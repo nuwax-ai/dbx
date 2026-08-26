@@ -30,6 +30,7 @@ pub mod cloud_sync;
 pub mod config;
 pub mod connection;
 pub mod connection_secrets;
+pub mod connection_seed;
 pub mod consul;
 pub mod correction;
 pub mod csv_export;
