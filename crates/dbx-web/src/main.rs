@@ -252,6 +252,8 @@ async fn main() {
         let db_path = data_dir.join("dbx.db");
         let storage = Storage::open(&db_path).await.expect("Failed to open storage");
         storage.migrate_from_json(&data_dir).await.expect("Failed to migrate JSON data");
+        // nuwax fork: 容器语义(POSTGRES_USER 在)时确保 local-pg socket 免密连接
+        dbx_core::local_pg::ensure_local_pg_connection(&storage).await.expect("Failed to ensure local-pg connection");
 
         // Initialize core dialect registry and load external plugin dialects
         register_core_dialects();

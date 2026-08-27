@@ -560,7 +560,7 @@ impl Storage {
         })
     }
 
-    pub(crate) async fn with_conn<T, F>(&self, f: F) -> Result<T, String>
+    async fn with_conn<T, F>(&self, f: F) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, String> + Send + 'static,
@@ -2639,7 +2639,7 @@ fn ensure_mcp_connection_change_allowed_in_tx(
     Ok(())
 }
 
-pub(crate) fn sanitized_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
+fn sanitized_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
     let mut sanitized = config.clone().canonicalized();
     sanitized.password = String::new();
     scrub_transport_layer_secrets(&mut sanitized);
@@ -4278,14 +4278,36 @@ impl Storage {
 
 impl Storage {
     pub async fn migrate_from_json(&self, data_dir: &Path) -> Result<(), String> {
-        // nuwax fork: connections 种子导入切到 upsert 版（connection_seed.rs），
-        // 其余迁移维持上游实现。
-        self.migrate_connections_json_upsert(data_dir).await?;
+        self.migrate_connections_json(data_dir).await?;
         self.migrate_secrets_json(data_dir).await?;
         self.migrate_history_json(data_dir).await?;
         self.migrate_ai_config_json(data_dir).await?;
         self.migrate_ai_conversations_json(data_dir).await?;
         self.migrate_sidebar_layout_json(data_dir).await?;
+        Ok(())
+    }
+
+    async fn migrate_connections_json(&self, data_dir: &Path) -> Result<(), String> {
+        let path = data_dir.join("connections.json");
+        if tokio::fs::metadata(&path).await.is_err() {
+            return Ok(());
+        }
+        let json = tokio::fs::read_to_string(&path).await.map_err(|e| e.to_string())?;
+        let configs: Vec<ConnectionConfig> = serde_json::from_str(&json).unwrap_or_default();
+        for config in &configs {
+            let config_json = serde_json::to_string(config).map_err(|e| e.to_string())?;
+            let id = config.id.clone();
+            self.with_conn(move |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO connections (id, config_json) VALUES (?1, ?2)",
+                    params![id, config_json],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            })
+            .await?;
+        }
+        let _ = tokio::fs::rename(&path, data_dir.join("connections.json.bak")).await;
         Ok(())
     }
 
@@ -4412,7 +4434,7 @@ impl Storage {
     }
 }
 
-pub(crate) fn persist_secret_in_tx(
+fn persist_secret_in_tx(
     tx: &rusqlite::Transaction<'_>,
     connection_id: &str,
     key: &str,

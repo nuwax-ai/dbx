@@ -997,11 +997,15 @@ impl ConnectionConfig {
                 format!("mysql://{host}:{port}{db_part}{suffix}")
             }
             DatabaseType::Postgres | DatabaseType::Redshift => {
-                let suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
-                if is_multi_host(raw_host) {
-                    format!("postgres://{raw_host}{db_part}{suffix}")
+                if raw_host.starts_with('/') {
+                    postgres_socket_url("", &db_part, &params, raw_host)
                 } else {
-                    format!("postgres://{host}:{port}{db_part}{suffix}")
+                    let suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
+                    if is_multi_host(raw_host) {
+                        format!("postgres://{raw_host}{db_part}{suffix}")
+                    } else {
+                        format!("postgres://{host}:{port}{db_part}{suffix}")
+                    }
                 }
             }
             DatabaseType::ClickHouse => clickhouse_http_url(self, raw_host, port),
@@ -1164,11 +1168,15 @@ impl ConnectionConfig {
                 format!("mysql://{}:{}@{host}:{port}{db_part}{suffix}", username, password)
             }
             DatabaseType::Postgres | DatabaseType::Redshift => {
-                let suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
-                if is_multi_host(raw_host) {
+                if raw_host.starts_with('/') {
+                    let auth = if password.is_empty() { username.clone() } else { format!("{username}:{password}") };
+                    postgres_socket_url(&auth, &db_part, &params, raw_host)
+                } else if is_multi_host(raw_host) {
                     // Multi-host: host1:port1,host2:port2 — each host already has its port embedded
+                    let suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
                     format!("postgres://{}:{}@{raw_host}{db_part}{suffix}", username, password)
                 } else {
+                    let suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
                     format!("postgres://{}:{}@{host}:{port}{db_part}{suffix}", username, password)
                 }
             }
@@ -2482,6 +2490,18 @@ fn replace_oracle_descriptor_value(input: &str, key: &str, value: &str) -> Strin
     format!("{}{}{}", &input[..value_start], value, &input[value_end..])
 }
 
+/// nuwax fork: unix socket host 的 PG 连接串——URI authority 放不下以 `/` 开头的
+/// host(tokio-postgres 会解析成空 host 回落 TCP localhost + 脏 dbname,静默错连),
+/// 经 query 参数 `host=<percent-encoded 路径>` 表达(libpq 语义,tokio-postgres
+/// `?host=/path` 原生走 unix socket)。`params` 非空时与 host 参数合并;
+/// port 于 socket 无意义,忽略。
+fn postgres_socket_url(auth: &str, db_part: &str, params: &str, raw_host: &str) -> String {
+    let host_param = format!("host={}", encode_url_part(raw_host));
+    let query = if params.is_empty() { format!("?{host_param}") } else { format!("?{params}&{host_param}") };
+    let authority = if auth.is_empty() { String::new() } else { format!("{auth}@") };
+    format!("postgres://{authority}{db_part}{query}")
+}
+
 fn encode_url_part(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
@@ -2814,6 +2834,54 @@ mod tests {
     /// `projects%2Fmy%2Dproject%2F…` by the shared `encode_url_part`. Hyphens matter in
     /// practice: GCP project and instance IDs allow only lowercase letters, digits and
     /// hyphens. Characters that genuinely need escaping (here a space) still are.
+    /// nuwax fork: unix socket host 的连接串形态——query host 表达(tokio-postgres
+    /// 原生支持),防回归为 authority 形态(会静默错连 TCP localhost)。
+    fn pg_config(host: &str, user: &str, password: &str, db: &str) -> ConnectionConfig {
+        serde_json::from_str(&format!(
+            r#"{{"id":"t","name":"t","db_type":"postgres","host":"{host}","port":5432,"username":"{user}","password":"{password}","database":"{db}"}}"#
+        ))
+        .expect("test pg config json")
+    }
+
+    #[test]
+    fn postgres_socket_host_uses_query_param_form() {
+        let cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
+        let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
+        assert_eq!(
+            url, "postgres://app@/appdb?sslmode=prefer&host=%2Fvar%2Frun%2Fpostgresql",
+            "socket host 必须走 query 形态(空密码省 :pass;sslmode 为 normalize 默认)"
+        );
+        // 带密码:auth 段含 password
+        let cfg = pg_config("/var/run/postgresql", "app", "pw", "appdb");
+        let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
+        assert_eq!(url, "postgres://app:pw@/appdb?sslmode=prefer&host=%2Fvar%2Frun%2Fpostgresql");
+    }
+
+    #[test]
+    fn postgres_socket_host_merges_url_params() {
+        // url_params 显式值:host 参数与其合并在同一 query(normalize 默认 sslmode
+        // 被显式值取代,不重复)
+        let mut cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
+        cfg.url_params = Some("sslmode=disable".into());
+        let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
+        assert_eq!(url, "postgres://app@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql", "params 与 host 合并");
+    }
+
+    #[test]
+    fn postgres_socket_host_redacted_form_has_no_credentials() {
+        let cfg = pg_config("/var/run/postgresql", "app", "pw", "appdb");
+        let url = cfg.redacted_connection_url_with_host("/var/run/postgresql", 5432);
+        assert_eq!(url, "postgres:///appdb?sslmode=prefer&host=%2Fvar%2Frun%2Fpostgresql");
+    }
+
+    #[test]
+    fn postgres_tcp_host_unchanged() {
+        // TCP 形态回归:确保特判不影响既有 url
+        let cfg = pg_config("127.0.0.1", "app", "pw", "appdb");
+        let url = cfg.connection_url_with_host("127.0.0.1", 5432);
+        assert_eq!(url, "postgres://app:pw@127.0.0.1:5432/appdb?sslmode=prefer");
+    }
+
     #[test]
     fn spanner_display_url_keeps_resource_path_separators() {
         let mut config = mysql_config("", "", Some("projects/my-project/instances/my-instance/databases/my db"));
