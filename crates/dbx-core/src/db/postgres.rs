@@ -2012,6 +2012,31 @@ fn postgres_client_keys() -> &'static Mutex<PostgresClientKeys> {
 /// (`RAISE NOTICE`/`WARNING`, etc.) into a per-backend buffer instead of
 /// discarding them. Query execution drains the buffer so notices are
 /// attached to the `QueryResult` of the statement that raised them.
+/// nuwax fork: tokio-postgres 0.7.18 对 Unix socket host 以**空串**调
+/// `make_tls_connect`(先于 sslmode 判定),rustls 的 `ServerName::try_from("")`
+/// 直接报 "invalid dns name"——sslmode=disable 也拦不住。透传包装:空 hostname
+/// (= unix socket)换成占位合法 DNS;sslmode=disable 时 `connect` 根本不会被调
+/// (SNI 无实际作用),prefer 时 unix socket 上的 TLS 由服务器拒绝后回落明文。
+#[derive(Clone)]
+struct UnixSocketSafeTls<T>(T);
+
+impl<T> MakeTlsConnect<Socket> for UnixSocketSafeTls<T>
+where
+    T: MakeTlsConnect<Socket> + Sync + Send,
+    T::Stream: Sync + Send,
+    T::TlsConnect: Sync + Send,
+    <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
+{
+    type Stream = T::Stream;
+    type TlsConnect = T::TlsConnect;
+    type Error = T::Error;
+
+    fn make_tls_connect(&mut self, hostname: &str) -> Result<Self::TlsConnect, Self::Error> {
+        let effective = if hostname.is_empty() { "localhost" } else { hostname };
+        self.0.make_tls_connect(effective)
+    }
+}
+
 struct NoticeCapturingConnect<T>
 where
     T: MakeTlsConnect<Socket> + Clone + Sync + Send + 'static,
@@ -2213,7 +2238,11 @@ async fn connect_postgres_pool_attempt(
                 postgres_url.accepts_invalid_certs,
                 postgres_url.verifies_hostname,
             )?;
-            deadpool_postgres::Manager::from_connect(pg_config.clone(), NoticeCapturingConnect { tls }, mgr_config)
+            deadpool_postgres::Manager::from_connect(
+                pg_config.clone(),
+                NoticeCapturingConnect { tls: UnixSocketSafeTls(tls) },
+                mgr_config,
+            )
         } else {
             let tls_config = postgres_tls_config(
                 &pg_config,
@@ -2223,7 +2252,9 @@ async fn connect_postgres_pool_attempt(
             )?;
             deadpool_postgres::Manager::from_connect(
                 pg_config.clone(),
-                NoticeCapturingConnect { tls: tokio_postgres_rustls::MakeRustlsConnect::new(tls_config) },
+                NoticeCapturingConnect {
+                    tls: UnixSocketSafeTls(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config)),
+                },
                 mgr_config,
             )
         };
