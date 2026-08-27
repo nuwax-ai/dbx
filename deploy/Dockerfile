@@ -32,6 +32,15 @@ RUN dpkg --add-architecture arm64 \
     && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
+# nuwax fork: 补装 amd64 交叉的 fontconfig/freetype dev 库（独立层，不动上游层——
+# arm64 构建缓存保留）。上游只装 :arm64 覆盖 "amd64 runner 交叉 arm64"；在 arm64
+# 宿主（OrbStack mac）交叉 amd64 时缺 amd64 库，链接报
+# "libfontconfig.so is incompatible with elf_x86_64"。
+RUN dpkg --add-architecture amd64 && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libfontconfig-dev:amd64 libfreetype-dev:amd64 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy dependency manifests only and create dummy sources to pre-compile dependencies.
 # This layer is cached by GHA as long as Cargo.toml/Cargo.lock don't change.
 COPY Cargo.toml Cargo.lock ./
