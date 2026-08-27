@@ -2496,10 +2496,17 @@ fn replace_oracle_descriptor_value(input: &str, key: &str, value: &str) -> Strin
 /// `?host=/path` 原生走 unix socket)。`params` 非空时与 host 参数合并;
 /// port 于 socket 无意义,忽略。
 fn postgres_socket_url(auth: &str, db_part: &str, params: &str, raw_host: &str) -> String {
+    // socket 下强制 sslmode=disable:unix 通道无 TLS 语义,而 dbx 的 TLS connector
+    // 会对 socket 路径做 SNI 校验直接报 "invalid dns name"(normalize 默认的
+    // sslmode=prefer 即触发)——剔除调用方传入的 sslmode 键后强制 disable,
+    // 其余参数保留。
+    let kept: Vec<&str> = params.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("sslmode=")).collect();
+    let mut query_parts = kept;
+    query_parts.push("sslmode=disable");
     let host_param = format!("host={}", encode_url_part(raw_host));
-    let query = if params.is_empty() { format!("?{host_param}") } else { format!("?{params}&{host_param}") };
+    query_parts.push(&host_param);
     let authority = if auth.is_empty() { String::new() } else { format!("{auth}@") };
-    format!("postgres://{authority}{db_part}{query}")
+    format!("postgres://{authority}{db_part}?{}", query_parts.join("&"))
 }
 
 fn encode_url_part(value: &str) -> String {
@@ -2848,13 +2855,13 @@ mod tests {
         let cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
         let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
         assert_eq!(
-            url, "postgres://app@/appdb?sslmode=prefer&host=%2Fvar%2Frun%2Fpostgresql",
-            "socket host 必须走 query 形态(空密码省 :pass;sslmode 为 normalize 默认)"
+            url, "postgres://app@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql",
+            "socket host 必须走 query 形态(空密码省 :pass;sslmode 强制 disable——TLS 对 socket 路径 SNI 报错)"
         );
         // 带密码:auth 段含 password
         let cfg = pg_config("/var/run/postgresql", "app", "pw", "appdb");
         let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
-        assert_eq!(url, "postgres://app:pw@/appdb?sslmode=prefer&host=%2Fvar%2Frun%2Fpostgresql");
+        assert_eq!(url, "postgres://app:pw@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql");
     }
 
     #[test]
@@ -2871,7 +2878,7 @@ mod tests {
     fn postgres_socket_host_redacted_form_has_no_credentials() {
         let cfg = pg_config("/var/run/postgresql", "app", "pw", "appdb");
         let url = cfg.redacted_connection_url_with_host("/var/run/postgresql", 5432);
-        assert_eq!(url, "postgres:///appdb?sslmode=prefer&host=%2Fvar%2Frun%2Fpostgresql");
+        assert_eq!(url, "postgres:///appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql");
     }
 
     #[test]
