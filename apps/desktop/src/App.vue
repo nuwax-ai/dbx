@@ -74,6 +74,7 @@ import {
   isExecuteSqlInNewResultTabShortcut,
   isExecuteSqlShortcut,
   isFocusSearchShortcut,
+  isGoToColumnShortcut,
   isModRShortcut,
   handleTabHistoryNavigationShortcut,
   isNewQueryShortcut,
@@ -88,6 +89,7 @@ import {
   isSwitchToPreviousTabShortcut,
   isToggleResultsPaneShortcut,
   isToggleSidebarShortcut,
+  isToggleZenModeShortcut,
   isZoomInShortcut,
   isZoomOutShortcut,
   switchToTabIndexFromShortcut,
@@ -100,7 +102,7 @@ import { createTabSwitcherKeyboardController } from "@/lib/tabs/tabSwitcherKeybo
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { supportsSqlFileExecution } from "@/lib/database/databaseCapabilities";
 import { classifyAiSqlExecution } from "@/lib/ai/aiSqlExecutionPolicy";
-import { buildAppendedEditorSql } from "@/lib/ai/aiSqlAppend";
+import { buildAppendedEditorSql, buildDeduplicatedAppendedEditorSql } from "@/lib/ai/aiSqlAppend";
 import { assessProductionSql } from "@/lib/database/productionSafety";
 import { normalizeSqlExecutionTarget, sqlExecutionTargetCapabilities } from "@/lib/database/sqlExecutionTargetCapabilities";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
@@ -205,7 +207,7 @@ const {
   checkUpdates,
   openLatestRelease,
   ignoreCurrentVersion,
-  downloadAndInstallUpdate,
+  downloadUpdateInBackground,
   cancelDownload,
   installDownloadedUpdate,
   restartApp,
@@ -254,6 +256,7 @@ const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
 const isAiPanelMaximized = ref(false);
+const isZenMode = ref(false);
 const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
 const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
 const rightSidebarPanelRefs: Record<RightSidebarPanelId, typeof showAiPanel> = {
@@ -322,6 +325,18 @@ let aiRunsQuitConfirmed = false;
 const activeTab = computed(() => queryStore.tabs.find((t) => t.id === queryStore.activeTabId));
 const tabNavigationHistory = ref(createTabNavigationHistory());
 let pendingTabHistoryNavigationId: string | null = null;
+
+watch(
+  () => activeTab.value?.mode,
+  (mode) => {
+    if (mode !== "data") isZenMode.value = false;
+  },
+);
+
+function toggleZenMode() {
+  if (activeTab.value?.mode !== "data") return;
+  isZenMode.value = !isZenMode.value;
+}
 
 const externalSqlFileChanges = useExternalSqlFileChanges({
   activeTab,
@@ -408,6 +423,7 @@ async function resolveActiveExecutableSql(snapshot?: SqlExecutionSnapshot) {
 const blockDangerousRedisCommands = ref(true);
 const databaseRequiredSignal = ref(0);
 const databaseRequiredTabId = ref<string | null>(null);
+const pendingToolbarExecutionSnapshot = ref<SqlExecutionSnapshot>();
 const sqlExecutionDangerStore = useSqlExecutionDangerStore();
 const productionSafetyStore = useProductionSafetyStore();
 
@@ -451,7 +467,19 @@ const {
   onExecutionStarted: (editorViewportRequestId) => contentAreaRef.value?.acceptQueryEditorExecutionViewport(editorViewportRequestId),
 });
 
-function requestActiveEditorExecute() {
+function captureActiveEditorExecutionSnapshot() {
+  pendingToolbarExecutionSnapshot.value = contentAreaRef.value?.captureQueryEditorExecutionSnapshot?.();
+}
+
+function requestActiveEditorExecute(source?: "pointer" | "keyboard") {
+  const snapshot = pendingToolbarExecutionSnapshot.value;
+  pendingToolbarExecutionSnapshot.value = undefined;
+  if (source === "pointer") {
+    if (snapshot) {
+      void tryExecute(snapshot);
+      return;
+    }
+  }
   if (contentAreaRef.value?.requestQueryEditorExecute?.()) return;
   void tryExecute();
 }
@@ -545,6 +573,12 @@ useScheduledDatabaseBackups({ scheduler: true });
 
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
+const isVerticalTabPlacement = computed(() => settingsStore.editorSettings.tabPlacement === "left" || settingsStore.editorSettings.tabPlacement === "right");
+const tabWorkspaceLayoutClass = computed(() => {
+  if (settingsStore.editorSettings.tabPlacement === "bottom") return "flex-col-reverse";
+  if (settingsStore.editorSettings.tabPlacement === "right") return "flex-row-reverse";
+  return isVerticalTabPlacement.value ? "flex-row" : "flex-col";
+});
 const updateNotificationsEnabled = computed(() => settingsStore.editorSettings.updateNotificationsEnabled);
 
 function openSettings(initialTab = "appearance", initialSection?: string) {
@@ -916,8 +950,10 @@ function sendSelectionToAi(sql: string) {
 
 let addToAiRequestId = 0;
 
-async function addToAi(node: TreeNode) {
-  if ((node.type !== "connection" && node.type !== "database" && node.type !== "table") || !node.connectionId) return;
+async function addToAi(nodesInput: TreeNode | TreeNode[]) {
+  const nodes = Array.isArray(nodesInput) ? nodesInput : [nodesInput];
+  const node = nodes[0];
+  if (!node || (node.type !== "connection" && node.type !== "database" && node.type !== "table") || !node.connectionId) return;
   const connection = connectionStore.getConfig(node.connectionId);
   if (!connection) return;
   const requestId = ++addToAiRequestId;
@@ -956,10 +992,12 @@ async function addToAi(node: TreeNode) {
       queryStore.createTab(node.connectionId, target.database, undefined, "query", target.schema, undefined, target.catalog);
     }
 
+    const tableMentions = nodes.filter((entry) => entry.type === "table" && !!entry.label).map((entry) => ({ schema: entry.schema, table: entry.label }));
+
     openRightSidebarPanel("ai");
     invokeWhenAiReady((handle) => {
       if (contextChanged) handle.clearContextReferences();
-      if (node.type === "table") handle.addTableMention({ schema: node.schema, table: node.label });
+      for (const mention of tableMentions) handle.addTableMention(mention);
     });
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
@@ -2213,10 +2251,12 @@ function routeAiRedisCommand(command: string, execute: boolean): boolean {
   return true;
 }
 
-function onAiReplaceSql(sql: string) {
+function onAiAppendSql(sql: string) {
   if (routeAiRedisCommand(sql, false)) return;
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+  const currentSql = queryStore.tabs.find((tab) => tab.id === tabId)?.sql ?? "";
+  const appendedSql = buildDeduplicatedAppendedEditorSql(currentSql, sql);
+  if (appendedSql !== currentSql) queryStore.updateSql(tabId, appendedSql);
 }
 
 function runAiGeneratedSql(sql: string) {
@@ -2227,7 +2267,9 @@ function runAiGeneratedSql(sql: string) {
 function onAiExecuteSql(sql: string) {
   if (routeAiRedisCommand(sql, true)) return;
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
+  const currentSql = queryStore.tabs.find((tab) => tab.id === tabId)?.sql ?? "";
+  const appendedSql = buildDeduplicatedAppendedEditorSql(currentSql, sql);
+  if (appendedSql !== currentSql) queryStore.updateSql(tabId, appendedSql);
   runAiGeneratedSql(sql);
 }
 
@@ -2556,8 +2598,17 @@ async function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
   const shortcuts = settingsStore.editorSettings.shortcuts;
-  const tabSwitcherDirection = tabSwitcherDirectionFromShortcut(e, shortcuts);
   if (showTabSwitcher.value) return;
+  // Grid-scoped shortcuts normally win inside DataGrid. Keep that precedence
+  // for a data tab even when focus is in a sibling input, where the grid's
+  // local listener intentionally leaves native editing untouched.
+  if (isGoToColumnShortcut(e, shortcuts) && contentAreaRef.value?.openGoToColumn()) {
+    e.preventDefault();
+    e.stopPropagation();
+    return;
+  }
+
+  const tabSwitcherDirection = tabSwitcherDirectionFromShortcut(e, shortcuts);
   if (tabSwitcherDirection) {
     e.preventDefault();
     e.stopPropagation();
@@ -2608,6 +2659,12 @@ async function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     setSidebarOpen(!sidebarOpen.value);
+    return;
+  }
+  if (isToggleZenModeShortcut(e, shortcuts) && activeTab.value?.mode === "data") {
+    e.preventDefault();
+    e.stopPropagation();
+    toggleZenMode();
     return;
   }
   if (switchTabIndex != null) {
@@ -2954,6 +3011,10 @@ onUnmounted(() => {
           :show-settings-page="showSettingsPage"
           :checking-updates="checkingUpdates"
           :has-update-available="toolbarHasUpdateAvailable"
+          :is-downloading-update="isDownloadingUpdate"
+          :download-progress="downloadProgress"
+          :update-ready-to-install="updateDownloaded"
+          :update-ready="updateReady"
           :agent-driver-update-count="toolbarAgentDriverUpdateCount"
           :has-mcp-update-available="toolbarMcpUpdateAvailable"
           :has-connections="connectionStore.connections.length > 0"
@@ -2977,7 +3038,7 @@ onUnmounted(() => {
 
         <div :class="isClassicLayout ? 'app-layout-classic flex-1 flex min-h-0' : 'app-panel-gutter flex-1 flex min-h-0 gap-1 p-1'">
           <AppSidebar
-            v-show="sidebarOpen"
+            v-show="sidebarOpen && !isZenMode"
             ref="appSidebarRef"
             :sidebar-width="sidebarWidth"
             :classic-layout="isClassicLayout"
@@ -2988,14 +3049,14 @@ onUnmounted(() => {
             @open-settings="(initialTab) => openSettings(initialTab ?? 'appearance')"
             @add-to-ai="addToAi"
           />
-          <div v-show="!sidebarOpen" class="flex h-full w-8 shrink-0 items-start justify-center border-r bg-background/80 pt-2" :class="isClassicLayout ? '' : 'rounded-md border border-border/80'">
+          <div v-show="!sidebarOpen && !isZenMode" class="flex h-full w-8 shrink-0 items-start justify-center border-r bg-background/80 pt-2" :class="isClassicLayout ? '' : 'rounded-md border border-border/80'">
             <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('sidebar.expand')" :aria-label="t('sidebar.expand')" @click="setSidebarOpen(true)">
               <ChevronsRight class="h-4 w-4" />
             </Button>
           </div>
 
-          <div v-show="!isAiPanelMaximized" :class="isClassicLayout ? 'flex-1 min-w-0 overflow-hidden' : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'">
-            <div class="h-full flex flex-col min-w-0">
+          <div v-show="!isAiPanelMaximized || isZenMode" :class="isClassicLayout ? 'flex-1 min-w-0 overflow-hidden' : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'">
+            <div class="h-full flex min-w-0" :class="tabWorkspaceLayoutClass">
               <AppTabBar
                 ref="appTabBarRef"
                 :driver-store-open="driverStoreTabOpen"
@@ -3003,6 +3064,7 @@ onUnmounted(() => {
                 :settings-page-open="settingsPageTabOpen"
                 :settings-page-active="settingsStore.settingsPageActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
+                @toggle-zen-mode="toggleZenMode"
                 @activate-driver-store="openDriverStorePage"
                 @activate-settings-page="activateSettingsPage"
                 @locate-tab="locateTabInSidebar"
@@ -3015,159 +3077,163 @@ onUnmounted(() => {
                 @discard-all-tab-close="handleDiscardAllPendingTabClose"
                 @cancel-tab-close="cancelPendingAppClose"
               />
-              <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
-              <EditorSettingsPage
-                v-if="settingsPageTabOpen"
-                v-show="settingsStore.settingsPageActive"
-                variant="page"
-                :open="settingsPageTabOpen"
-                :initial-tab="settingsInitialTab"
-                :initial-section="settingsInitialSection"
-                :navigation-request-id="settingsNavigationRequestId"
-                :ai-config-draft="settingsAiConfigDraft"
-                :ai-config-request-id="settingsAiConfigRequestId"
-                :app-version="appVersion"
-                :checking-updates="checkingUpdates"
-                class="flex-1 min-h-0"
-                @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
-                @check-updates="checkUpdates()"
-              />
-              <div v-if="activeTab" v-show="!driverStoreActive && !settingsStore.settingsPageActive" class="flex flex-col flex-1 min-h-0">
-                <EditorToolbar
-                  v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
-                  :active-tab="activeTab"
-                  :active-connection="activeConnection"
-                  :executable-sql="executableSql"
-                  :explain-mode="explainMode"
-                  :block-dangerous-redis-commands="blockDangerousRedisCommands"
-                  :sql-keyword-case="settingsStore.editorSettings.sqlFormatter.keywordCase"
-                  :database-required-signal="databaseRequiredTabId === activeTab.id ? databaseRequiredSignal : 0"
-                  :auto-commit="activeTab.autoCommit ?? true"
-                  :txn-session-id="activeTab?.txnSessionId"
-                  :txn-auto-rolled-back="activeTab?.txnAutoRolledBack"
-                  :oracle-txn-possibly-dirty="activeTab?.oracleTxnPossiblyDirty"
-                  :is-oracle-manual-transaction="isOracleManualTransaction"
-                  @update:explain-mode="(m: 'explain' | 'autotrace') => (explainMode = m)"
-                  @update:block-dangerous-redis-commands="(v: boolean) => (blockDangerousRedisCommands = v)"
-                  @update:auto-commit="
-                    (v: boolean) => {
-                      if (activeTab) queryStore.setAutoCommit(activeTab.id, v);
-                    }
-                  "
-                  @commit="activeTab && queryStore.commitTransaction(activeTab.id)"
-                  @rollback="activeTab && queryStore.rollbackTransaction(activeTab.id)"
-                  @dismiss-txn-rolled-back="activeTab && (activeTab.txnAutoRolledBack = false)"
-                  @execute="requestActiveEditorExecute()"
-                  @multi-execute="requestMultiDbExecute()"
-                  @cancel="cancelActiveExecution()"
-                  @explain="tryExplain()"
-                  @format-sql="formatActiveSql"
-                  @compress-sql="compressActiveSql"
-                  @toggle-sql-keyword-case="toggleSqlKeywordCase"
-                  @save-sql="void openSaveSqlDialog()"
-                  @open-sql="openSqlFile"
-                  @import-result-archive="importResultArchive"
-                  @paste-sql-in-condition="pasteClipboardAsSqlInCondition"
-                  @change-connection="changeActiveConnection"
-                  @change-database="changeActiveDatabase"
-                  @change-catalog="changeActiveCatalog"
-                  @change-schema="changeActiveSchema"
-                  @set-default-database="setActiveDatabaseAsDefault"
-                  @clear-default-database="clearActiveDefaultDatabase"
+              <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+                <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
+                <EditorSettingsPage
+                  v-if="settingsPageTabOpen"
+                  v-show="settingsStore.settingsPageActive"
+                  variant="page"
+                  :open="settingsPageTabOpen"
+                  :initial-tab="settingsInitialTab"
+                  :initial-section="settingsInitialSection"
+                  :navigation-request-id="settingsNavigationRequestId"
+                  :ai-config-draft="settingsAiConfigDraft"
+                  :ai-config-request-id="settingsAiConfigRequestId"
+                  :app-version="appVersion"
+                  :checking-updates="checkingUpdates"
+                  class="flex-1 min-h-0"
+                  @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
+                  @check-updates="checkUpdates()"
                 />
-                <KeepAlive :max="4">
-                  <ContentArea
-                    ref="contentAreaRef"
-                    :key="activeTab.id"
+                <div v-if="activeTab" v-show="!driverStoreActive && !settingsStore.settingsPageActive" class="flex flex-col flex-1 min-h-0">
+                  <EditorToolbar
+                    v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
                     :active-tab="activeTab"
                     :active-connection="activeConnection"
                     :executable-sql="executableSql"
-                    :active-output-view="activeOutputView"
-                    :format-sql-request="formatSqlRequest"
-                    :compress-sql-request="compressSqlRequest"
-                    :selected-sql="selectedSql"
-                    :cursor-pos="cursorPos"
+                    :explain-mode="explainMode"
                     :block-dangerous-redis-commands="blockDangerousRedisCommands"
-                    @update:active-output-view="activeOutputView = $event"
-                    @fix-with-ai="fixWithAi"
-                    @send-selection-to-ai="sendSelectionToAi"
-                    @execute="tryExecute($event)"
-                    @execute-in-new-result-tab="tryExecuteInNewResultTab($event)"
+                    :sql-keyword-case="settingsStore.editorSettings.sqlFormatter.keywordCase"
+                    :database-required-signal="databaseRequiredTabId === activeTab.id ? databaseRequiredSignal : 0"
+                    :auto-commit="activeTab.autoCommit ?? true"
+                    :txn-session-id="activeTab?.txnSessionId"
+                    :txn-auto-rolled-back="activeTab?.txnAutoRolledBack"
+                    :oracle-txn-possibly-dirty="activeTab?.oracleTxnPossiblyDirty"
+                    :is-oracle-manual-transaction="isOracleManualTransaction"
+                    @update:explain-mode="(m: 'explain' | 'autotrace') => (explainMode = m)"
+                    @update:block-dangerous-redis-commands="(v: boolean) => (blockDangerousRedisCommands = v)"
+                    @update:auto-commit="
+                      (v: boolean) => {
+                        if (activeTab) queryStore.setAutoCommit(activeTab.id, v);
+                      }
+                    "
+                    @commit="activeTab && queryStore.commitTransaction(activeTab.id)"
+                    @rollback="activeTab && queryStore.rollbackTransaction(activeTab.id)"
+                    @dismiss-txn-rolled-back="activeTab && (activeTab.txnAutoRolledBack = false)"
+                    @execute-pointer-down="captureActiveEditorExecutionSnapshot()"
+                    @execute="requestActiveEditorExecute($event)"
+                    @multi-execute="requestMultiDbExecute()"
                     @cancel="cancelActiveExecution()"
                     @explain="tryExplain()"
-                    @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v)"
-                    @editor-selection-change="(v: string) => (selectedSql = v)"
-                    @editor-cursor-change="(p: number) => (cursorPos = p)"
-                    @editor-viewport-change="(tabId: string, viewport: { scrollTop: number; scrollLeft: number }) => queryStore.updateEditorViewport(tabId, viewport)"
-                    @editor-selection-state-change="(tabId: string, selection: { anchor: number; head: number }) => queryStore.updateEditorSelection(tabId, selection)"
-                    @format-error="toast(t('toolbar.formatSqlFailed'))"
+                    @format-sql="formatActiveSql"
+                    @compress-sql="compressActiveSql"
+                    @toggle-sql-keyword-case="toggleSqlKeywordCase"
                     @save-sql="void openSaveSqlDialog()"
-                    @reload="(sql, searchText, whereInput, orderBy, limit, offset, intent) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset, intent)"
-                    @paginate="onPaginate"
-                    @sort="onSort"
-                    @execute-sql="onExecuteSql"
-                    @click-table="onClickTable"
-                    @view-table-data="onViewTableData"
-                    @edit-table-structure="onEditTableStructure"
-                    @view-table-ddl="onViewTableDdl"
-                    @open-object-source="onOpenObjectSource"
-                    @open-object-table="
-                      (target) =>
-                        activeTab &&
-                        openObjectBrowserTableTarget({
-                          connectionId: activeTab.connectionId,
-                          database: activeTab.database,
-                          schema: target.schema,
-                          catalog: target.catalog,
-                          tableName: target.tableName,
-                          tableType: target.tableType,
-                        })
-                    "
-                    @object-schema-change="(schema) => activeTab && queryStore.updateSchema(activeTab.id, schema)"
-                    @object-browser-viewport-change="(tabId, viewport) => queryStore.updateObjectBrowserViewport(tabId, viewport)"
-                    @structure-editor-saved="
-                      (commentChanged) =>
-                        activeTab &&
-                        onStructureEditorSaved(
-                          onReloadData,
-                          toast,
-                          {
+                    @open-sql="openSqlFile"
+                    @import-result-archive="importResultArchive"
+                    @paste-sql-in-condition="pasteClipboardAsSqlInCondition"
+                    @change-connection="changeActiveConnection"
+                    @change-database="changeActiveDatabase"
+                    @change-catalog="changeActiveCatalog"
+                    @change-schema="changeActiveSchema"
+                    @set-default-database="setActiveDatabaseAsDefault"
+                    @clear-default-database="clearActiveDefaultDatabase"
+                  />
+                  <KeepAlive :max="4">
+                    <ContentArea
+                      ref="contentAreaRef"
+                      :key="activeTab.id"
+                      :active-tab="activeTab"
+                      :active-connection="activeConnection"
+                      :executable-sql="executableSql"
+                      :active-output-view="activeOutputView"
+                      :format-sql-request="formatSqlRequest"
+                      :compress-sql-request="compressSqlRequest"
+                      :selected-sql="selectedSql"
+                      :cursor-pos="cursorPos"
+                      :block-dangerous-redis-commands="blockDangerousRedisCommands"
+                      @update:active-output-view="activeOutputView = $event"
+                      @fix-with-ai="fixWithAi"
+                      @send-selection-to-ai="sendSelectionToAi"
+                      @execute="tryExecute($event)"
+                      @execute-in-new-result-tab="tryExecuteInNewResultTab($event)"
+                      @cancel="cancelActiveExecution()"
+                      @explain="tryExplain()"
+                      @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v)"
+                      @editor-selection-change="(v: string) => (selectedSql = v)"
+                      @editor-cursor-change="(p: number) => (cursorPos = p)"
+                      @editor-viewport-change="(tabId: string, viewport: { scrollTop: number; scrollLeft: number }) => queryStore.updateEditorViewport(tabId, viewport)"
+                      @editor-selection-state-change="(tabId: string, selection: { anchor: number; head: number }) => queryStore.updateEditorSelection(tabId, selection)"
+                      @format-error="toast(t('toolbar.formatSqlFailed'))"
+                      @save-sql="void openSaveSqlDialog()"
+                      @reload="(sql, searchText, whereInput, orderBy, limit, offset, intent) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset, intent)"
+                      @paginate="onPaginate"
+                      @sort="onSort"
+                      @execute-sql="onExecuteSql"
+                      @click-table="onClickTable"
+                      @view-table-data="onViewTableData"
+                      @edit-table-structure="onEditTableStructure"
+                      @view-table-ddl="onViewTableDdl"
+                      @open-object-source="onOpenObjectSource"
+                      @open-object-table="
+                        (target) =>
+                          activeTab &&
+                          openObjectBrowserTableTarget({
                             connectionId: activeTab.connectionId,
                             database: activeTab.database,
-                            schema: activeTab.schema,
-                            catalog: activeTab.catalog,
-                            tableName: activeTab.structureTableName || '',
-                          },
-                          commentChanged,
-                        )
-                    "
-                    @structure-editor-close="activeTab && queryStore.closeTab(activeTab.id)"
-                    @open-settings="openSettings"
-                    @open-connection-settings="openConnectionSettings"
-                  />
-                </KeepAlive>
+                            schema: target.schema,
+                            catalog: target.catalog,
+                            tableName: target.tableName,
+                            tableType: target.tableType,
+                          })
+                      "
+                      @object-schema-change="(schema) => activeTab && queryStore.updateSchema(activeTab.id, schema)"
+                      @object-browser-viewport-change="(tabId, viewport) => queryStore.updateObjectBrowserViewport(tabId, viewport)"
+                      @structure-editor-saved="
+                        (commentChanged) =>
+                          activeTab &&
+                          onStructureEditorSaved(
+                            onReloadData,
+                            toast,
+                            {
+                              connectionId: activeTab.connectionId,
+                              database: activeTab.database,
+                              schema: activeTab.schema,
+                              catalog: activeTab.catalog,
+                              tableName: activeTab.structureTableName || '',
+                            },
+                            commentChanged,
+                          )
+                      "
+                      @structure-editor-close="activeTab && queryStore.closeTab(activeTab.id)"
+                      @open-settings="openSettings"
+                      @open-connection-settings="openConnectionSettings"
+                    />
+                  </KeepAlive>
+                </div>
+                <WelcomeScreen
+                  v-else-if="!driverStoreActive && !settingsStore.settingsPageActive"
+                  :connection-stats="connectionStats"
+                  :recent-connections="recentConnections"
+                  :saved-sql-history-items="savedSqlHistoryItems"
+                  :app-version="appVersion"
+                  :has-connections="connectionStore.connections.length > 0"
+                  @open-connection-query="openConnectionQuery"
+                  @open-saved-sql="openSavedSqlFromWelcome"
+                  @new-connection="showConnectionDialog = true"
+                  @new-query="newQuery"
+                  @show-history="openRightSidebarPanel('history')"
+                  @import-config="dialogs.onImportClick"
+                  @open-github="openGitHub"
+                  @open-mcp-guide="openMcpGuide"
+                />
               </div>
-              <WelcomeScreen
-                v-else-if="!driverStoreActive && !settingsStore.settingsPageActive"
-                :connection-stats="connectionStats"
-                :recent-connections="recentConnections"
-                :saved-sql-history-items="savedSqlHistoryItems"
-                :app-version="appVersion"
-                :has-connections="connectionStore.connections.length > 0"
-                @open-connection-query="openConnectionQuery"
-                @open-saved-sql="openSavedSqlFromWelcome"
-                @new-connection="showConnectionDialog = true"
-                @new-query="newQuery"
-                @show-history="openRightSidebarPanel('history')"
-                @import-config="dialogs.onImportClick"
-                @open-github="openGitHub"
-                @open-mcp-guide="openMcpGuide"
-              />
             </div>
           </div>
 
           <div
             v-if="showAiPanel"
+            v-show="!isZenMode"
             :class="[isClassicLayout ? 'h-full relative z-30 isolate bg-background' : 'h-full relative z-30 isolate rounded-md border border-border/80 bg-background', isAiPanelMaximized ? 'min-w-0 flex-1' : 'min-w-[180px] max-w-full']"
             :style="isAiPanelMaximized ? {} : { width: aiPanelWidth + 'px' }"
           >
@@ -3179,7 +3245,7 @@ onUnmounted(() => {
                 :tab="activeTab"
                 :connection="activeConnection"
                 :maximized="isAiPanelMaximized"
-                @replace-sql="onAiReplaceSql"
+                @append-sql="onAiAppendSql"
                 @execute-sql="onAiExecuteSql"
                 @temp-run-sql="onAiTempRunSql"
                 @request-auto-execute-sql="onAiRequestAutoExecuteSql"
@@ -3192,21 +3258,21 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div v-if="showHistory" v-show="!isAiPanelMaximized" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: historyWidth + 'px' }">
+          <div v-if="showHistory" v-show="!isAiPanelMaximized && !isZenMode" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: historyWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startHistoryResize" />
             <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
               <QueryHistory :current-connection-id="activeTab?.connectionId" :current-database="activeTab?.database" @restore="restoreHistorySql" @analyze-ai="analyzeHistoryWithAi" @close="closeRightSidebarPanel('history')" />
             </div>
           </div>
 
-          <div v-if="showSqlLibraryPanel" v-show="!isAiPanelMaximized" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlLibraryWidth + 'px' }">
+          <div v-if="showSqlLibraryPanel" v-show="!isAiPanelMaximized && !isZenMode" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlLibraryWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlLibraryResize" />
             <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
               <SqlLibraryPanel @close="closeRightSidebarPanel('sqlLibrary')" />
             </div>
           </div>
 
-          <div v-if="showSqlFilePanel" v-show="!isAiPanelMaximized" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlFilePanelWidth + 'px' }">
+          <div v-if="showSqlFilePanel" v-show="!isAiPanelMaximized && !isZenMode" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlFilePanelWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlFilePanelResize" />
             <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
               <SqlFilePanel @close="closeRightSidebarPanel('sqlFile')" />
@@ -3281,7 +3347,7 @@ onUnmounted(() => {
           :is-ignoring-update="isIgnoringUpdate"
           :active-task-count="activeUpdateTaskCount"
           @open-latest-release="openLatestRelease"
-          @download-and-install="downloadAndInstallUpdate"
+          @download-in-background="downloadUpdateInBackground"
           @cancel-download="cancelDownload"
           @install-downloaded="installDownloadedUpdate"
           @restart="restartApp"
