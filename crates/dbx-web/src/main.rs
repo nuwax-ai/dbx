@@ -381,6 +381,7 @@ async fn main() {
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))
+        .route("/connection/test-ssh-tunnel", post(routes::connection::test_ssh_tunnel))
         .route("/connection/connect", post(routes::connection::connect_db))
         .route("/connection/database-info", post(routes::connection::connected_database_info))
         .route("/connection/database-info/save", post(routes::connection::save_connection_database_info))
@@ -595,6 +596,7 @@ async fn main() {
             "/query/build-data-grid-copy-insert-statement",
             post(routes::query::build_data_grid_copy_insert_statement),
         )
+        .route("/query/build-dml-change-preview-sql", post(routes::query::build_dml_change_preview_sql))
         .route(
             "/query/build-data-grid-context-filter-condition",
             post(routes::query::build_data_grid_context_filter_condition),

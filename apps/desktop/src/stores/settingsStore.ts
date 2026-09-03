@@ -64,8 +64,16 @@ export interface McpConnectionPolicy {
   readOnly: boolean;
   allowDangerousSql: boolean;
   executionModeConfigured: boolean;
+  executionModePolicyVersion: number | null;
   databaseScope: "all" | "selected" | "none";
   allowedDatabases: string[];
+  databasePolicies: McpDatabasePolicy[];
+}
+
+export interface McpDatabasePolicy {
+  databaseName: string;
+  readOnly: boolean;
+  allowDangerousSql: boolean;
 }
 
 export type DesktopIconTheme = "default" | "black";
@@ -116,13 +124,33 @@ export function normalizeMcpGlobalPolicy(policy: Partial<McpGlobalPolicy> | null
   const connectionPolicies = Object.values(
     (policy?.connectionPolicies ?? []).reduce<Record<string, McpConnectionPolicy>>((rules, rule) => {
       if (!rule || typeof rule.connectionId !== "string" || !rule.connectionId.trim()) return rules;
+      const databaseScope = rule.databaseScope === "selected" || rule.databaseScope === "none" ? rule.databaseScope : "all";
+      const allowedDatabases = databaseScope === "selected" ? [...new Set((rule.allowedDatabases ?? []).filter((database): database is string => typeof database === "string" && database.trim().length > 0).map((database) => database.trim()))] : [];
+      const allowedDatabaseNames = new Set(allowedDatabases);
+      const databasePolicies = Object.values(
+        (databaseScope === "selected" ? (rule.databasePolicies ?? []) : []).reduce<Record<string, McpDatabasePolicy>>((policies, databasePolicy) => {
+          if (!databasePolicy || typeof databasePolicy.databaseName !== "string") return policies;
+          const databaseName = databasePolicy.databaseName.trim();
+          if (!databaseName || !allowedDatabaseNames.has(databaseName)) return policies;
+          const current = policies[databaseName];
+          const readOnly = current?.readOnly === true || databasePolicy.readOnly === true;
+          policies[databaseName] = {
+            databaseName,
+            readOnly,
+            allowDangerousSql: !readOnly && (current ? current.allowDangerousSql && databasePolicy.allowDangerousSql === true : databasePolicy.allowDangerousSql === true),
+          };
+          return policies;
+        }, {}),
+      );
       rules[rule.connectionId.trim()] = {
         connectionId: rule.connectionId.trim(),
         readOnly: rule.readOnly === true,
         allowDangerousSql: rule.readOnly !== true && rule.allowDangerousSql === true,
         executionModeConfigured: rule.executionModeConfigured !== false,
-        databaseScope: rule.databaseScope === "selected" || rule.databaseScope === "none" ? rule.databaseScope : "all",
-        allowedDatabases: rule.databaseScope === "selected" ? [...new Set((rule.allowedDatabases ?? []).filter((database): database is string => typeof database === "string" && database.trim().length > 0).map((database) => database.trim()))] : [],
+        executionModePolicyVersion: rule.executionModePolicyVersion === 1 ? 1 : null,
+        databaseScope,
+        allowedDatabases,
+        databasePolicies,
       };
       return rules;
     }, {}),
@@ -170,7 +198,17 @@ export function normalizeDuckDbWorkerMaxProcesses(value: unknown): number {
 export interface AiProviderPreset extends Omit<AiConfig, "apiKey"> {
   label: string;
   iconSlug?: string;
+  iconPath?: string;
   requiresApiKey: boolean;
+  group?: "builtin" | "partner";
+}
+
+export interface AiPartnerProviderPreset extends AiProviderPreset {
+  id: string;
+  group: "partner";
+  websiteUrl: string;
+  apiKeyUrl: string;
+  descriptionKey: string;
 }
 
 export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
@@ -210,6 +248,15 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     provider: "deepseek",
     endpoint: "https://api.deepseek.com/v1",
     model: "deepseek-v4-flash",
+    apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: true,
+  },
+  kimi: {
+    label: "Kimi",
+    provider: "kimi",
+    endpoint: "https://api.moonshot.cn/v1",
+    model: "",
     apiStyle: "completions",
     authMethod: "bearer",
     requiresApiKey: true,
@@ -360,9 +407,51 @@ export function aiProviderLabel(provider: AiProvider, t: (key: string) => string
   return AI_PROVIDER_PRESETS[provider].label;
 }
 
+export const AI_PROVIDER_PARTNER_PRESETS: readonly AiPartnerProviderPreset[] = [
+  {
+    id: "jalapeno-cloud",
+    label: "Jalapeno Cloud",
+    iconPath: "/icons/ai/jalapeno-cloud.png",
+    group: "partner",
+    provider: "openai-compatible",
+    endpoint: "https://api.jalapeno-cloud.ai/v1",
+    model: "GLM-5.2",
+    models: [{ name: "GLM-5.2" }, { name: "DeepSeek-V4-Pro" }, { name: "MiniMax-M3" }],
+    apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: true,
+    websiteUrl: "https://www.jalapeno-cloud.ai/dbx",
+    apiKeyUrl: "https://www.jalapeno-cloud.ai/dbx",
+    descriptionKey: "ai.jalapenoDescription",
+  },
+];
+
+function normalizeAiProviderEndpoint(endpoint: string): string {
+  return endpoint.trim().replace(/\/+$/, "").toLowerCase();
+}
+
+export function getAiProviderPreset(provider: AiProvider, endpoint = ""): AiProviderPreset | AiPartnerProviderPreset {
+  const normalizedEndpoint = normalizeAiProviderEndpoint(endpoint);
+  const partnerPreset = AI_PROVIDER_PARTNER_PRESETS.find((preset) => preset.provider === provider && normalizeAiProviderEndpoint(preset.endpoint) === normalizedEndpoint);
+  return partnerPreset ?? AI_PROVIDER_PRESETS[provider];
+}
+
+export function getAiProviderPresetOption(id: string): AiProviderPreset | AiPartnerProviderPreset {
+  return AI_PROVIDER_PARTNER_PRESETS.find((preset) => preset.id === id) ?? AI_PROVIDER_PRESETS[id as AiProvider] ?? AI_PROVIDER_PRESETS.custom;
+}
+
+export function getAiProviderPresetId(provider: AiProvider, endpoint = ""): string {
+  const preset = getAiProviderPreset(provider, endpoint);
+  return "id" in preset ? preset.id : provider;
+}
+
+export function isAiPartnerProviderPreset(preset: AiProviderPreset | AiPartnerProviderPreset): preset is AiPartnerProviderPreset {
+  return preset.group === "partner";
+}
+
 const defaultConfigs: Record<AiProvider, Omit<AiConfig, "apiKey">> = Object.fromEntries(
   Object.entries(AI_PROVIDER_PRESETS).map(([provider, preset]) => {
-    const { label: _label, iconSlug: _iconSlug, requiresApiKey: _requiresApiKey, ...config } = preset;
+    const { label: _label, iconSlug: _iconSlug, iconPath: _iconPath, group: _group, requiresApiKey: _requiresApiKey, ...config } = preset;
     return [provider, config];
   }),
 ) as Record<AiProvider, Omit<AiConfig, "apiKey">>;
@@ -438,6 +527,7 @@ function inferAiProviderFromConfig(config: Partial<AiConfig> | null | undefined)
   const endpoint = config?.endpoint?.toLowerCase() ?? "";
   const model = config?.model?.toLowerCase() ?? "";
   if (endpoint.includes("deepseek") || model.includes("deepseek")) return "deepseek";
+  if (endpoint.includes("moonshot") || endpoint.includes("kimi.com") || model.includes("kimi")) return "kimi";
   if (endpoint.includes("dashscope") || endpoint.includes("aliyuncs") || model.includes("qwen")) return "qwen";
   if (endpoint.includes("generativelanguage.googleapis.com") || model.includes("gemini")) return "gemini";
   if (endpoint.includes("minimax.io") || endpoint.includes("minimaxi.com") || model.includes("minimax")) return "minimax";
@@ -686,6 +776,7 @@ export interface EditorSettings {
   sidebarCopyTableNameIncludeSchema: boolean;
   sidebarObjectInfoMode: SidebarObjectInfoMode;
   sidebarShowConnectionNotes: boolean;
+  sidebarShowTooltips: boolean;
   sidebarAllowHorizontalScroll: boolean;
   sidebarIndent: number;
   sidebarFontSize: number;
@@ -904,6 +995,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sidebarCopyTableNameIncludeSchema: false,
   sidebarObjectInfoMode: "comment-inline",
   sidebarShowConnectionNotes: false,
+  sidebarShowTooltips: true,
   sidebarAllowHorizontalScroll: false,
   sidebarIndent: SIDEBAR_INDENT_DEFAULT,
   sidebarFontSize: SIDEBAR_FONT_SIZE_DEFAULT,
@@ -1370,6 +1462,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
       ).sidebarShowDatabaseSizes,
     ),
     sidebarShowConnectionNotes: settings.sidebarShowConnectionNotes === true,
+    sidebarShowTooltips: settings.sidebarShowTooltips ?? DEFAULT_EDITOR_SETTINGS.sidebarShowTooltips,
     sidebarAllowHorizontalScroll: settings.sidebarAllowHorizontalScroll ?? DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll,
     sidebarIndent: normalizeSidebarIndent(settings.sidebarIndent),
     sidebarFontSize: normalizeSidebarFontSize(settings.sidebarFontSize),
@@ -1435,6 +1528,18 @@ function editorSettingsPatchSnapshot(settings: Partial<EditorSettings>): Partial
   return JSON.parse(JSON.stringify(settings)) as Partial<EditorSettings>;
 }
 
+/** Keep only well-formed, non-empty template id lists keyed by db_type. */
+function normalizeTemplateIdsByDbType(value?: Record<string, string[]>): Record<string, string[]> {
+  if (!value) return {};
+  const out: Record<string, string[]> = {};
+  for (const [dbType, ids] of Object.entries(value)) {
+    if (!Array.isArray(ids)) continue;
+    const cleaned = [...new Set(ids.filter((id): id is string => typeof id === "string" && id.trim() !== "").map((id) => id.trim()))];
+    if (cleaned.length > 0) out[dbType] = cleaned;
+  }
+  return out;
+}
+
 export interface SettingsNavigationRequest {
   id: number;
   tab: string;
@@ -1447,6 +1552,10 @@ export const useSettingsStore = defineStore("settings", () => {
   const activeModel = ref<{ configId: string; modelId: string } | null>(null);
   const effortPreferences = ref<AiModelEffortPreference[]>([]);
   const defaultAiMode = ref<AiAssistantMode>("ask");
+  // Per-db_type prompt template defaults (explicit opt-in) and last-used
+  // fallback; both resolved when an AI panel mounts or its namespace changes.
+  const aiDefaultTemplatesByDbType = ref<Record<string, string[]>>({});
+  const aiLastUsedTemplatesByDbType = ref<Record<string, string[]>>({});
   const isAiConfigLoaded = ref(false);
   const aiConfigs = ref<AiConfigItem[]>([]);
   const desktopSettings = ref<DesktopSettings>({ ...DEFAULT_DESKTOP_SETTINGS });
@@ -1636,6 +1745,8 @@ export const useSettingsStore = defineStore("settings", () => {
     const savedSelection = await api.loadAiChatSelection().catch(() => null);
     effortPreferences.value = (savedSelection?.effortPreferences ?? []).filter((preference) => aiConfigs.value.some((config) => config.id === preference.configId));
     defaultAiMode.value = savedSelection?.defaultMode ?? "ask";
+    aiDefaultTemplatesByDbType.value = normalizeTemplateIdsByDbType(savedSelection?.defaultTemplatesByDbType);
+    aiLastUsedTemplatesByDbType.value = normalizeTemplateIdsByDbType(savedSelection?.lastUsedTemplatesByDbType);
 
     const savedActive = savedSelection?.active;
     const savedConfig = savedActive ? aiConfigs.value.find((config) => config.id === savedActive.configId) : undefined;
@@ -1774,6 +1885,57 @@ export const useSettingsStore = defineStore("settings", () => {
     persistAiChatSelection();
   }
 
+  /** Empty id list clears the db_type entry so unsetting a default is expressible. */
+  function setDefaultTemplatesForDbType(dbType: string, templateIds: string[]) {
+    if (!dbType) return;
+    const next = { ...aiDefaultTemplatesByDbType.value };
+    const cleaned = [...new Set(templateIds.map((id) => id.trim()).filter((id) => id !== ""))];
+    if (cleaned.length === 0) delete next[dbType];
+    else next[dbType] = cleaned;
+    aiDefaultTemplatesByDbType.value = next;
+    persistAiChatSelection();
+  }
+
+  /**
+   * Called on send: a non-empty selection is remembered for the db_type, while
+   * sending with every template deselected is an explicit choice that clears
+   * the remembered selection — otherwise the stale entry would resurrect the
+   * old templates the next time a panel opens.
+   */
+  function recordLastUsedTemplates(dbType: string, templateIds: string[]) {
+    if (!dbType) return;
+    if (templateIds.length === 0) {
+      if (!(dbType in aiLastUsedTemplatesByDbType.value)) return;
+      const next = { ...aiLastUsedTemplatesByDbType.value };
+      delete next[dbType];
+      aiLastUsedTemplatesByDbType.value = next;
+      persistAiChatSelection();
+      return;
+    }
+    aiLastUsedTemplatesByDbType.value = { ...aiLastUsedTemplatesByDbType.value, [dbType]: [...templateIds] };
+    persistAiChatSelection();
+  }
+
+  function removeTemplateFromDefaultAndLastUsed(templateId: string) {
+    const strip = (record: Record<string, string[]>): Record<string, string[]> => {
+      let changed = false;
+      const next: Record<string, string[]> = {};
+      for (const [dbType, ids] of Object.entries(record)) {
+        const filtered = ids.filter((id) => id !== templateId);
+        if (filtered.length !== ids.length) changed = true;
+        if (filtered.length > 0) next[dbType] = filtered;
+      }
+      // Identity-preserving no-op lets the caller skip a needless persist.
+      return changed ? next : record;
+    };
+    const nextDefaults = strip(aiDefaultTemplatesByDbType.value);
+    const nextLastUsed = strip(aiLastUsedTemplatesByDbType.value);
+    if (nextDefaults === aiDefaultTemplatesByDbType.value && nextLastUsed === aiLastUsedTemplatesByDbType.value) return;
+    aiDefaultTemplatesByDbType.value = nextDefaults;
+    aiLastUsedTemplatesByDbType.value = nextLastUsed;
+    persistAiChatSelection();
+  }
+
   function persistAiChatSelection() {
     pendingAiChatSelection = {
       version: 1,
@@ -1783,6 +1945,11 @@ export const useSettingsStore = defineStore("settings", () => {
         selection: { ...preference.selection },
       })),
       defaultMode: defaultAiMode.value,
+      // Match the backend's skip_serializing_if(empty): omit the per-db_type
+      // records entirely while nothing is configured so the payload stays
+      // identical to the pre-defaults format for users without template picks.
+      ...(Object.keys(aiDefaultTemplatesByDbType.value).length > 0 ? { defaultTemplatesByDbType: aiDefaultTemplatesByDbType.value } : {}),
+      ...(Object.keys(aiLastUsedTemplatesByDbType.value).length > 0 ? { lastUsedTemplatesByDbType: aiLastUsedTemplatesByDbType.value } : {}),
     };
     if (!aiChatSelectionSaveRunning) void flushAiChatSelection();
   }
@@ -1805,7 +1972,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (!activeModel.value) return false;
     const config = aiConfigs.value.find((c) => c.id === activeModel.value!.configId);
     if (!config) return false;
-    const preset = AI_PROVIDER_PRESETS[config.provider];
+    const preset = getAiProviderPreset(config.provider, config.endpoint);
     if (
       config.provider === "codex-cli" ||
       config.provider === "claude-code-cli" ||
@@ -1962,6 +2129,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.sidebarCopyTableNameIncludeSchema !== undefined) editorSettings.value.sidebarCopyTableNameIncludeSchema = partial.sidebarCopyTableNameIncludeSchema === true;
     if (partial.sidebarObjectInfoMode !== undefined) editorSettings.value.sidebarObjectInfoMode = normalizeSidebarObjectInfoMode(partial.sidebarObjectInfoMode);
     if (partial.sidebarShowConnectionNotes !== undefined) editorSettings.value.sidebarShowConnectionNotes = partial.sidebarShowConnectionNotes === true;
+    if (partial.sidebarShowTooltips !== undefined) editorSettings.value.sidebarShowTooltips = partial.sidebarShowTooltips;
     if (partial.sidebarAllowHorizontalScroll !== undefined) editorSettings.value.sidebarAllowHorizontalScroll = partial.sidebarAllowHorizontalScroll;
     if (partial.sidebarIndent !== undefined) editorSettings.value.sidebarIndent = normalizeSidebarIndent(partial.sidebarIndent);
     if (partial.sidebarFontSize !== undefined) editorSettings.value.sidebarFontSize = normalizeSidebarFontSize(partial.sidebarFontSize);
@@ -2154,6 +2322,11 @@ export const useSettingsStore = defineStore("settings", () => {
     activeEffort,
     defaultAiMode,
     setDefaultAiMode,
+    aiDefaultTemplatesByDbType,
+    aiLastUsedTemplatesByDbType,
+    setDefaultTemplatesForDbType,
+    recordLastUsedTemplates,
+    removeTemplateFromDefaultAndLastUsed,
     isAiConfigLoaded,
     aiConfigs,
     initAiConfigs,

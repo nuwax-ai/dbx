@@ -49,7 +49,7 @@ const SQLSERVER_RESULT_TYPE_PROBE_SQL: &str = "\
         DECLARE @dbx_probe_object nvarchar(258) = N'tempdb..' + QUOTENAME(@dbx_probe_table); \
         DECLARE @dbx_probe_sql nvarchar(max); \
         BEGIN TRY \
-            SET @dbx_probe_sql = N'SELECT TOP (0) * INTO ' + QUOTENAME(@dbx_probe_table) + \
+            SET @dbx_probe_sql = CAST(@P4 AS nvarchar(max)) + N'SELECT TOP (0) * INTO ' + QUOTENAME(@dbx_probe_table) + \
                 N' FROM ' + @P3; \
             EXEC sys.sp_executesql @dbx_probe_sql; \
             SELECT c.name, TYPE_NAME(c.system_type_id) AS system_type_name, \
@@ -380,6 +380,29 @@ fn columns_from_metadata(metadata: &tiberius::ResultMetadata) -> Vec<String> {
     metadata.columns().iter().map(|c| c.name().to_string()).collect()
 }
 
+fn restore_sqlserver_blank_column_names(columns: &mut [String], sql: &str) {
+    if !columns.iter().any(|column| column.trim().is_empty()) {
+        return;
+    }
+    // The projection parser rejects wildcard expressions, whose expansion count is
+    // unknown and therefore cannot be mapped safely to result-column ordinals.
+    let Some(fallback_names) = sqlserver_projection_fallback_names(sql) else {
+        return;
+    };
+    if fallback_names.len() != columns.len() {
+        return;
+    }
+
+    for (column, fallback_name) in columns.iter_mut().zip(fallback_names) {
+        if !column.trim().is_empty() {
+            continue;
+        }
+        if let Some(fallback_name) = fallback_name.filter(|name| !name.trim().is_empty()) {
+            *column = fallback_name;
+        }
+    }
+}
+
 fn sqlserver_column_type_name(column: &tiberius::Column) -> String {
     match column.column_type() {
         ColumnType::BigVarChar => "varchar".to_string(),
@@ -579,6 +602,7 @@ async fn collect_first_result_limited(
     start: Instant,
     max_rows: Option<usize>,
     result_offset: usize,
+    sql: &str,
     query: &SqlServerUnsafeTypeQuery,
 ) -> Result<QueryResult, String> {
     let row_limit = query_result_row_limit(max_rows);
@@ -619,6 +643,7 @@ async fn collect_first_result_limited(
         }
     }
 
+    restore_sqlserver_blank_column_names(&mut columns, sql);
     restore_sqlserver_unsafe_column_types(&mut column_types, query);
 
     Ok(QueryResult {
@@ -691,6 +716,7 @@ impl SqlServerUnsafeTypeQuery {
 
 #[derive(Debug, PartialEq, Eq)]
 struct SqlServerLegacyProbe {
+    prefix: String,
     source_sql: String,
     output_names: Option<Vec<Option<String>>>,
     output_name_overrides: Vec<SqlServerProbeOutputNameOverride>,
@@ -744,9 +770,10 @@ async fn describe_sqlserver_result_set_with_mode(
     // SQL Server 2008 has no first-result-set DMV. Keep one probe round trip by
     // selecting the modern DMV path server-side and using metadata-only execution otherwise.
     let force_legacy = i32::from(force_legacy);
-    let mut stream = sqlserver_driver_result(
-        client.query(SQLSERVER_RESULT_TYPE_PROBE_SQL, &[&sql, &force_legacy, &legacy_probe.source_sql]),
-    )
+    let mut stream = sqlserver_driver_result(client.query(
+        SQLSERVER_RESULT_TYPE_PROBE_SQL,
+        &[&sql, &force_legacy, &legacy_probe.source_sql, &legacy_probe.prefix],
+    ))
     .await?;
     let mut active_result_index = None;
     let mut uses_describe_dmv = None;
@@ -972,7 +999,7 @@ fn sqlserver_legacy_probe_with_nonce(sql: &str, nonce: &str) -> Option<SqlServer
     } else {
         (format!("({}) AS {source_alias}", statement.inner), Vec::new())
     };
-    Some(SqlServerLegacyProbe { source_sql, output_names, output_name_overrides })
+    Some(SqlServerLegacyProbe { prefix: statement.prefix, source_sql, output_names, output_name_overrides })
 }
 
 fn sqlserver_projection_output_names(statement: &str) -> Option<Vec<Option<String>>> {
@@ -984,6 +1011,32 @@ fn sqlserver_projection_output_names(statement: &str) -> Option<Vec<Option<Strin
         return None;
     };
     select.projection.iter().map(sqlserver_projection_item_output_name).collect()
+}
+
+fn sqlserver_projection_fallback_names(statement: &str) -> Option<Vec<Option<String>>> {
+    let statements = Parser::parse_sql(&MsSqlDialect {}, statement).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    select.projection.iter().map(sqlserver_projection_item_fallback_name).collect()
+}
+
+fn sqlserver_projection_item_fallback_name(item: &SelectItem) -> Option<Option<String>> {
+    let SelectItem::UnnamedExpr(expr) = item else {
+        return sqlserver_projection_item_output_name(item);
+    };
+    if matches!(expr, Expr::Identifier(identifier) if identifier.value.starts_with('@')) {
+        return Some(None);
+    }
+
+    match sqlserver_projection_item_output_name(item) {
+        Some(Some(name)) => Some(Some(name)),
+        Some(None) => Some(Some(expr.to_string())),
+        None => None,
+    }
 }
 
 fn sqlserver_projection_item_output_name(item: &SelectItem) -> Option<Option<String>> {
@@ -1601,6 +1654,7 @@ async fn collect_ordered_result_sets_limited(
     max_rows: Option<usize>,
     result_offset: usize,
     event_layer: SqlServerTdsEventLayer,
+    sql: &str,
 ) -> Result<Vec<SqlServerBatchResult>, String> {
     let row_limit = query_result_row_limit(max_rows);
     let mut results = Vec::new();
@@ -1617,9 +1671,14 @@ async fn collect_ordered_result_sets_limited(
             QueryItem::Metadata(metadata) => {
                 push_sqlserver_ordered_result_set(&mut results, current.take(), start);
                 let remaining_offset = if saw_result_set { 0 } else { result_offset };
+                let first_result_set = !saw_result_set;
                 saw_result_set = true;
+                let mut columns = columns_from_metadata(&metadata);
+                if first_result_set {
+                    restore_sqlserver_blank_column_names(&mut columns, sql);
+                }
                 current = Some(SqlServerResultSet {
-                    columns: columns_from_metadata(&metadata),
+                    columns,
                     column_types: column_types_from_metadata(&metadata),
                     rows: Vec::new(),
                     truncated: false,
@@ -1627,12 +1686,18 @@ async fn collect_ordered_result_sets_limited(
                 });
             }
             QueryItem::Row(row) => {
-                let result = current.get_or_insert_with(|| SqlServerResultSet {
-                    columns: row.columns().iter().map(|c| c.name().to_string()).collect(),
-                    column_types: row.columns().iter().map(sqlserver_column_type_name).collect(),
-                    rows: Vec::new(),
-                    truncated: false,
-                    remaining_offset: if saw_result_set { 0 } else { result_offset },
+                let result = current.get_or_insert_with(|| {
+                    let mut columns = row.columns().iter().map(|c| c.name().to_string()).collect::<Vec<_>>();
+                    if !saw_result_set {
+                        restore_sqlserver_blank_column_names(&mut columns, sql);
+                    }
+                    SqlServerResultSet {
+                        columns,
+                        column_types: row.columns().iter().map(sqlserver_column_type_name).collect(),
+                        rows: Vec::new(),
+                        truncated: false,
+                        remaining_offset: if saw_result_set { 0 } else { result_offset },
+                    }
                 });
                 saw_result_set = true;
                 if result.remaining_offset > 0 {
@@ -1694,6 +1759,7 @@ pub async fn stream_first_result_set(
                 if active_result_index.is_none() {
                     active_result_index = Some(metadata.result_index());
                     columns = columns_from_metadata(&metadata);
+                    restore_sqlserver_blank_column_names(&mut columns, sql);
                     column_types = column_types_from_metadata(&metadata);
                     restore_sqlserver_unsafe_column_types(&mut column_types, &query);
                     on_item(SqlServerStreamItem::Columns { columns: &columns, column_types: &column_types })?;
@@ -1704,6 +1770,7 @@ pub async fn stream_first_result_set(
                 if active_result_index.is_none() {
                     active_result_index = Some(row.result_index());
                     columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    restore_sqlserver_blank_column_names(&mut columns, sql);
                     column_types = row.columns().iter().map(sqlserver_column_type_name).collect();
                     restore_sqlserver_unsafe_column_types(&mut column_types, &query);
                     on_item(SqlServerStreamItem::Columns { columns: &columns, column_types: &column_types })?;
@@ -2401,7 +2468,10 @@ fn sqlserver_list_tables_sql_with_kind(
             }
         })
         .unwrap_or_default();
-    let base_columns = "o.name, CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END, ep.value AS TABLE_COMMENT";
+    // The ROW_NUMBER pagination path wraps these projections in a derived table;
+    // SQL Server requires every derived-table column to have a name.
+    let base_columns =
+        "o.name, CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END AS TABLE_TYPE, ep.value AS TABLE_COMMENT";
     let base_from = "FROM sys.objects o \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
          OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep \
@@ -2994,7 +3064,8 @@ pub async fn execute_query_with_max_rows(
         };
         let (result, messages) = capture_sqlserver_messages(async {
             let stream = sqlserver_driver_result(client.query(query.sql.as_str(), &[])).await?;
-            sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows, result_offset, &query)).await
+            sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows, result_offset, sql, &query))
+                .await
         })
         .await;
         let mut result = query_result_with_server_messages(result?, messages);
@@ -3080,6 +3151,7 @@ pub(crate) async fn execute_batch_with_max_rows_metadata(
                         start,
                         max_rows,
                         result_offset,
+                        sql,
                         &query,
                     ))
                     .await
@@ -3124,8 +3196,15 @@ pub(crate) async fn execute_simple_batch_with_max_rows_metadata(
     let captured = layer.clone();
     let results = async {
         let stream = sqlserver_driver_result(client.simple_query(sql)).await?;
-        sqlserver_driver_result(collect_ordered_result_sets_limited(stream, start, max_rows, result_offset, captured))
-            .await
+        sqlserver_driver_result(collect_ordered_result_sets_limited(
+            stream,
+            start,
+            max_rows,
+            result_offset,
+            captured,
+            sql,
+        ))
+        .await
     }
     .with_subscriber(tracing_subscriber::registry().with(layer))
     .await;
@@ -3168,7 +3247,7 @@ async fn execute_simple_batch_first_result_with_max_rows(
     let (result, messages) = capture_sqlserver_messages(async {
         let stream = sqlserver_driver_result(client.simple_query(sql)).await?;
         let query = SqlServerUnsafeTypeQuery::plain(sql);
-        sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows, result_offset, &query)).await
+        sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows, result_offset, sql, &query)).await
     })
     .await;
     let mut result = query_result_with_server_messages(result?, messages);
@@ -3419,7 +3498,7 @@ mod tests {
         decode_sqlserver_spatial_values, format_sqlserver_numeric, is_blocking_sqlserver_unsafe_probe_error,
         is_sqlserver_legacy_duplicate_probe_error, is_sqlserver_spatial_column, is_sqlserver_variant_column,
         push_sqlserver_ordered_events, query_result_with_server_messages, query_result_with_server_messages_metadata,
-        requires_simple_query_batch, restore_sqlserver_legacy_probe_output_names,
+        requires_simple_query_batch, restore_sqlserver_blank_column_names, restore_sqlserver_legacy_probe_output_names,
         restore_sqlserver_spatial_column_types, restore_sqlserver_unsafe_column_types, server_messages_query_result,
         sqlserver_batch_can_use_execute, sqlserver_bulk_token_row, sqlserver_cell_to_json, sqlserver_columns_sql,
         sqlserver_completion_assistant_sql, sqlserver_dml_output_returns_rows, sqlserver_done_trace_event,
@@ -3448,6 +3527,78 @@ mod tests {
 
         assert!(matches!(&values[0], ColumnData::String(Some(value)) if value.as_ref() == "Tieng Viet"));
         assert!(matches!(&values[1], ColumnData::String(None)));
+    }
+
+    #[test]
+    fn sqlserver_blank_result_column_names_restore_projection_names() {
+        let mut aggregate_columns = vec![String::new(); 3];
+        restore_sqlserver_blank_column_names(
+            &mut aggregate_columns,
+            "SELECT COUNT(*), SUM(amount), MAX(created_at) FROM users",
+        );
+        assert_eq!(
+            aggregate_columns,
+            vec!["COUNT(*)".to_string(), "SUM(amount)".to_string(), "MAX(created_at)".to_string()]
+        );
+
+        let mut grouped_columns = vec!["category".to_string(), String::new(), String::new()];
+        restore_sqlserver_blank_column_names(
+            &mut grouped_columns,
+            "SELECT category, COUNT(*), SUM(amount) FROM users GROUP BY category",
+        );
+        assert_eq!(grouped_columns, vec!["category".to_string(), "COUNT(*)".to_string(), "SUM(amount)".to_string()]);
+
+        let mut nested_expression = vec![String::new()];
+        restore_sqlserver_blank_column_names(&mut nested_expression, "SELECT COALESCE(amount, 0) FROM users");
+        assert_eq!(nested_expression, vec!["COALESCE(amount, 0)".to_string()]);
+
+        let mut ordinary_columns = vec![String::new(); 2];
+        restore_sqlserver_blank_column_names(&mut ordinary_columns, "SELECT id, name FROM users");
+        assert_eq!(ordinary_columns, vec!["id".to_string(), "name".to_string()]);
+
+        let mut metadata_name = vec!["something".to_string()];
+        restore_sqlserver_blank_column_names(&mut metadata_name, "SELECT COUNT(*) FROM users");
+        assert_eq!(metadata_name, vec!["something".to_string()]);
+
+        let mut aliased_column = vec!["total".to_string()];
+        restore_sqlserver_blank_column_names(&mut aliased_column, "SELECT COUNT(*) AS total FROM users");
+        assert_eq!(aliased_column, vec!["total".to_string()]);
+    }
+
+    #[test]
+    fn sqlserver_blank_result_column_fallback_rejects_ambiguous_projection_mapping() {
+        let mut wildcard_columns = vec![String::new(); 2];
+        restore_sqlserver_blank_column_names(&mut wildcard_columns, "SELECT *, COUNT(*) FROM users");
+        assert_eq!(wildcard_columns, vec![String::new(); 2]);
+
+        let mut qualified_wildcard_columns = vec![String::new(); 2];
+        restore_sqlserver_blank_column_names(&mut qualified_wildcard_columns, "SELECT users.*, COUNT(*) FROM users");
+        assert_eq!(qualified_wildcard_columns, vec![String::new(); 2]);
+
+        let mut batch_columns = vec![String::new()];
+        restore_sqlserver_blank_column_names(
+            &mut batch_columns,
+            "SELECT COUNT(*) FROM users; SELECT SUM(amount) FROM users",
+        );
+        assert_eq!(batch_columns, vec![String::new()]);
+    }
+
+    #[test]
+    fn sqlserver_blank_result_column_fallback_handles_sqlserver_query_shapes() {
+        let mut top_columns = vec![String::new()];
+        restore_sqlserver_blank_column_names(&mut top_columns, "SELECT TOP 10 COUNT(*) FROM users");
+        assert_eq!(top_columns, vec!["COUNT(*)".to_string()]);
+
+        let mut distinct_columns = vec![String::new()];
+        restore_sqlserver_blank_column_names(&mut distinct_columns, "SELECT DISTINCT category FROM users");
+        assert_eq!(distinct_columns, vec!["category".to_string()]);
+
+        let mut cte_columns = vec![String::new()];
+        restore_sqlserver_blank_column_names(
+            &mut cte_columns,
+            "WITH x AS (SELECT category FROM users) SELECT COUNT(*) FROM x",
+        );
+        assert_eq!(cte_columns, vec!["COUNT(*)".to_string()]);
     }
 
     #[tokio::test]
@@ -4040,7 +4191,9 @@ mod tests {
 
         let first_result = source.split("async fn execute_simple_batch_first_result_with_max_rows").nth(1).unwrap();
         let first_result = first_result.split("fn strip_dbx_sqlserver_row_number_column").next().unwrap();
-        assert!(first_result.contains("collect_first_result_limited(stream, start, max_rows, result_offset, &query)"));
+        assert!(
+            first_result.contains("collect_first_result_limited(stream, start, max_rows, result_offset, sql, &query)")
+        );
         assert!(!first_result.contains("collect_result_sets_limited"));
     }
 
@@ -4307,6 +4460,14 @@ mod tests {
         assert!(!sql.contains("o.type IN ('U','V')"));
         assert!(sql.contains("ROW_NUMBER() OVER (ORDER BY o.name)"));
         assert!(sql.contains("__dbx_rn > 100 AND __dbx_rn <= 201"));
+    }
+
+    #[test]
+    fn sqlserver_table_objects_pagination_names_every_derived_column() {
+        let sql = sqlserver_table_objects_sql("dbo", None, Some(100), Some(100));
+
+        assert!(sql.contains("END AS TABLE_TYPE, ep.value AS TABLE_COMMENT"));
+        assert!(!sql.contains("END, ep.value AS TABLE_COMMENT"));
     }
 
     #[test]
@@ -5248,10 +5409,26 @@ mod tests {
         assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("sys.dm_exec_describe_first_result_set"));
         assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("##dbx_result_type_probe_"));
         assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("SELECT TOP (0) * INTO"));
+        assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("CAST(@P4 AS nvarchar(max)) + N'SELECT TOP (0) * INTO"));
         assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("N' FROM ' + @P3"));
         assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("FROM tempdb.sys.columns"));
         assert!(!SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("FMTONLY"));
         assert_eq!(SQLSERVER_RESULT_TYPE_PROBE_SQL.matches("SELECT @dbx_use_describe_dmv").count(), 1);
+    }
+
+    #[test]
+    fn sqlserver_legacy_probe_keeps_long_projection_text_untruncated() {
+        let aliases = (1..=136).map(|index| format!("[dbx_col_{index}]")).collect::<Vec<_>>().join(", ");
+        let source_sql = format!(
+            "(SELECT TOP (100) {} FROM [dbo].[ProjectInfo] WHERE ([PrjId] = N'123')) AS [dbx_probe_source]({aliases})",
+            (1..=136).map(|index| format!("[column_{index:03}]")).collect::<Vec<_>>().join(", "),
+        );
+
+        // SQL Server evaluates non-MAX concatenations left-to-right and caps
+        // nvarchar results at 4,000 characters. This is the shape reported in
+        // #7827; the explicit MAX cast must precede the dynamic source text.
+        assert!(source_sql.len() > 3_900);
+        assert!(SQLSERVER_RESULT_TYPE_PROBE_SQL.contains("CAST(@P4 AS nvarchar(max)) +"));
     }
 
     #[test]
@@ -5296,6 +5473,27 @@ mod tests {
             probe.output_names,
             Some(vec![Some("HJRQ".to_string()), Some("HJRQ".to_string()), Some("total".to_string()), None])
         );
+        assert_eq!(probe.prefix, "");
+    }
+
+    #[test]
+    fn sqlserver_legacy_probe_preserves_cte_prefix() {
+        let probe = sqlserver_legacy_probe(
+            ";WITH source AS (\n    SELECT 1 AS num -- keep the CTE line break\n)\nSELECT num FROM source;",
+        )
+        .unwrap();
+
+        assert_eq!(probe.prefix, ";WITH source AS (\n    SELECT 1 AS num -- keep the CTE line break\n)\n");
+        assert_eq!(probe.source_sql, "(SELECT num FROM source) AS [dbx_probe_source]([dbx_col_1])");
+        assert_eq!(probe.output_names, Some(vec![Some("num".to_string())]));
+    }
+
+    #[test]
+    fn sqlserver_legacy_probe_preserves_comments_before_select() {
+        let probe = sqlserver_legacy_probe("-- result query\n/* keep this block */ SELECT 1 AS num").unwrap();
+
+        assert_eq!(probe.prefix, "-- result query\n/* keep this block */ ");
+        assert_eq!(probe.source_sql, "(SELECT 1 AS num) AS [dbx_probe_source]([dbx_col_1])");
     }
 
     #[test]
@@ -5583,8 +5781,24 @@ mod tests {
         let variant = super::execute_query(&mut client, sql).await.unwrap();
         assert_eq!(variant.rows, vec![vec![serde_json::json!(1), serde_json::json!("legacy")]]);
 
+        let simple_cte_sql = "WITH t AS (SELECT 1 AS num) SELECT num FROM t";
+        let simple_cte_probe = super::sqlserver_legacy_probe(simple_cte_sql).unwrap();
+        let simple_cte_legacy_columns =
+            super::describe_sqlserver_result_set_with_mode(&mut client, simple_cte_sql, &simple_cte_probe, true)
+                .await
+                .unwrap();
+        assert_eq!(simple_cte_legacy_columns.len(), 1);
+        assert_eq!(simple_cte_legacy_columns[0].system_type_name.as_deref(), Some("int"));
+        let simple_cte = super::execute_query(&mut client, simple_cte_sql).await.unwrap();
+        assert_eq!(simple_cte.rows, vec![vec![serde_json::json!(1)]]);
+
         let cte_sql = "WITH source AS (SELECT id, payload FROM #dbx_issue_4002) SELECT id, payload FROM source";
         assert!(super::is_single_sqlserver_select(cte_sql));
+        let cte_probe = super::sqlserver_legacy_probe(cte_sql).unwrap();
+        let cte_legacy_columns =
+            super::describe_sqlserver_result_set_with_mode(&mut client, cte_sql, &cte_probe, true).await.unwrap();
+        assert_eq!(cte_legacy_columns.len(), 2);
+        assert!(is_sqlserver_variant_column(&cte_legacy_columns[1]));
         let cte_variant = super::execute_query(&mut client, cte_sql).await.unwrap();
         assert_eq!(cte_variant.rows, vec![vec![serde_json::json!(1), serde_json::json!("legacy")]]);
 
@@ -5609,6 +5823,7 @@ mod tests {
 
         let wildcard_sql = "SELECT ybbz, cytzrq, jzrq, * FROM #dbx_issue_4002";
         let previous_wildcard_probe = super::SqlServerLegacyProbe {
+            prefix: String::new(),
             source_sql: format!("({wildcard_sql}) AS [dbx_probe_source]"),
             output_names: None,
             output_name_overrides: Vec::new(),

@@ -48,6 +48,7 @@ import type {
   SshConfigHostEntry,
   TunnelProfile,
 } from "@/types/database";
+import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
@@ -165,6 +166,7 @@ import type {
   DataGridSaveStatementOptions,
   HiveTablePropertiesSqlOptions,
 } from "@/lib/dataGrid/dataGridSql";
+import type { DmlChangePreviewSqlOptions, DmlChangePreviewSqlResult } from "@/lib/sql/dmlChangePreview";
 import type { DataGridExtractRequest, DataGridExtractResult } from "@/lib/dataGrid/dataGridCopyExtractor";
 import type { BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
@@ -371,6 +373,10 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 
 export async function testConnection(config: ConnectionConfig): Promise<string> {
   return post("/api/connection/test", { config });
+}
+
+export async function testSshTunnel(config: ConnectionConfig): Promise<string> {
+  return post("/api/connection/test-ssh-tunnel", { config });
 }
 
 export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
@@ -1527,6 +1533,10 @@ export async function buildDataGridCopyInsertStatement(options: DataGridCopyInse
   return result ?? undefined;
 }
 
+export async function buildDmlChangePreviewSql(options: DmlChangePreviewSqlOptions): Promise<DmlChangePreviewSqlResult> {
+  return post("/api/query/build-dml-change-preview-sql", { options });
+}
+
 export async function buildDataGridContextFilterCondition(options: DataGridContextFilterConditionOptions): Promise<string | undefined> {
   const result = await post<string | null>("/api/query/build-data-grid-context-filter-condition", { options });
   return result ?? undefined;
@@ -1888,6 +1898,20 @@ export async function saveOpenTabsState(payload: OpenTabsStatePayload): Promise<
   await saveBrowserAppState("open_tabs", payload);
 }
 
+export async function saveDetachedTabHandoff(_tabId: string, _handoff: DetachedTabHandoff): Promise<void> {}
+
+export async function loadDetachedTabHandoff(_tabId: string): Promise<DetachedTabHandoff | null> {
+  return null;
+}
+
+export async function listDetachedTabHandoffs(): Promise<DetachedTabHandoff[]> {
+  return [];
+}
+
+export async function deleteDetachedTabHandoff(_tabId: string): Promise<void> {}
+
+export async function approveDetachedWindowClose(): Promise<void> {}
+
 export async function loadSavedSqlEditorPositions(): Promise<unknown[] | null> {
   const value = await loadBrowserAppState("saved_sql_editor_positions");
   return Array.isArray(value) ? value : null;
@@ -2237,7 +2261,7 @@ export async function writeExternalSqlFile(_path: string, _content: string, _opt
   throw new Error("Saving external SQL file paths is only available in the desktop app");
 }
 
-export async function saveExternalSqlFile(_defaultFileName: string, _content: string): Promise<{ path: string; version: import("@/types/database").ExternalSqlFileVersion } | null> {
+export async function saveExternalSqlFile(_defaultFileName: string, _content: string, _filterExtension?: string): Promise<{ path: string; version: import("@/types/database").ExternalSqlFileVersion } | null> {
   throw new Error("Saving SQL files locally is only available in the desktop app");
 }
 

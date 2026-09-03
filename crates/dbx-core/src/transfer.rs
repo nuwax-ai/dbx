@@ -1,6 +1,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::connection::{config_for_pool_key, AppState, PoolKind};
@@ -25,6 +26,13 @@ static OCEANBASE_MYSQL_TABLE_OPTION_RE: std::sync::LazyLock<Regex> = std::sync::
 });
 static MYSQL_COLLATE_CLAUSE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"(?i)\bCOLLATE\s*=?\s*([A-Za-z0-9_]+)\b").expect("valid MySQL COLLATE clause regex")
+});
+// An inline FK constraint *definition line*: an optional `CONSTRAINT <name>`
+// prefix followed by `FOREIGN KEY (`. Anchored to the line start so column
+// definitions whose COMMENT/DEFAULT strings mention "foreign key" never match.
+static INLINE_FOREIGN_KEY_CONSTRAINT_LINE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r#"(?i)^\s*(?:CONSTRAINT\s+(?:`[^`]*`|"[^"]*"|\S+)\s+)?FOREIGN\s+KEY\s*\("#)
+        .expect("valid inline foreign key constraint line regex")
 });
 
 const MAX_TRANSFER_WRITE_SQL_BYTES: usize = 512 * 1024;
@@ -791,8 +799,66 @@ fn existing_transfer_target_table_name(
     tables.iter().find(|table| table.name.eq_ignore_ascii_case(requested_name)).map(|table| table.name.clone())
 }
 
+const TRANSFER_PROGRESS_CHANNEL_CAPACITY: usize = 16;
+
+fn try_send_transfer_progress(sender: &tokio::sync::mpsc::Sender<TransferProgress>, progress: TransferProgress) {
+    let _ = sender.try_send(progress);
+}
+
+struct AbortTransferTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTransferTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_transfer_tables_isolated(
+    state: Arc<AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    catalog: Option<String>,
+    db_type: DatabaseType,
+    table: String,
+    limit: usize,
+) -> Result<Vec<db::TableInfo>, String> {
+    let task = tokio::spawn(async move {
+        if let Some(catalog) = resolve_external_transfer_catalog(catalog.as_deref(), &db_type) {
+            crate::schema::list_doris_catalog_tables_core(
+                &state,
+                &connection_id,
+                catalog,
+                &database,
+                Some(&table),
+                Some(limit),
+                None,
+                None,
+                None,
+            )
+            .await
+        } else {
+            crate::schema::list_tables_core(
+                &state,
+                &connection_id,
+                &database,
+                &schema,
+                Some(&table),
+                Some(limit),
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+    });
+    let _abort_on_drop = AbortTransferTaskOnDrop(task.abort_handle());
+    task.await.map_err(|error| format!("Transfer table metadata task failed: {error}"))?
+}
+
 async fn resolve_transfer_target_table_name(
-    state: &AppState,
+    state: &Arc<AppState>,
     request: &TransferRequest,
     source_table: &str,
     target_pool_key: &str,
@@ -811,41 +877,21 @@ async fn resolve_transfer_target_table_name(
     // Route through the catalog-aware path when targeting an external
     // Doris/StarRocks catalog — otherwise the lookup runs against the
     // default / internal catalog and can miss or misidentify the table.
-    let tables = if let Some(catalog) = resolve_external_transfer_catalog(target_catalog, target_db_type) {
-        crate::schema::list_doris_catalog_tables_core(
-            state,
-            &request.target_connection_id,
-            catalog,
-            &request.target_database,
-            Some(&requested_name),
-            Some(TRANSFER_TARGET_TABLE_LOOKUP_LIMIT),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            log::debug!("[transfer] failed to resolve target table metadata for {requested_name} in catalog '{catalog}': {error}");
-            Vec::new()
-        })
-    } else {
-        crate::schema::list_tables_core(
-            state,
-            &request.target_connection_id,
-            &request.target_database,
-            &request.target_schema,
-            Some(&requested_name),
-            Some(TRANSFER_TARGET_TABLE_LOOKUP_LIMIT),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            log::debug!("[transfer] failed to resolve target table metadata for {requested_name}: {error}");
-            Vec::new()
-        })
-    };
+    let tables = list_transfer_tables_isolated(
+        state.clone(),
+        request.target_connection_id.clone(),
+        request.target_database.clone(),
+        request.target_schema.clone(),
+        target_catalog.map(str::to_string),
+        *target_db_type,
+        requested_name.clone(),
+        TRANSFER_TARGET_TABLE_LOOKUP_LIMIT,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        log::debug!("[transfer] failed to resolve target table metadata for {requested_name}: {error}");
+        Vec::new()
+    });
 
     if let Some(existing_name) =
         existing_transfer_target_table_name(&requested_name, &tables, allow_case_insensitive_match)
@@ -1577,6 +1623,42 @@ fn required_unmapped_transfer_target_columns(
         })
         .map(|column| column.name.clone())
         .collect()
+}
+
+/// Fails fast when a preexisting target table's structure can't accept the
+/// source columns. DBX never alters an existing target table's columns, so
+/// skipping this check (structure-only transfers used to silently skip it,
+/// #7660) leaves the transfer reporting success while the target quietly stays
+/// out of sync with the source.
+fn validate_preexisting_target_columns(
+    target_columns: &[db::ColumnInfo],
+    col_names: &[String],
+    target_db_type: &DatabaseType,
+    quote_target_column_names: bool,
+    target_table: &str,
+) -> Result<(), String> {
+    let missing = missing_transfer_target_columns(target_columns, col_names, target_db_type, quote_target_column_names);
+    if !missing.is_empty() {
+        return Err(format!(
+            "Target table '{target_table}' already exists with a different structure and is missing column(s) \
+             {} present in the source table. DBX does not alter an existing target table's columns during \
+             transfer — drop the target table or adjust its structure to match the source first.",
+            missing.join(", ")
+        ));
+    }
+
+    let required =
+        required_unmapped_transfer_target_columns(target_columns, col_names, target_db_type, quote_target_column_names);
+    if !required.is_empty() {
+        return Err(format!(
+            "Target table '{target_table}' already exists with a different structure and has required column(s) \
+             {} that are not present in the source table and have no default or generated value. DBX does not \
+             alter an existing target table's columns during transfer — drop the target table or adjust its \
+             structure to match the source first.",
+            required.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 fn transfer_key_columns(columns: &[db::ColumnInfo], db_type: &DatabaseType) -> Vec<String> {
@@ -4601,6 +4683,21 @@ fn sql_rows_to_mongo_documents(columns: &[String], rows: &[Vec<serde_json::Value
         .collect()
 }
 
+/// Select the representation used by a MongoDB transfer. MongoDB-to-MongoDB
+/// writes consume canonical Extended JSON so BSON values (for example dates)
+/// keep their server-side types; SQL targets continue using the browser view.
+fn mongo_documents_for_transfer(result: MongoDocumentResult, preserve_bson_types: bool) -> Vec<serde_json::Value> {
+    let MongoDocumentResult { documents, extended_documents, .. } = result;
+    if preserve_bson_types {
+        match extended_documents {
+            Some(extended_documents) if extended_documents.len() == documents.len() => extended_documents,
+            _ => documents,
+        }
+    } else {
+        documents
+    }
+}
+
 async fn find_mongo_documents_extended_json(
     state: &AppState,
     connection_id: &str,
@@ -4866,6 +4963,10 @@ fn transfer_ddl_statements(sql: &str, db_type: &DatabaseType) -> Vec<String> {
 /// text, which both Postgres and MySQL-family `SHOW CREATE TABLE` output share,
 /// and on foreign key constraints always being the last items before the closing
 /// paren (true for both dialects' DDL dumps).
+///
+/// Only genuine constraint definition lines match (`CONSTRAINT <name> FOREIGN
+/// KEY (` / bare `FOREIGN KEY (`); a column line whose COMMENT or DEFAULT text
+/// merely mentions the words must survive (#7660).
 fn strip_inline_foreign_key_constraint_lines(statement: &str) -> String {
     if !statement.trim_start().to_ascii_uppercase().starts_with("CREATE TABLE ") {
         return statement.to_string();
@@ -4873,7 +4974,7 @@ fn strip_inline_foreign_key_constraint_lines(statement: &str) -> String {
 
     let mut lines: Vec<String> = Vec::new();
     for line in statement.lines() {
-        if line.to_ascii_uppercase().contains(" FOREIGN KEY ") {
+        if INLINE_FOREIGN_KEY_CONSTRAINT_LINE_RE.is_match(line) {
             if let Some(previous) = lines.last_mut() {
                 let trimmed_len = previous.trim_end_matches(char::is_whitespace).len();
                 if previous[..trimmed_len].ends_with(',') {
@@ -4993,35 +5094,30 @@ async fn execute_on_pool_once(
 ) -> Result<db::QueryResult, String> {
     // Read-only check: block transfer operations in readonly mode
     crate::query::check_read_only_for_connection(state, pool_key, sql).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(pool_key).ok_or("Connection not found")?;
+    let pool_handle = state.pool_handle(pool_key).await;
+    let pool = pool_handle.as_ref().ok_or("Connection not found")?;
 
     match pool {
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
             let bare = *mode == crate::connection::MysqlMode::Bare;
-            drop(connections);
             db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, Default::default()).await
         }
         PoolKind::Postgres(p) => {
             let p = p.clone();
-            drop(connections);
             db::postgres::execute_query_with_max_rows(&p, sql, max_rows).await
         }
         PoolKind::Sqlite(p) => {
             let p = p.clone();
-            drop(connections);
             db::sqlite::execute_query_with_max_rows(&p, sql, max_rows).await
         }
         PoolKind::ClickHouse(client) => {
             let client = client.clone();
             let database = database_from_pool_key(pool_key).unwrap_or("default").to_string();
-            drop(connections);
             db::clickhouse_driver::execute_query_with_max_rows(&client, &database, sql, max_rows).await
         }
         PoolKind::SqlServer(client) => {
             let client = client.clone();
-            drop(connections);
             let mut client = client.lock().await;
             let result = db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows).await;
             drop(client);
@@ -5031,7 +5127,6 @@ async fn execute_on_pool_once(
             let client = client.clone();
             let database = database_from_pool_key(pool_key).map(str::to_string);
             let sql = sql.to_string();
-            drop(connections);
             let mut client = client.lock().await;
             let params = agent_execute_query_params(
                 &sql,
@@ -5058,7 +5153,6 @@ async fn execute_on_pool_once(
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
             let sql = sql.to_string();
-            drop(connections);
             client.execute(None, sql, max_rows, None, None).await
         }
         _ => Err("Unsupported database type for transfer".to_string()),
@@ -5122,56 +5216,56 @@ pub async fn get_columns_for_transfer(
     table: &str,
     catalog: Option<&str>,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    let connections = state.connections.read().await;
+    let pool_handle = state.pool_handle(pool_key).await;
 
     #[cfg(feature = "duckdb-sidecar")]
-    if let Some(PoolKind::DuckDbWorker(client)) = connections.get(pool_key) {
+    if let Some(PoolKind::DuckDbWorker(client)) = pool_handle.as_ref() {
         let client = client.clone();
         let database = database.to_string();
         let schema = schema.to_string();
         let table = table.to_string();
-        drop(connections);
         return client.list_columns(database, schema, table).await;
     }
 
-    if let Some(PoolKind::ClickHouse(client)) = connections.get(pool_key) {
+    if let Some(PoolKind::ClickHouse(client)) = pool_handle.as_ref() {
         let client = client.clone();
         let database = database.to_string();
         let table = table.to_string();
-        drop(connections);
         return db::clickhouse_driver::get_columns(&client, &database, &table).await;
     }
-    if let Some(PoolKind::SqlServer(client)) = connections.get(pool_key) {
+    if let Some(PoolKind::SqlServer(client)) = pool_handle.as_ref() {
         let client = client.clone();
         let schema = schema.to_string();
         let table = table.to_string();
-        drop(connections);
         let mut client = client.lock().await;
         return db::sqlserver::get_columns(&mut client, &schema, &table).await;
     }
-    if let Some(PoolKind::InfluxDb(client)) = connections.get(pool_key) {
+    if let Some(PoolKind::InfluxDb(client)) = pool_handle.as_ref() {
         let client = client.clone();
         let database = database.to_string();
         let table = table.to_string();
-        drop(connections);
         return db::influxdb_driver::get_columns(&client, &database, &table).await;
     }
-    if let Some(PoolKind::Agent(client)) = connections.get(pool_key) {
+    if let Some(PoolKind::InfluxDb3(client)) = pool_handle.as_ref() {
+        let client = client.clone();
+        let database = database.to_string();
+        let table = table.to_string();
+        return db::influxdb3_driver::get_columns(&client, &database, &table).await;
+    }
+    if let Some(PoolKind::Agent(client)) = pool_handle.as_ref() {
         let client = client.clone();
         let database = database.to_string();
         let schema = schema.to_string();
         let table = table.to_string();
-        drop(connections);
         let mut client = client.lock().await;
         return client.get_columns(&database, &schema, &table, None).await;
     }
-    if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(pool_key) {
+    if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
         let config = config.clone();
         let session = session.clone();
         let database = database.to_string();
         let schema = schema.to_string();
         let table = table.to_string();
-        drop(connections);
         return session
             .invoke_with_timeout(
                 "getColumns",
@@ -5185,14 +5279,13 @@ pub async fn get_columns_for_transfer(
             )
             .await;
     }
-    let pool = connections.get(pool_key).ok_or("Pool not found")?;
+    let pool = pool_handle.as_ref().ok_or("Pool not found")?;
     let schema = schema.to_string();
     let table = table.to_string();
     match pool {
         PoolKind::Mysql(p, _) => {
             let p = p.clone();
             let catalog = normalize_external_catalog_name(catalog).map(str::to_string);
-            drop(connections);
             if let Some(catalog) = catalog {
                 // Use 3-part qualified column lookup for Doris/StarRocks external catalogs
                 db::doris::get_catalog_columns(&p, &catalog, &schema, &table).await
@@ -5202,12 +5295,10 @@ pub async fn get_columns_for_transfer(
         }
         PoolKind::Postgres(p) => {
             let p = p.clone();
-            drop(connections);
             db::postgres::get_columns(&p, &schema, &table).await
         }
         PoolKind::Sqlite(p) => {
             let p = p.clone();
-            drop(connections);
             db::sqlite::get_columns(&p, &schema, &table).await
         }
         _ => Err("Unsupported database type".to_string()),
@@ -5221,21 +5312,19 @@ async fn get_postgres_indexes_for_transfer(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::IndexInfo>, String> {
-    let connections = state.connections.read().await;
-    if let Some(PoolKind::Agent(client)) = connections.get(pool_key) {
+    let pool_handle = state.pool_handle(pool_key).await;
+    if let Some(PoolKind::Agent(client)) = pool_handle.as_ref() {
         let client = client.clone();
         let database = database.to_string();
         let schema = schema.to_string();
         let table = table.to_string();
-        drop(connections);
         let mut client = client.lock().await;
         return client.list_indexes(&database, &schema, &table, None).await;
     }
-    let Some(PoolKind::Postgres(pool)) = connections.get(pool_key) else {
+    let Some(PoolKind::Postgres(pool)) = pool_handle.as_ref() else {
         return Err("PostgreSQL pool not found".to_string());
     };
     let pool = pool.clone();
-    drop(connections);
     db::postgres::list_indexes(&pool, schema, table).await
 }
 
@@ -5246,21 +5335,19 @@ async fn get_postgres_foreign_keys_for_transfer(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::ForeignKeyInfo>, String> {
-    let connections = state.connections.read().await;
-    if let Some(PoolKind::Agent(client)) = connections.get(pool_key) {
+    let pool_handle = state.pool_handle(pool_key).await;
+    if let Some(PoolKind::Agent(client)) = pool_handle.as_ref() {
         let client = client.clone();
         let database = database.to_string();
         let schema = schema.to_string();
         let table = table.to_string();
-        drop(connections);
         let mut client = client.lock().await;
         return client.list_foreign_keys(&database, &schema, &table, None).await;
     }
-    let Some(PoolKind::Postgres(pool)) = connections.get(pool_key) else {
+    let Some(PoolKind::Postgres(pool)) = pool_handle.as_ref() else {
         return Err("PostgreSQL pool not found".to_string());
     };
     let pool = pool.clone();
-    drop(connections);
     db::postgres::list_foreign_keys(&pool, schema, table).await
 }
 
@@ -5275,8 +5362,8 @@ async fn get_postgres_owned_sequences_for_transfer(
     }
 
     let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(pool_key) {
+        let pool_handle = state.pool_handle(pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => pool.clone(),
             _ => return Ok(Vec::new()),
         }
@@ -5322,8 +5409,8 @@ async fn get_postgres_sequence_snapshots_for_transfer(
     schema: &str,
 ) -> Result<Vec<PostgresSequenceSnapshot>, String> {
     let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(pool_key) {
+        let pool_handle = state.pool_handle(pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => pool.clone(),
             _ => return Ok(Vec::new()),
         }
@@ -6655,8 +6742,8 @@ pub async fn sort_tables_by_fk_dependency_with_foreign_keys(
     let postgres_pool = if db_type == DatabaseType::Postgres {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
         {
-            let connections = state.connections.read().await;
-            native_postgres_dependency_pool(connections.get(&pool_key))
+            let pool_handle = state.pool_handle(&pool_key).await;
+            native_postgres_dependency_pool(pool_handle.as_ref())
         }
     } else {
         None
@@ -6773,7 +6860,7 @@ pub(crate) fn sort_table_names_by_dependencies(
 
 #[allow(clippy::too_many_arguments)]
 async fn transfer_mongodb_table<F>(
-    state: &AppState,
+    state: &Arc<AppState>,
     request: &TransferRequest,
     table: &str,
     table_index: usize,
@@ -6850,7 +6937,7 @@ where
                 .await?
             };
             total_rows = Some(result.total);
-            result.documents
+            mongo_documents_for_transfer(result, is_mongodb_transfer_type(target_db_type))
         } else {
             let columns = get_columns_for_transfer(
                 state,
@@ -7076,12 +7163,11 @@ async fn fetch_hive_server_transfer_batch(
         let configs = state.configs.read().await;
         configs.get(&request.source_connection_id).map(|config| config.query_timeout_secs).unwrap_or(0)
     };
-    let connections = state.connections.read().await;
-    let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
+    let pool_handle = state.pool_handle(pool_key).await;
+    let Some(PoolKind::Agent(client)) = pool_handle.as_ref() else {
         return Err("Impala transfer requires an Agent connection".to_string());
     };
     let client = client.clone();
-    drop(connections);
 
     let mut client = client.lock().await;
     let result = if cursor.started {
@@ -7118,12 +7204,11 @@ async fn close_hive_server_transfer_cursor(state: &AppState, pool_key: &str, cur
     let Some(session_id) = cursor.session_id.take() else {
         return;
     };
-    let connections = state.connections.read().await;
-    let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
+    let pool_handle = state.pool_handle(pool_key).await;
+    let Some(PoolKind::Agent(client)) = pool_handle.as_ref() else {
         return;
     };
     let client = client.clone();
-    drop(connections);
     let mut client = client.lock().await;
     if let Err(error) = client.close_table_read_session::<bool>(&session_id).await {
         log::warn!("[transfer] failed to close Impala transfer cursor: {error}");
@@ -7133,8 +7218,8 @@ async fn close_hive_server_transfer_cursor(state: &AppState, pool_key: &str, cur
 /// Transfer a single table. Returns rows transferred.
 /// `progress_callback` is invoked for progress updates.
 #[allow(clippy::too_many_arguments)]
-pub async fn transfer_table<F>(
-    state: &AppState,
+async fn transfer_table_inner<F>(
+    state: &Arc<AppState>,
     request: &TransferRequest,
     table: &str,
     table_index: usize,
@@ -7211,45 +7296,23 @@ where
         log::info!("[transfer] {} has {} columns, counting rows...", table, columns.len());
     }
 
-    // Fetch source table comment
-    // Route through the catalog-aware path for Doris/StarRocks external catalogs
-    // so the comment comes from the selected catalog, not the default one.
-    let table_comment: Option<String> =
-        if let Some(catalog) = resolve_external_transfer_catalog(request.source_catalog.as_deref(), source_db_type) {
-            crate::schema::list_doris_catalog_tables_core(
-                state,
-                &request.source_connection_id,
-                catalog,
-                &request.source_database,
-                Some(table),
-                Some(1),
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .and_then(|t| t.comment)
-        } else {
-            crate::schema::list_tables_core(
-                state,
-                &request.source_connection_id,
-                &request.source_database,
-                &request.source_schema,
-                Some(table),
-                Some(1),
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .and_then(|t| t.comment)
-        };
+    // Fetch source table comment. Keep this list-tables metadata chain on its
+    // own task stack, just like the target-table lookup above.
+    let table_comment = list_transfer_tables_isolated(
+        state.clone(),
+        request.source_connection_id.clone(),
+        request.source_database.clone(),
+        request.source_schema.clone(),
+        request.source_catalog.clone(),
+        *source_db_type,
+        table.to_string(),
+        1,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .next()
+    .and_then(|table| table.comment);
 
     let source_indexes =
         if request.create_table && pg_compat_transfer && preserves_target_table_name && !target_table_preexisting {
@@ -7347,10 +7410,11 @@ where
                     // SHOW CREATE TABLE catalog.database.table using the
                     // existing source pool (bare MySQL — addresses any catalog).
                     let pool = {
-                        let connections = state.connections.read().await;
-                        let pool =
-                            connections.get(source_pool_key).ok_or_else(|| "Source pool not found".to_string())?;
-                        let PoolKind::Mysql(p, _) = pool else {
+                        let pool = state
+                            .pool_handle(source_pool_key)
+                            .await
+                            .ok_or_else(|| "Source pool not found".to_string())?;
+                        let PoolKind::Mysql(p, _) = &pool else {
                             return Err("Source pool must be MySQL-family for catalog DDL".to_string());
                         };
                         p.clone()
@@ -7533,6 +7597,28 @@ where
     // Structure-only transfer: complete the table's post-create schema DDL,
     // then skip everything data-related.
     if !should_copy_data(&request.content) {
+        if request.create_table && target_table_preexisting {
+            let target_columns = get_columns_for_transfer(
+                state,
+                target_pool_key,
+                &request.target_connection_id,
+                &request.target_database,
+                &request.target_schema,
+                &target_table,
+                request.target_catalog.as_deref(),
+            )
+            .await
+            .map_err(|error| {
+                format!("Failed to inspect target table '{target_table}' columns before transfer: {error}")
+            })?;
+            validate_preexisting_target_columns(
+                &target_columns,
+                &col_names,
+                target_db_type,
+                request.quote_target_column_names,
+                &target_table,
+            )?;
+        }
         if should_restore_postgres_table_schema {
             restore_postgres_table_schema_objects(
                 state,
@@ -7581,36 +7667,13 @@ where
     // can't accept the planned insert, fail fast here instead of truncating
     // the target's existing data and then hitting an opaque driver error.
     if request.create_table && target_table_preexisting {
-        let missing = missing_transfer_target_columns(
+        validate_preexisting_target_columns(
             &target_columns,
             &col_names,
             target_db_type,
             request.quote_target_column_names,
-        );
-        if !missing.is_empty() {
-            return Err(format!(
-                "Target table '{target_table}' already exists with a different structure and is missing column(s) \
-                 {} present in the source table. DBX does not alter an existing target table's columns during \
-                 transfer — drop the target table or adjust its structure to match the source first.",
-                missing.join(", ")
-            ));
-        }
-
-        let required = required_unmapped_transfer_target_columns(
-            &target_columns,
-            &col_names,
-            target_db_type,
-            request.quote_target_column_names,
-        );
-        if !required.is_empty() {
-            return Err(format!(
-                "Target table '{target_table}' already exists with a different structure and has required column(s) \
-                 {} that are not present in the source table and have no default or generated value. DBX does not \
-                 alter an existing target table's columns during transfer — drop the target table or adjust its \
-                 structure to match the source first.",
-                required.join(", ")
-            ));
-        }
+            &target_table,
+        )?;
     }
 
     // Truncate target if overwrite mode
@@ -7807,6 +7870,74 @@ where
     }
 
     Ok(total_transferred)
+}
+
+/// Transfer one table on its own Tokio task so the large transfer future and
+/// nested driver metadata futures do not share a single worker stack.
+#[allow(clippy::too_many_arguments)]
+pub async fn transfer_table<F>(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    table: &str,
+    table_index: usize,
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+    source_pool_key: &str,
+    target_pool_key: &str,
+    known_foreign_keys: &HashMap<String, Vec<db::ForeignKeyInfo>>,
+    pending_fk_alters: &mut Vec<(String, String)>,
+    mut progress_callback: F,
+) -> Result<u64, String>
+where
+    F: FnMut(TransferProgress),
+{
+    let state = state.clone();
+    let request = request.clone();
+    let table = table.to_string();
+    let source_db_type = *source_db_type;
+    let target_db_type = *target_db_type;
+    let source_pool_key = source_pool_key.to_string();
+    let target_pool_key = target_pool_key.to_string();
+    let known_foreign_keys = known_foreign_keys
+        .get(&table)
+        .map(|foreign_keys| HashMap::from([(table.clone(), foreign_keys.clone())]))
+        .unwrap_or_default();
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(TRANSFER_PROGRESS_CHANNEL_CAPACITY);
+
+    let mut task = tokio::spawn(async move {
+        let mut task_pending_fk_alters = Vec::new();
+        let result = transfer_table_inner(
+            &state,
+            &request,
+            &table,
+            table_index,
+            &source_db_type,
+            &target_db_type,
+            &source_pool_key,
+            &target_pool_key,
+            &known_foreign_keys,
+            &mut task_pending_fk_alters,
+            move |progress| {
+                try_send_transfer_progress(&progress_tx, progress);
+            },
+        )
+        .await;
+        (result, task_pending_fk_alters)
+    });
+    let _abort_on_drop = AbortTransferTaskOnDrop(task.abort_handle());
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(progress) = progress_rx.recv() => progress_callback(progress),
+            result = &mut task => {
+                let (result, task_pending_fk_alters) =
+                    result.map_err(|error| format!("Transfer table task failed: {error}"))?;
+                pending_fk_alters.extend(task_pending_fk_alters);
+                return result;
+            }
+        }
+    }
 }
 
 pub async fn transfer_postgres_schema_dependencies<F>(
@@ -8103,6 +8234,7 @@ where
             }
             db::ObjectSourceKind::Sequence
             | db::ObjectSourceKind::Synonym
+            | db::ObjectSourceKind::Job
             | db::ObjectSourceKind::Package
             | db::ObjectSourceKind::PackageBody => object.source.clone(),
             db::ObjectSourceKind::Trigger
@@ -8484,10 +8616,14 @@ mod tests {
     #[tokio::test]
     async fn postgres_transfer_metadata_routes_agent_pools() {
         let (state, dir) = test_app_state().await;
-        state.connections.write().await.insert(
-            "source:source_db".to_string(),
-            PoolKind::agent(crate::db::agent_driver::AgentDriverClient::test_stub()),
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "source:source_db".to_string(),
+                    PoolKind::agent(crate::db::agent_driver::AgentDriverClient::test_stub()),
+                );
+            })
+            .await;
 
         let index_error =
             get_postgres_indexes_for_transfer(&state, "source:source_db", "source_db", "source_schema", "items")
@@ -9089,6 +9225,35 @@ mod tests {
 
             assert!(!stripped.to_ascii_uppercase().contains("FOREIGN KEY"), "{stripped}");
             assert!(stripped.contains("KEY `fk_child_parent` (`parent_id`)"), "{stripped}");
+        }
+
+        #[test]
+        fn keeps_columns_whose_comment_mentions_foreign_key() {
+            // Regression for #7660: the deferred-FK DDL rewrite used to drop any
+            // line containing " FOREIGN KEY ", so column definitions whose
+            // COMMENT text merely mentions the words silently vanished from the
+            // created target table.
+            let ddl = "CREATE TABLE `title_task` (\n  `id` varchar(32) NOT NULL,\n  `review_result` varchar(100) DEFAULT NULL,\n  `review_mode` tinyint NOT NULL DEFAULT '0' COMMENT 'foreign key of review flow',\n  `score_snapshot_json` text COMMENT 'snapshot json, see foreign key docs',\n  `task_status` int DEFAULT '0',\n  PRIMARY KEY (`id`),\n  KEY `idx_task_status` (`task_status`),\n  CONSTRAINT `fk_title_task_org` FOREIGN KEY (`org_id`) REFERENCES `org` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+            let stripped = strip_inline_foreign_key_constraint_lines(ddl);
+
+            assert!(stripped.contains("`review_mode` tinyint NOT NULL DEFAULT '0'"), "{stripped}");
+            assert!(stripped.contains("`score_snapshot_json` text"), "{stripped}");
+            assert!(!stripped.contains("FOREIGN KEY"), "{stripped}");
+            assert!(stripped.contains("KEY `idx_task_status` (`task_status`)"), "{stripped}");
+        }
+
+        #[test]
+        fn strips_only_foreign_key_constraint_lines_regardless_of_other_mentions() {
+            // A CHECK constraint whose expression mentions the words stays; a
+            // nameless inline `FOREIGN KEY (` line (defensive: some MySQL
+            // dialects emit it) is still stripped.
+            let ddl = "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `kind` varchar(10) NOT NULL,\n  CONSTRAINT `chk_kind` CHECK (`kind` <> 'foreign key'),\n  FOREIGN KEY (`id`) REFERENCES `parent` (`id`)\n) ENGINE=InnoDB";
+
+            let stripped = strip_inline_foreign_key_constraint_lines(ddl);
+
+            assert!(stripped.contains("CONSTRAINT `chk_kind` CHECK (`kind` <> 'foreign key')"), "{stripped}");
+            assert!(!stripped.contains("REFERENCES"), "{stripped}");
         }
 
         #[test]
@@ -10787,6 +10952,71 @@ mod tests {
         );
 
         assert_eq!(rows, vec![vec![json!(1), json!("Ada")], vec![json!(2), serde_json::Value::Null]]);
+    }
+
+    #[test]
+    fn mongo_transfer_uses_extended_json_to_preserve_bson_dates() {
+        let result = MongoDocumentResult {
+            documents: vec![json!({"gmtModified": "ISODate(\"2026-08-31T10:14:01.105Z\")"})],
+            raw_documents: None,
+            extended_documents: Some(vec![json!({
+                "gmtModified": {"$date": {"$numberLong": "1788161641105"}}
+            })]),
+            total: 1,
+            total_is_exact: true,
+            next_cursor: None,
+        };
+
+        let documents = mongo_documents_for_transfer(result, true);
+
+        assert_eq!(documents[0]["gmtModified"]["$date"]["$numberLong"], json!("1788161641105"));
+    }
+
+    #[test]
+    fn mongo_transfer_falls_back_to_browser_documents_without_extended_json() {
+        let result = MongoDocumentResult {
+            documents: vec![json!({"value": "text"})],
+            raw_documents: None,
+            extended_documents: None,
+            total: 1,
+            total_is_exact: true,
+            next_cursor: None,
+        };
+
+        assert_eq!(mongo_documents_for_transfer(result, true), vec![json!({"value": "text"})]);
+    }
+
+    #[test]
+    fn mongo_transfer_keeps_browser_documents_for_sql_targets() {
+        let result = MongoDocumentResult {
+            documents: vec![json!({"gmtModified": "ISODate(\"2026-08-31T10:14:01.105Z\")"})],
+            raw_documents: None,
+            extended_documents: Some(vec![json!({
+                "gmtModified": {"$date": {"$numberLong": "1788161641105"}}
+            })]),
+            total: 1,
+            total_is_exact: true,
+            next_cursor: None,
+        };
+
+        assert_eq!(
+            mongo_documents_for_transfer(result, false),
+            vec![json!({"gmtModified": "ISODate(\"2026-08-31T10:14:01.105Z\")"})]
+        );
+    }
+
+    #[test]
+    fn mongo_transfer_falls_back_when_extended_json_row_count_differs() {
+        let result = MongoDocumentResult {
+            documents: vec![json!({"id": 1}), json!({"id": 2})],
+            raw_documents: None,
+            extended_documents: Some(vec![json!({"id": {"$numberInt": "1"}})]),
+            total: 2,
+            total_is_exact: true,
+            next_cursor: None,
+        };
+
+        assert_eq!(mongo_documents_for_transfer(result, true), vec![json!({"id": 1}), json!({"id": 2})]);
     }
 
     #[test]
@@ -12909,5 +13139,28 @@ CREATE INDEX items_name_idx ON public.items (id);"#;
 
         assert_eq!(statements.len(), 1);
         assert!(statements[0].starts_with("CREATE TABLE"));
+    }
+
+    #[test]
+    fn transfer_progress_queue_has_bounded_capacity() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(TRANSFER_PROGRESS_CHANNEL_CAPACITY);
+        for rows_transferred in 0..=TRANSFER_PROGRESS_CHANNEL_CAPACITY {
+            try_send_transfer_progress(
+                &sender,
+                TransferProgress {
+                    transfer_id: "transfer".to_string(),
+                    table: "table".to_string(),
+                    table_index: 0,
+                    total_tables: 1,
+                    rows_transferred: rows_transferred as u64,
+                    total_rows: None,
+                    status: TransferStatus::Running,
+                    error: None,
+                    terminal: false,
+                },
+            );
+        }
+
+        assert_eq!(receiver.len(), TRANSFER_PROGRESS_CHANNEL_CAPACITY);
     }
 }

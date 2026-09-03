@@ -52,6 +52,7 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
 
 // Connection
 export const testConnection = forward("testConnection");
+export const testSshTunnel = forward("testSshTunnel");
 export const testConnectionWithInfo = forward("testConnectionWithInfo");
 export const connectDb = forward("connectDb");
 export const connectionDatabaseInfo = forward("connectionDatabaseInfo");
@@ -272,6 +273,7 @@ export const prepareDataGridSave = forward("prepareDataGridSave");
 export const extractDataGridSelection = forward("extractDataGridSelection");
 export const buildDataGridCopyUpdateStatements = forward("buildDataGridCopyUpdateStatements");
 export const buildDataGridCopyInsertStatement = forward("buildDataGridCopyInsertStatement");
+export const buildDmlChangePreviewSql = forward("buildDmlChangePreviewSql");
 export const buildDataGridContextFilterCondition = forward("buildDataGridContextFilterCondition");
 export const buildDataGridColumnValueFilterCondition = forward("buildDataGridColumnValueFilterCondition");
 export const buildDataGridColumnValuesFilterCondition = forward("buildDataGridColumnValuesFilterCondition");
@@ -326,6 +328,11 @@ export const loadEditorSettings = forward("loadEditorSettings");
 export const saveEditorSettings = forward("saveEditorSettings");
 export const loadOpenTabsState = forward("loadOpenTabsState");
 export const saveOpenTabsState = forward("saveOpenTabsState");
+export const saveDetachedTabHandoff = forward("saveDetachedTabHandoff");
+export const loadDetachedTabHandoff = forward("loadDetachedTabHandoff");
+export const listDetachedTabHandoffs = forward("listDetachedTabHandoffs");
+export const deleteDetachedTabHandoff = forward("deleteDetachedTabHandoff");
+export const approveDetachedWindowClose = forward("approveDetachedWindowClose");
 export const loadSavedSqlEditorPositions = forward("loadSavedSqlEditorPositions");
 export const saveSavedSqlEditorPositions = forward("saveSavedSqlEditorPositions");
 export const loadTransferTaskLibrary = forward("loadTransferTaskLibrary");

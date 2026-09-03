@@ -857,7 +857,10 @@ impl ConnectionConfig {
             DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => Some("main"),
             DatabaseType::Gaussdb | DatabaseType::OpenGauss => Some("postgres"),
             DatabaseType::Kwdb => Some("defaultdb"),
-            DatabaseType::Vastbase => Some("postgres"),
+            // Keep saved Kingbase connections from before the database field became
+            // required working after upgrade. New and edited desktop connections
+            // still require an explicit existing database in the connection form.
+            DatabaseType::Kingbase | DatabaseType::Vastbase => Some("postgres"),
             DatabaseType::Highgo => Some("highgo"),
             DatabaseType::Uxdb => Some("uxdb"),
             DatabaseType::Yashandb => Some("yasdb"),
@@ -1123,7 +1126,7 @@ impl ConnectionConfig {
                 format!("zookeeper://{host}:{port}")
             }
             DatabaseType::Iris => format!("iris://{host}:{port}{db_part}"),
-            DatabaseType::InfluxDb | DatabaseType::VictoriaMetrics => {
+            DatabaseType::InfluxDb | DatabaseType::InfluxDb3 | DatabaseType::VictoriaMetrics => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -1403,7 +1406,7 @@ impl ConnectionConfig {
             DatabaseType::Iris => {
                 format!("iris://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::InfluxDb | DatabaseType::VictoriaMetrics => {
+            DatabaseType::InfluxDb | DatabaseType::InfluxDb3 | DatabaseType::VictoriaMetrics => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -3519,13 +3522,17 @@ mod tests {
     }
 
     #[test]
-    fn kingbase_empty_database_has_no_default() {
+    fn kingbase_empty_database_uses_legacy_postgres_default() {
         let mut config = mysql_config("SYSTEM", "secret", None);
         config.db_type = DatabaseType::Kingbase;
         config.port = 54321;
 
-        assert_eq!(config.effective_database(), None);
-        assert_eq!(config.connection_url(), "kingbase://SYSTEM:secret@10.1.2.3:54321");
+        assert_eq!(config.effective_database(), Some("postgres"));
+        assert_eq!(config.connection_url(), "kingbase://SYSTEM:secret@10.1.2.3:54321/postgres");
+
+        config.database = Some("application".to_string());
+        assert_eq!(config.effective_database(), Some("application"));
+        assert_eq!(config.connection_url(), "kingbase://SYSTEM:secret@10.1.2.3:54321/application");
     }
 
     #[test]

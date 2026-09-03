@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
-import { AlignLeft, Camera, CaseLower, CaseUpper, ClipboardPaste, Code2, Download, FileCode, MessageSquareText, Minimize2, Pencil, PencilRuler, Play, Copy, List, Scissors, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
+import { AlignLeft, Camera, CaseLower, CaseUpper, ClipboardPaste, Code2, Download, Eye, FileCode, MessageSquareText, Minimize2, Pencil, PencilRuler, Play, Copy, List, Scissors, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { Completion, CompletionContext } from "@codemirror/autocomplete";
 import { Transaction, StateEffect } from "@codemirror/state";
@@ -18,6 +18,7 @@ import { executionCandidateForMode, resolveExecutableSql, type SqlExecutionSnaps
 import { buildExecutionCandidates, hasMultipleExecutionTargets, supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
 import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, executableStatementRangeStartingAt as executableStatementRangeStartingAtLine, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { currentStatementFrameRangeTo } from "@/lib/sql/currentStatementFrame";
+import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
 import { expandToSqlStatementWindow } from "@/lib/sql/insertValueHints";
 import { insertValueHintColumnNames } from "@/lib/sql/insertValueHintColumns";
 import { canFormatSqlForDatabaseType, formatSqlForDisplay, formatSqlForEditing, compressSqlText, sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
@@ -128,7 +129,7 @@ import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/editor
 import { trimmedSelectionLayer } from "@/lib/editor/codemirrorTrimmedSelectionLayer";
 import { currentStatementFrameLayer } from "@/lib/editor/codemirrorCurrentStatementFrameLayer";
 import { selectionMatchOccurrences } from "@/lib/editor/codemirrorSelectionMatches";
-import { createInsertValueHintsExtension, requestInsertValueHintsRefresh } from "@/lib/editor/codemirrorInsertValueHints";
+import { createInsertValueHintsExtension, requestInsertValueHintsRefresh, supportsInsertValueHints } from "@/lib/editor/codemirrorInsertValueHints";
 import { sqlBlockFoldService } from "@/lib/editor/codemirrorSqlBlockFolding";
 import { focusEditorView } from "@/lib/editor/queryEditorFocus";
 import { createDbxCodeMirrorSqlDialect, type CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
@@ -139,6 +140,7 @@ import { computePasteCaretResyncTarget } from "@/lib/editor/queryEditorPasteCare
 import { queryEditorCommentTokens, queryEditorLineCommentToken } from "@/lib/editor/queryEditorLineComment";
 import { createShellLineCommentHighlight } from "@/lib/editor/codemirrorShellLineCommentHighlight";
 import { extendQueryEditorSelection, runQueryEditorAltExtendSelection } from "@/lib/editor/queryEditorExtendSelection";
+import { addNextQueryEditorSelectionOccurrence, selectAllQueryEditorSelectionOccurrences } from "@/lib/editor/queryEditorOccurrenceSelection";
 import { createQueryEditorStringMouseSelection } from "@/lib/editor/queryEditorStringMouseSelection";
 import { createQueryEditorCompletionShortcutBindings } from "@/lib/editor/queryEditorCompletionShortcut";
 import { createQueryEditorSelectionCaseShortcutBindings } from "@/lib/editor/queryEditorSelectionCaseShortcut";
@@ -223,6 +225,7 @@ const emit = defineEmits<{
   "update:modelValue": [value: string];
   selectionChange: [value: string];
   cursorChange: [pos: number];
+  previewChangesAvailable: [value: boolean];
   formatError: [message: string];
   execute: [source: SqlExecutionOverride];
   executeInNewResultTab: [source: SqlExecutionOverride];
@@ -364,6 +367,7 @@ const isGestureZooming = ref(false);
 const searchPanelRef = ref<InstanceType<typeof EditorSearchPanel>>();
 const selectedSql = ref("");
 const executableSql = ref("");
+const previewContextSql = ref("");
 const contextObjectTarget = ref<SqlObjectNavigationTarget | null>(null);
 
 interface SelectStarExpansionTarget {
@@ -568,8 +572,10 @@ let buildSqlSemanticHighlightExtension: (() => import("@codemirror/state").Exten
 let codeMirrorSnippetCompletion: typeof import("@codemirror/autocomplete").snippetCompletion;
 let codeMirrorCompletionStatus: typeof import("@codemirror/autocomplete").completionStatus | null = null;
 let codeMirrorAcceptCompletion: typeof import("@codemirror/autocomplete").acceptCompletion | null = null;
+let codeMirrorCurrentCompletions: typeof import("@codemirror/autocomplete").currentCompletions | null = null;
 let codeMirrorSelectedCompletionIndex: typeof import("@codemirror/autocomplete").selectedCompletionIndex | null = null;
 let codeMirrorSelectedCompletion: typeof import("@codemirror/autocomplete").selectedCompletion | null = null;
+let codeMirrorSetSelectedCompletion: typeof import("@codemirror/autocomplete").setSelectedCompletion | null = null;
 let codeMirrorMoveCompletionSelection: typeof import("@codemirror/autocomplete").moveCompletionSelection | null = null;
 let codeMirrorSelectFirstCompletion: import("@codemirror/view").Command | null = null;
 let codeMirrorStartCompletion: typeof import("@codemirror/autocomplete").startCompletion | null = null;
@@ -724,8 +730,6 @@ const queryEditorAppearanceSettings = computed(() => {
     wordWrap: settings.wordWrap,
     vimModeEnabled: settings.vimModeEnabled,
     autoCloseBrackets: settings.autoCloseBrackets,
-    showCurrentStatementFrame: settings.showCurrentStatementFrame,
-    showInsertValueHints: settings.showInsertValueHints,
     showLineNumbers: settings.showLineNumbers,
     shortcuts: settings.shortcuts,
     showStatementRunButtons: settings.showStatementRunButtons,
@@ -1066,9 +1070,10 @@ function insertLineBelow(currentView: EditorViewType): boolean {
   return true;
 }
 
-function syncContextMenuState(currentView: EditorViewType, starPosition?: number) {
+function syncContextMenuState(currentView: EditorViewType, starPosition?: number, previewPosition?: number) {
   selectedSql.value = selectedSqlFromView(currentView);
   executableSql.value = executableSqlFromView(currentView);
+  previewContextSql.value = resolvePreviewDmlCandidate(previewPosition);
   selectStarExpansionTarget.value = selectStarExpansionTargetForView(currentView, starPosition);
 }
 
@@ -1152,7 +1157,8 @@ function selectStarExpansionTargetForView(currentView: EditorViewType, position?
 
 function syncContextMenuStateAtEvent(currentView: EditorViewType, event: MouseEvent) {
   const pos = currentView.posAtCoords({ x: event.clientX, y: event.clientY });
-  syncContextMenuState(currentView, pos ?? undefined);
+  // 预览按“右键点击处”解析当前语句（执行按光标处），右键处与光标一致时才直觉一致。
+  syncContextMenuState(currentView, pos ?? undefined, pos ?? undefined);
   if (pos == null) {
     contextObjectTarget.value = null;
     return;
@@ -1422,6 +1428,61 @@ function exportQueryFromContextMenu(format: "csv" | "xlsx" | "txt") {
   const sql = executableSql.value;
   if (!sql.trim()) return;
   emit("exportQuery", { sql, format, columnComments: undefined });
+}
+
+// 与「执行」使用同一套候选解析：选区优先，否则取 position（右键点击处）/ 光标处的单条语句。
+// 注意：不跟随 executeAllOnBlankLine 回退到“整篇文档”（那会包含多条语句）。
+function resolvePreviewDmlCandidate(position?: number): string {
+  const currentView = view.value;
+  if (!currentView) return "";
+  const selection = currentView.state.selection.main;
+  if (!selection.empty) {
+    const text = currentView.state.sliceDoc(selection.from, selection.to);
+    return looksLikeDmlStatement(text) ? text : "";
+  }
+  const doc = currentView.state.doc.toString();
+  const cursorPos = position ?? selection.head;
+  const parameterOptions = sqlStatementParameterOptions();
+  const candidates = buildExecutionCandidates(doc, cursorPos, props.databaseType, parameterOptions);
+  const cursorCandidate = candidates.find((item) => item.supportedKinds.includes("cursor"));
+  return cursorCandidate && looksLikeDmlStatement(cursorCandidate.sql) ? cursorCandidate.sql : "";
+}
+
+// 「预览变更」：把当前 DML 语句改写为只读 SELECT，作为新结果标签执行（干跑，不写库）。
+async function requestPreviewChanges(stackSql?: string) {
+  let sql = (stackSql ?? "").trim();
+  // 永远只预览“单条语句”：禁用整篇文档回退（那会包含多条语句）。
+  if (!sql) sql = resolvePreviewDmlCandidate();
+  if (!sql) {
+    toast(t("editor.previewChangesNoStatement"), 3000);
+    return false;
+  }
+  try {
+    const identifierQuote = props.connectionId ? connectionStore.connectionIdentifierQuote?.(props.connectionId) : undefined;
+    // 第一次：生成基础预览 SELECT，并拿到目标表引用。
+    let preview = await api.buildDmlChangePreviewSql({ sql, databaseType: props.databaseType, identifierQuote });
+    // 单表 UPDATE：拉取目标表列元数据，让「新值」列紧跟其原值列（交错展开）。
+    if (preview.tables.length === 1 && props.connectionId && props.database) {
+      const tableRef = preview.tables[0];
+      if (tableRef.table) {
+        const columns = await api
+          .getColumns(props.connectionId, props.database, tableRef.schema ?? "", tableRef.table, tableRef.catalog)
+          .then((infos) => infos.map((column) => column.name))
+          .catch(() => undefined);
+        if (columns?.length) {
+          preview = await api.buildDmlChangePreviewSql({ sql, databaseType: props.databaseType, identifierQuote, columns });
+        }
+      }
+    }
+    // 前置注释标注干跑预览（引擎会忽略注释），并在新结果标签中展示受影响行 + 新值列。
+    emit("executeInNewResultTab", `/* ${t("editor.previewChangesComment", { operation: preview.operation })} */\n${preview.sql}`);
+    return true;
+  } catch (error: any) {
+    // http 层抛 BackendErrorException（Error），tauri 层拒绝时是 String。
+    const message = error instanceof Error ? error.message : typeof error === "string" ? error : t("editor.previewChangesFailed");
+    toast(message, 4000);
+    return false;
+  }
 }
 
 async function copySelectedSqlFromContextMenu() {
@@ -1777,6 +1838,12 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
             shortcut: shortcuts.executeSqlInNewResultTab,
           },
           {
+            label: t("editor.previewChanges"),
+            action: () => void requestPreviewChanges(previewContextSql.value),
+            disabled: !previewContextSql.value,
+            icon: Eye,
+          },
+          {
             label: t("editor.contextMenu.export"),
             icon: Download,
             disabled: !canExecuteContextSql.value,
@@ -1883,6 +1950,18 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
       action: openDelimitedListDialog,
       disabled: props.readOnly || !canCopySelectedSql.value,
       icon: List,
+    },
+    {
+      label: t("editor.contextMenu.addNextSelectionOccurrence"),
+      action: addNextSelectionOccurrenceFromContextMenu,
+      icon: TextSelect,
+      shortcut: shortcuts.addNextSelectionOccurrence,
+    },
+    {
+      label: t("editor.contextMenu.selectAllSelectionOccurrences"),
+      action: selectAllSelectionOccurrencesFromContextMenu,
+      icon: TextSelect,
+      shortcut: shortcuts.selectAllSelectionOccurrences,
     },
     { label: "", separator: true },
     {
@@ -2048,6 +2127,8 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
         ...binding(shortcuts.redo, (view) => codeMirrorRedo?.(view) ?? false),
         ...binding(shortcuts.selectAll, (view) => codeMirrorSelectAll?.(view) ?? false),
         ...binding(shortcuts.extendSelection, extendQueryEditorSelectionForView),
+        ...binding(shortcuts.addNextSelectionOccurrence, addNextQueryEditorSelectionOccurrence),
+        ...binding(shortcuts.selectAllSelectionOccurrences, selectAllQueryEditorSelectionOccurrences),
         ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.uppercaseSelection, () => convertSelectedSqlCase("upper")),
         ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.lowercaseSelection, () => convertSelectedSqlCase("lower")),
         ...binding(shortcuts.toggleLineComment, (view) => codeMirrorToggleLineComment?.(view) ?? false),
@@ -2134,6 +2215,18 @@ function extendQueryEditorSelectionForView(currentView: EditorViewType): boolean
     dialect: sqlBehaviorDialect(),
     language: queryEditorSelectionLanguage(),
   });
+}
+
+function addNextSelectionOccurrenceFromContextMenu() {
+  if (!view.value) return;
+  addNextQueryEditorSelectionOccurrence(view.value);
+  focusEditor();
+}
+
+function selectAllSelectionOccurrencesFromContextMenu() {
+  if (!view.value) return;
+  selectAllQueryEditorSelectionOccurrences(view.value);
+  focusEditor();
 }
 
 function acceptCompletionOrNextSnippetField(view: EditorViewType): boolean {
@@ -2366,7 +2459,7 @@ function getInsertValueHintTableColumns(table: string, schema?: string, database
 
 function requestInsertValueHintTableColumns(table: string, schema?: string, database?: string) {
   if (!props.connectionId || props.database == null) return;
-  if (props.databaseType === "redis" || props.databaseType === "mongodb" || props.databaseType === "elasticsearch" || props.databaseType === "easysearch" || props.databaseType === "meilisearch" || props.databaseType === "victoriametrics") return;
+  if (!supportsInsertValueHints(props.databaseType)) return;
   const cacheKey = insertHintCacheKey({ name: table, schema, database });
   const hasCachedColumns = props.databaseType === "sqlserver" ? cachedInsertValueHintColumnsByTable.has(cacheKey) : cachedColumnsByTable.has(cacheKey);
   if (hasCachedColumns || pendingInsertValueHintColumnLoads.has(cacheKey)) return;
@@ -3541,11 +3634,158 @@ interface BatchColumnSelectionActionItem {
 
 type QueryCompletionOption = Completion & {
   dbxBatchColumnSelection?: { sessionKey: string; candidateKey: string };
+  dbxBatchColumnSelectionAction?: { sessionKey: string };
 };
 
 let batchColumnSelectionSession: BatchColumnSelectionSession | null = null;
+type BatchColumnSelectionCheckboxMarker = NonNullable<QueryCompletionOption["dbxBatchColumnSelection"]>;
+interface BatchColumnSelectionDragState {
+  view: EditorViewType;
+  sessionKey: string;
+  pointerId: number;
+  anchorCandidateKey: string;
+  baseSelectedKeys: Set<string>;
+  selected: boolean;
+  focusCandidateKey: string;
+  previousUserSelect: string;
+  scrollElement: HTMLElement | null;
+  pointerClientX: number;
+  pointerClientY: number;
+  autoScrollFrame: number;
+}
+
+const batchColumnSelectionCheckboxMarkers = new WeakMap<HTMLElement, BatchColumnSelectionCheckboxMarker>();
+const batchColumnSelectionActionMarkers = new WeakMap<HTMLElement, string>();
+const batchColumnSelectionTooltipParents = new WeakMap<EditorViewType, HTMLElement>();
+let batchColumnSelectionDragState: BatchColumnSelectionDragState | null = null;
+let batchColumnSelectionRefreshCleanup: (() => void) | null = null;
+let batchColumnSelectionExpandedRendering = false;
+let batchColumnSelectionRenderLimitTimer: number | null = null;
+
+function cancelBatchColumnSelectionRefresh() {
+  batchColumnSelectionRefreshCleanup?.();
+  batchColumnSelectionRefreshCleanup = null;
+}
+
+function setBatchColumnSelectionExpandedRendering(expanded: boolean) {
+  if (batchColumnSelectionExpandedRendering === expanded) return;
+  batchColumnSelectionExpandedRendering = expanded;
+  if (batchColumnSelectionRenderLimitTimer !== null) window.clearTimeout(batchColumnSelectionRenderLimitTimer);
+
+  const currentView = view.value;
+  if (!currentView || !completionComp || !buildSqlCompletionExtension) return;
+  batchColumnSelectionRenderLimitTimer = window.setTimeout(() => {
+    batchColumnSelectionRenderLimitTimer = null;
+    if (view.value !== currentView || !completionComp || !buildSqlCompletionExtension) return;
+    currentView.dispatch({ effects: completionComp.reconfigure(buildSqlCompletionExtension()) });
+    if (expanded && codeMirrorCompletionStatus?.(currentView.state) === "active") codeMirrorStartCompletion?.(currentView);
+  }, 0);
+}
+
+function setBatchColumnSelectionValue(sessionKey: string, candidateKey: string, selected: boolean, checkbox?: HTMLInputElement) {
+  const session = batchColumnSelectionSession;
+  if (!session || session.key !== sessionKey || !session.candidates.some((candidate) => candidate.key === candidateKey)) return;
+  if (selected) session.selectedKeys.add(candidateKey);
+  else session.selectedKeys.delete(candidateKey);
+  if (checkbox) checkbox.checked = selected;
+}
+
+function updateBatchColumnSelectionActionLabel(view: EditorViewType, sessionKey: string) {
+  const session = batchColumnSelectionSession;
+  if (!session || session.key !== sessionKey) return;
+  const label = t("editor.completion.insertSelectedColumns", { count: session.selectedKeys.size });
+  const tooltipParent = batchColumnSelectionTooltipParents.get(view) ?? view.dom;
+  tooltipParent.querySelectorAll<HTMLElement>(".cm-batch-column-selection-action-marker").forEach((marker) => {
+    if (batchColumnSelectionActionMarkers.get(marker) !== sessionKey) return;
+    const element = marker.closest("li")?.querySelector<HTMLElement>(".cm-completionLabel");
+    if (!element) return;
+    if (element.textContent !== label) element.textContent = label;
+  });
+}
+
+function scheduleBatchColumnSelectionRefresh(view: EditorViewType, sessionKey: string, focusCandidateKey: string, scrollState?: { element: HTMLElement | null; top: number; left: number }) {
+  cancelBatchColumnSelectionRefresh();
+  const preservedScroll =
+    scrollState ??
+    (() => {
+      const element =
+        visibleBatchColumnSelectionCheckboxes(sessionKey)
+          .map(({ checkbox }) => batchColumnSelectionScrollElement(checkbox))
+          .find((candidate): candidate is HTMLElement => !!candidate) ?? null;
+      return { element, top: element?.scrollTop ?? 0, left: element?.scrollLeft ?? 0 };
+    })();
+  const restoreScroll = () => {
+    const currentElement =
+      visibleBatchColumnSelectionCheckboxes(sessionKey)
+        .map(({ checkbox }) => batchColumnSelectionScrollElement(checkbox))
+        .find((candidate): candidate is HTMLElement => !!candidate) ?? preservedScroll.element;
+    if (!currentElement) return;
+    currentElement.scrollTop = Math.min(preservedScroll.top, Math.max(0, currentElement.scrollHeight - currentElement.clientHeight));
+    currentElement.scrollLeft = Math.min(preservedScroll.left, Math.max(0, currentElement.scrollWidth - currentElement.clientWidth));
+  };
+  let restoreAttempts = 0;
+  let restoreFrame = 0;
+  let restoreTimer = 0;
+  let restoreStartTimer = 0;
+  let stopped = false;
+  const restoreObserver = typeof MutationObserver === "undefined" ? null : new MutationObserver(restoreScroll);
+  const stopRestore = () => {
+    if (stopped) return;
+    stopped = true;
+    restoreObserver?.disconnect();
+    if (restoreFrame) window.cancelAnimationFrame(restoreFrame);
+    if (restoreTimer) window.clearTimeout(restoreTimer);
+    if (restoreStartTimer) window.clearTimeout(restoreStartTimer);
+    if (batchColumnSelectionRefreshCleanup === stopRestore) batchColumnSelectionRefreshCleanup = null;
+  };
+  batchColumnSelectionRefreshCleanup = stopRestore;
+  const restoreNextFrame = () => {
+    if (batchColumnSelectionSession?.key !== sessionKey) {
+      stopRestore();
+      return;
+    }
+    restoreScroll();
+    restoreAttempts += 1;
+    if (restoreAttempts < 60) restoreFrame = window.requestAnimationFrame(restoreNextFrame);
+    else stopRestore();
+  };
+  restoreStartTimer = window.setTimeout(() => {
+    if (stopped || batchColumnSelectionSession?.key !== sessionKey) {
+      stopRestore();
+      return;
+    }
+    restoreObserver?.observe(document.body, { childList: true, subtree: true });
+    // Keep CodeMirror's virtualized range anchored to the item where the drag ended.
+    const focusIndex =
+      codeMirrorCurrentCompletions?.(view.state).findIndex((completion) => {
+        const marker = (completion as QueryCompletionOption).dbxBatchColumnSelection;
+        return marker?.sessionKey === sessionKey && marker.candidateKey === focusCandidateKey;
+      }) ?? -1;
+    if (focusIndex >= 0 && codeMirrorSetSelectedCompletion) view.dispatch({ effects: codeMirrorSetSelectedCompletion(focusIndex) });
+    codeMirrorStartCompletion?.(view);
+    restoreNextFrame();
+    restoreTimer = window.setTimeout(stopRestore, 1500);
+  }, 0);
+}
+
+function finishBatchColumnSelectionDrag(refresh = true) {
+  const state = batchColumnSelectionDragState;
+  if (!state) return;
+  const scrollState = state.scrollElement ? { element: state.scrollElement, top: state.scrollElement.scrollTop, left: state.scrollElement.scrollLeft } : undefined;
+  batchColumnSelectionDragState = null;
+  if (state.autoScrollFrame) window.cancelAnimationFrame(state.autoScrollFrame);
+  window.removeEventListener("pointermove", onBatchColumnSelectionPointerMove, true);
+  window.removeEventListener("pointerup", onBatchColumnSelectionPointerUp, true);
+  window.removeEventListener("pointercancel", onBatchColumnSelectionPointerCancel, true);
+  window.removeEventListener("blur", onBatchColumnSelectionPointerCancel, true);
+  document.body.style.userSelect = state.previousUserSelect;
+  if (refresh) scheduleBatchColumnSelectionRefresh(state.view, state.sessionKey, state.focusCandidateKey, scrollState);
+}
 
 function clearBatchColumnSelectionSession() {
+  finishBatchColumnSelectionDrag(false);
+  cancelBatchColumnSelectionRefresh();
+  setBatchColumnSelectionExpandedRendering(false);
   batchColumnSelectionSession = null;
 }
 
@@ -3560,7 +3800,7 @@ function batchColumnSelectionCandidateKey(item: SqlCompletionItem): string {
 function prepareBatchColumnSelectionSession(items: SqlCompletionItem[], document: string, from: number, to: number): BatchColumnSelectionSession | null {
   const selectableItems = items.filter((item) => item.type === "column" && item.batchSelectionMode && item.apply);
   if (selectableItems.length === 0) {
-    batchColumnSelectionSession = null;
+    clearBatchColumnSelectionSession();
     return null;
   }
 
@@ -3580,9 +3820,11 @@ function prepareBatchColumnSelectionSession(items: SqlCompletionItem[], document
       selectedKeys: new Set(),
       completionOptions: new Map(),
     };
+    setBatchColumnSelectionExpandedRendering(true);
     return batchColumnSelectionSession;
   }
 
+  setBatchColumnSelectionExpandedRendering(true);
   batchColumnSelectionSession.candidates = candidates;
   batchColumnSelectionSession.qualifier = selectableItems[0]!.batchSelectionQualifier;
   const candidateKeys = new Set(candidates.map((candidate) => candidate.key));
@@ -3611,13 +3853,10 @@ function cacheBatchColumnSelectionOption(marker: QueryCompletionOption["dbxBatch
 function toggleBatchColumnSelection(view: EditorViewType, sessionKey: string, candidateKey: string) {
   const session = batchColumnSelectionSession;
   if (!session || session.key !== sessionKey || !session.candidates.some((candidate) => candidate.key === candidateKey)) return;
-  if (session.selectedKeys.has(candidateKey)) {
-    session.selectedKeys.delete(candidateKey);
-  } else {
-    session.selectedKeys.add(candidateKey);
-  }
+  setBatchColumnSelectionValue(sessionKey, candidateKey, !session.selectedKeys.has(candidateKey));
+  updateBatchColumnSelectionActionLabel(view, sessionKey);
   // Reopen the list so the action row and all virtualized checkboxes reflect the new state.
-  window.setTimeout(() => codeMirrorStartCompletion?.(view), 0);
+  scheduleBatchColumnSelectionRefresh(view, sessionKey, candidateKey);
 }
 
 function toggleSelectedBatchColumnSelection(view: EditorViewType): boolean {
@@ -3626,6 +3865,143 @@ function toggleSelectedBatchColumnSelection(view: EditorViewType): boolean {
   if (!marker) return false;
   toggleBatchColumnSelection(view, marker.sessionKey, marker.candidateKey);
   return true;
+}
+
+function batchColumnSelectionMarkerAtPoint(clientX: number, clientY: number): { checkbox: HTMLInputElement; marker: BatchColumnSelectionCheckboxMarker } | null {
+  const target = document.elementFromPoint(clientX, clientY);
+  if (!(target instanceof HTMLElement)) return null;
+  const checkbox = target.closest<HTMLInputElement>("input.cm-batch-column-selection-checkbox") ?? target.closest<HTMLElement>("[role='option']")?.querySelector<HTMLInputElement>("input.cm-batch-column-selection-checkbox") ?? null;
+  if (!checkbox) return null;
+  const marker = batchColumnSelectionCheckboxMarkers.get(checkbox);
+  return marker ? { checkbox, marker } : null;
+}
+
+function batchColumnSelectionScrollElement(checkbox: HTMLElement): HTMLElement | null {
+  let current = checkbox.parentElement;
+  while (current && current !== document.body) {
+    const style = window.getComputedStyle(current);
+    if (current.scrollHeight > current.clientHeight && /(auto|scroll|overlay)/.test(style.overflowY)) return current;
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function visibleBatchColumnSelectionCheckboxes(sessionKey: string): Array<{ checkbox: HTMLInputElement; marker: BatchColumnSelectionCheckboxMarker }> {
+  return Array.from(document.querySelectorAll<HTMLInputElement>("input.cm-batch-column-selection-checkbox")).flatMap((checkbox) => {
+    const marker = batchColumnSelectionCheckboxMarkers.get(checkbox);
+    return marker?.sessionKey === sessionKey ? [{ checkbox, marker }] : [];
+  });
+}
+
+function updateBatchColumnSelectionAtPoint(state: BatchColumnSelectionDragState, clientX: number, clientY: number) {
+  const hit = batchColumnSelectionMarkerAtPoint(clientX, clientY);
+  if (!hit || hit.marker.sessionKey !== state.sessionKey) return;
+  state.focusCandidateKey = hit.marker.candidateKey;
+  const session = batchColumnSelectionSession;
+  if (!session) return;
+  const visibleCheckboxes = visibleBatchColumnSelectionCheckboxes(state.sessionKey);
+  const anchorIndex = visibleCheckboxes.findIndex(({ marker }) => marker.candidateKey === state.anchorCandidateKey);
+  const focusIndex = visibleCheckboxes.findIndex(({ marker }) => marker.candidateKey === hit.marker.candidateKey);
+  if (anchorIndex < 0 || focusIndex < 0) return;
+  const nextSelectedKeys = new Set(state.baseSelectedKeys);
+  const rangeStart = Math.min(anchorIndex, focusIndex);
+  const rangeEnd = Math.max(anchorIndex, focusIndex);
+  for (let index = rangeStart; index <= rangeEnd; index++) {
+    const candidate = visibleCheckboxes[index]?.marker;
+    if (!candidate) continue;
+    if (state.selected) nextSelectedKeys.add(candidate.candidateKey);
+    else nextSelectedKeys.delete(candidate.candidateKey);
+  }
+  session.selectedKeys = nextSelectedKeys;
+  visibleCheckboxes.forEach(({ checkbox, marker }) => {
+    checkbox.checked = nextSelectedKeys.has(marker.candidateKey);
+  });
+  updateBatchColumnSelectionActionLabel(state.view, state.sessionKey);
+}
+
+const BATCH_COLUMN_SELECTION_AUTO_SCROLL_EDGE_PX = 36;
+const BATCH_COLUMN_SELECTION_AUTO_SCROLL_MAX_PX = 20;
+
+function runBatchColumnSelectionAutoScroll() {
+  const state = batchColumnSelectionDragState;
+  if (!state) return;
+  state.autoScrollFrame = 0;
+  const scroller = state.scrollElement;
+  if (!scroller) return;
+  const rect = scroller.getBoundingClientRect();
+  if (state.pointerClientX < rect.left || state.pointerClientX > rect.right) return;
+  let delta = 0;
+  if (state.pointerClientY < rect.top + BATCH_COLUMN_SELECTION_AUTO_SCROLL_EDGE_PX) {
+    delta = -BATCH_COLUMN_SELECTION_AUTO_SCROLL_MAX_PX * Math.min(1, (rect.top + BATCH_COLUMN_SELECTION_AUTO_SCROLL_EDGE_PX - state.pointerClientY) / BATCH_COLUMN_SELECTION_AUTO_SCROLL_EDGE_PX);
+  } else if (state.pointerClientY > rect.bottom - BATCH_COLUMN_SELECTION_AUTO_SCROLL_EDGE_PX) {
+    delta = BATCH_COLUMN_SELECTION_AUTO_SCROLL_MAX_PX * Math.min(1, (state.pointerClientY - (rect.bottom - BATCH_COLUMN_SELECTION_AUTO_SCROLL_EDGE_PX)) / BATCH_COLUMN_SELECTION_AUTO_SCROLL_EDGE_PX);
+  }
+  if (!delta) return;
+  const previousScrollTop = scroller.scrollTop;
+  scroller.scrollTop = Math.max(0, Math.min(scroller.scrollHeight - scroller.clientHeight, scroller.scrollTop + delta));
+  if (scroller.scrollTop === previousScrollTop) return;
+  updateBatchColumnSelectionAtPoint(state, state.pointerClientX, state.pointerClientY);
+  state.autoScrollFrame = window.requestAnimationFrame(runBatchColumnSelectionAutoScroll);
+}
+
+function scheduleBatchColumnSelectionAutoScroll(state: BatchColumnSelectionDragState) {
+  if (!state.scrollElement || state.autoScrollFrame) return;
+  state.autoScrollFrame = window.requestAnimationFrame(runBatchColumnSelectionAutoScroll);
+}
+
+function onBatchColumnSelectionPointerMove(event: PointerEvent) {
+  const state = batchColumnSelectionDragState;
+  if (!state || event.pointerId !== state.pointerId) return;
+  if ((event.buttons & 1) === 0) {
+    finishBatchColumnSelectionDrag();
+    return;
+  }
+  state.pointerClientX = event.clientX;
+  state.pointerClientY = event.clientY;
+  updateBatchColumnSelectionAtPoint(state, event.clientX, event.clientY);
+  scheduleBatchColumnSelectionAutoScroll(state);
+}
+
+function onBatchColumnSelectionPointerUp(event: PointerEvent) {
+  const state = batchColumnSelectionDragState;
+  if (!state || event.pointerId !== state.pointerId) return;
+  finishBatchColumnSelectionDrag();
+}
+
+function onBatchColumnSelectionPointerCancel() {
+  finishBatchColumnSelectionDrag();
+}
+
+function startBatchColumnSelectionDrag(view: EditorViewType, marker: BatchColumnSelectionCheckboxMarker, checkbox: HTMLInputElement, event: PointerEvent) {
+  if (event.button !== 0 || !event.isPrimary) return;
+  finishBatchColumnSelectionDrag(false);
+  cancelBatchColumnSelectionRefresh();
+  const session = batchColumnSelectionSession;
+  if (!session || session.key !== marker.sessionKey) return;
+  if (!session.candidates.some((candidate) => candidate.key === marker.candidateKey)) return;
+  const selected = !session.selectedKeys.has(marker.candidateKey);
+  const baseSelectedKeys = new Set(session.selectedKeys);
+  setBatchColumnSelectionValue(marker.sessionKey, marker.candidateKey, selected, checkbox);
+  batchColumnSelectionDragState = {
+    view,
+    sessionKey: marker.sessionKey,
+    pointerId: event.pointerId,
+    anchorCandidateKey: marker.candidateKey,
+    baseSelectedKeys,
+    selected,
+    focusCandidateKey: marker.candidateKey,
+    previousUserSelect: document.body.style.userSelect,
+    scrollElement: batchColumnSelectionScrollElement(checkbox),
+    pointerClientX: event.clientX,
+    pointerClientY: event.clientY,
+    autoScrollFrame: 0,
+  };
+  updateBatchColumnSelectionActionLabel(view, marker.sessionKey);
+  document.body.style.userSelect = "none";
+  window.addEventListener("pointermove", onBatchColumnSelectionPointerMove, true);
+  window.addEventListener("pointerup", onBatchColumnSelectionPointerUp, true);
+  window.addEventListener("pointercancel", onBatchColumnSelectionPointerCancel, true);
+  window.addEventListener("blur", onBatchColumnSelectionPointerCancel, true);
 }
 
 function renderBatchColumnSelectionCheckbox(completion: Completion, _state: import("@codemirror/state").EditorState, currentView: EditorViewType): Node | null {
@@ -3639,18 +4015,33 @@ function renderBatchColumnSelectionCheckbox(completion: Completion, _state: impo
   checkbox.checked = session.selectedKeys.has(marker.candidateKey);
   checkbox.tabIndex = -1;
   checkbox.setAttribute("aria-label", completion.displayLabel ?? completion.label);
+  batchColumnSelectionCheckboxMarkers.set(checkbox, marker);
+  checkbox.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    startBatchColumnSelectionDrag(currentView, marker, checkbox, event);
+  });
   checkbox.addEventListener("mousedown", (event) => {
     // CodeMirror accepts the completion on a list-item mousedown. Keep this
     // interaction local to the checkbox so a field can be toggled repeatedly.
     event.preventDefault();
     event.stopPropagation();
-    toggleBatchColumnSelection(currentView, marker.sessionKey, marker.candidateKey);
   });
   checkbox.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
   });
   return checkbox;
+}
+
+function renderBatchColumnSelectionActionMarker(completion: Completion): Node | null {
+  const action = (completion as QueryCompletionOption).dbxBatchColumnSelectionAction;
+  if (!action) return null;
+  const marker = document.createElement("span");
+  marker.className = "cm-batch-column-selection-action-marker";
+  marker.hidden = true;
+  batchColumnSelectionActionMarkers.set(marker, action.sessionKey);
+  return marker;
 }
 
 function applyBatchColumnSelection(view: EditorViewType, item: BatchColumnSelectionActionItem, from: number, to: number) {
@@ -3735,7 +4126,7 @@ function isTypedCompletionActivation(explicit: boolean) {
 }
 
 function markCompletionAccepted(item: QueryCompletionItem | BatchColumnSelectionActionItem) {
-  batchColumnSelectionSession = null;
+  clearBatchColumnSelectionSession();
   const shouldContinueCompletion = shouldChainSqlCompletionAfterAccept(item) || (props.databaseType === "sqlserver" && item.type === "keyword" && item.label.toUpperCase() === "USE");
   suppressNextSqlCompletionAutoStartUntil = shouldContinueCompletion ? 0 : Date.now() + 750;
   completionEpoch++;
@@ -3846,6 +4237,7 @@ function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectio
   if (isBatchColumnSelectionAction(item)) {
     return {
       ...labelPresentation,
+      dbxBatchColumnSelectionAction: { sessionKey: item.sessionKey },
       type: item.type,
       detail: item.detail,
       boost: item.boost,
@@ -5142,7 +5534,24 @@ onMounted(async () => {
     },
     { EditorState, EditorSelection, Compartment, Prec, RangeSet, StateEffect, StateField },
     langSql,
-    { autocompletion, startCompletion, acceptCompletion, closeBrackets, closeBracketsKeymap, snippetCompletion, completionStatus, completionKeymap, insertCompletionText, nextSnippetField, closeCompletion, moveCompletionSelection, selectedCompletion, selectedCompletionIndex },
+    {
+      autocompletion,
+      startCompletion,
+      acceptCompletion,
+      closeBrackets,
+      closeBracketsKeymap,
+      snippetCompletion,
+      completionStatus,
+      completionKeymap,
+      insertCompletionText,
+      nextSnippetField,
+      closeCompletion,
+      moveCompletionSelection,
+      selectedCompletion,
+      selectedCompletionIndex,
+      currentCompletions,
+      setSelectedCompletion,
+    },
     { copyLineDown, copyLineUp, deleteLine, indentLess, indentMore, insertNewlineKeepIndent, moveLineDown, moveLineUp, redo, selectAll, undo, toggleLineComment, toggleBlockComment, history, defaultKeymap, historyKeymap },
     { bracketMatching, foldGutter, indentOnInput, indentUnit, syntaxHighlighting, defaultHighlightStyle, foldKeymap, toggleFold, ensureSyntaxTree, highlightingFor, syntaxTree },
     { searchKeymap },
@@ -5179,8 +5588,10 @@ onMounted(async () => {
   setSqlDiagnosticsEffect = StateEffect.define<SqlSemanticDiagnostic[]>();
   codeMirrorCompletionStatus = completionStatus;
   codeMirrorAcceptCompletion = acceptCompletion;
+  codeMirrorCurrentCompletions = currentCompletions;
   codeMirrorSelectedCompletion = selectedCompletion;
   codeMirrorSelectedCompletionIndex = selectedCompletionIndex;
+  codeMirrorSetSelectedCompletion = setSelectedCompletion;
   codeMirrorMoveCompletionSelection = moveCompletionSelection;
   codeMirrorSelectFirstCompletion = moveCompletionSelection(true);
   codeMirrorCloseCompletion = closeCompletion;
@@ -5419,7 +5830,13 @@ onMounted(async () => {
       defaultKeymap: false,
       selectOnOpen: settingsStore.editorSettings.selectFirstCompletionOnOpen,
       compareCompletions: (a, b) => compareSqlCompletions(a, b, settingsStore.editorSettings.sortCompletionColumnsAlphabetically),
-      addToOptions: [{ position: 10, render: renderBatchColumnSelectionCheckbox }],
+      // Keep normal completion lists virtualized; batch-field selection needs every row in the DOM.
+      maxRenderedOptions: batchColumnSelectionExpandedRendering ? Number.MAX_SAFE_INTEGER : 100,
+      optionClass: (completion) => ((completion as QueryCompletionOption).dbxBatchColumnSelectionAction ? "cm-batch-column-selection-action" : ""),
+      addToOptions: [
+        { position: 5, render: renderBatchColumnSelectionActionMarker },
+        { position: 10, render: renderBatchColumnSelectionCheckbox },
+      ],
       override: [async (context: CompletionContext) => provideSqlCompletions(context)],
     });
 
@@ -5702,8 +6119,7 @@ onMounted(async () => {
       sqlSignatureComp.of(buildSqlSignatureExtension()),
       diagnosticComp.of(buildSqlDiagnosticExtension()),
       createInsertValueHintsExtension({
-        isEnabled: () =>
-          settingsStore.editorSettings.showInsertValueHints && props.databaseType !== "redis" && props.databaseType !== "mongodb" && props.databaseType !== "elasticsearch" && props.databaseType !== "easysearch" && props.databaseType !== "meilisearch" && props.databaseType !== "victoriametrics",
+        isEnabled: () => settingsStore.editorSettings.showInsertValueHints && supportsInsertValueHints(props.databaseType),
         getTableColumns: getInsertValueHintTableColumns,
         requestTableColumns: requestInsertValueHintTableColumns,
         getDialectId: () => resolveSqlDialectId({ databaseType: props.databaseType, dialect: sqlBehaviorDialect() }),
@@ -5769,6 +6185,7 @@ onMounted(async () => {
           syncContextMenuState(update.view);
           emit("selectionChange", selectedSqlFromView(update.view));
           emit("cursorChange", update.state.selection.main.head);
+          emit("previewChangesAvailable", !!previewContextSql.value);
           latestSelection = readEditorSelection(update.view);
           if (editorIsActive) emitEditorSelection(latestSelection);
         }
@@ -6092,6 +6509,7 @@ onMounted(async () => {
   });
 
   view.value = new EditorView({ state, parent: editorElement });
+  batchColumnSelectionTooltipParents.set(view.value, tooltipParent);
   postCompositionKeyGuardCleanup = postCompositionKeyGuard.attach(view.value.contentDOM);
   registerEditorScrollbarPointerGuard(view.value);
   view.value.scrollDOM.addEventListener("scroll", scheduleEditorViewportEmit, {
@@ -6114,6 +6532,7 @@ onMounted(async () => {
 
   restoreEditorViewport();
   syncContextMenuState(view.value);
+  emit("previewChangesAvailable", !!previewContextSql.value);
   syncEditorFontCssVars(liveFontSize.value, initialSettings.fontFamily);
   syncEditorDiagnosticCssVars();
   registerTableReferenceDropListener();
@@ -6385,6 +6804,8 @@ watch(
 );
 
 function pauseQueryEditorBackgroundWork() {
+  finishBatchColumnSelectionDrag(false);
+  cancelBatchColumnSelectionRefresh();
   flushEditorViewport();
   flushEditorSelection();
   clearTableNavigationHover();
@@ -6584,6 +7005,10 @@ function acceptGutterExecutionViewport(requestId: number) {
   return executionViewportOwnership.acceptRequest(requestId);
 }
 
+function cancelGutterExecutionViewport(requestId: number) {
+  return executionViewportOwnership.cancelPendingRequest(requestId);
+}
+
 function shouldBlockExecutionShortcut(event?: KeyboardEvent, currentView: EditorViewType | null = view.value): boolean {
   return (currentView ? isEditorComposing(currentView) : false) || (event ? postCompositionKeyGuard.blocks(event) : false);
 }
@@ -6594,9 +7019,11 @@ defineExpose({
   scrollCursorIntoView,
   beginExecutionViewportTracking,
   acceptGutterExecutionViewport,
+  cancelGutterExecutionViewport,
   shouldBlockExecutionShortcut,
   requestExecute,
   requestExecuteInNewResultTab,
+  requestPreviewChanges,
   captureExecutionSnapshot,
   pasteClipboardAsSqlInCondition,
   focusStatementRange,

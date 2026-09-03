@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
@@ -84,6 +85,7 @@ import type {
   DataGridSaveStatementOptions,
   HiveTablePropertiesSqlOptions,
 } from "@/lib/dataGrid/dataGridSql";
+import type { DmlChangePreviewSqlOptions, DmlChangePreviewSqlResult } from "@/lib/sql/dmlChangePreview";
 import type { DataGridExtractRequest, DataGridExtractResult } from "@/lib/dataGrid/dataGridCopyExtractor";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataGrid/dataCompare";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSqlPlan, SelectedSchemaDiffInput, GenerateSchemaSyncPlanOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
@@ -257,8 +259,16 @@ export interface McpConnectionPolicy {
   readOnly: boolean;
   allowDangerousSql: boolean;
   executionModeConfigured: boolean;
+  executionModePolicyVersion: number | null;
   databaseScope: "all" | "selected" | "none";
   allowedDatabases: string[];
+  databasePolicies: McpDatabasePolicy[];
+}
+
+export interface McpDatabasePolicy {
+  databaseName: string;
+  readOnly: boolean;
+  allowDangerousSql: boolean;
 }
 
 export interface SavedSqlSyncEntry {
@@ -730,6 +740,26 @@ export async function saveOpenTabsState(payload: OpenTabsStatePayload): Promise<
   return invoke("save_open_tabs_state", { payload });
 }
 
+export async function saveDetachedTabHandoff(tabId: string, handoff: DetachedTabHandoff): Promise<void> {
+  return invoke("save_detached_tab_handoff", { tabId, handoff });
+}
+
+export async function loadDetachedTabHandoff(tabId: string): Promise<DetachedTabHandoff | null> {
+  return invoke("load_detached_tab_handoff", { tabId });
+}
+
+export async function listDetachedTabHandoffs(): Promise<DetachedTabHandoff[]> {
+  return invoke("list_detached_tab_handoffs");
+}
+
+export async function deleteDetachedTabHandoff(tabId: string): Promise<void> {
+  return invoke("delete_detached_tab_handoff", { tabId });
+}
+
+export async function approveDetachedWindowClose(): Promise<void> {
+  return invoke("approve_detached_window_close");
+}
+
 export async function loadSavedSqlEditorPositions(): Promise<unknown[] | null> {
   return invoke("load_saved_sql_editor_positions");
 }
@@ -936,8 +966,8 @@ export async function writeExternalSqlFile(path: string, content: string, option
   });
 }
 
-export async function saveExternalSqlFile(defaultFileName: string, content: string): Promise<{ path: string; version: ExternalSqlFileVersion } | null> {
-  return invoke("save_external_sql_file", { defaultFileName, content });
+export async function saveExternalSqlFile(defaultFileName: string, content: string, filterExtension?: string): Promise<{ path: string; version: ExternalSqlFileVersion } | null> {
+  return invoke("save_external_sql_file", { defaultFileName, content, filterExtension });
 }
 
 export interface SqlFileEntry {
@@ -1065,6 +1095,10 @@ export async function setAiGlobalCustomInstructions(content: string): Promise<vo
 
 export async function testConnection(config: ConnectionConfig): Promise<string> {
   return invokeBackend("test_connection", { config });
+}
+
+export async function testSshTunnel(config: ConnectionConfig): Promise<string> {
+  return invokeBackend("test_ssh_tunnel", { config });
 }
 
 export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
@@ -1827,6 +1861,10 @@ export async function buildDataGridContextFilterCondition(options: DataGridConte
   return result ?? undefined;
 }
 
+export async function buildDmlChangePreviewSql(options: DmlChangePreviewSqlOptions): Promise<DmlChangePreviewSqlResult> {
+  return invoke("build_dml_change_preview_sql", { options });
+}
+
 export async function buildDataGridColumnValueFilterCondition(options: DataGridColumnValueFilterConditionOptions): Promise<string | undefined> {
   const result = await invoke<string | null>("build_data_grid_column_value_filter_condition", { options });
   return result ?? undefined;
@@ -2537,7 +2575,7 @@ export interface RedisStreamPendingPage {
 }
 
 export type RedisValueData =
-  | { kind: "string"; content: RedisBlob }
+  | { kind: "string"; content: RedisBlob; total_bytes?: number; truncated?: boolean }
   | { kind: "json"; value: string }
   | {
       kind: "list";

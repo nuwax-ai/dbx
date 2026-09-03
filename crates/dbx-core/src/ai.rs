@@ -3,7 +3,7 @@ use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -68,6 +68,7 @@ pub enum AiProvider {
     Openai,
     Gemini,
     Deepseek,
+    Kimi,
     Qwen,
     MiniMax,
     Ollama,
@@ -100,6 +101,7 @@ impl AiProvider {
             AiProvider::Openai => "openai",
             AiProvider::Gemini => "gemini",
             AiProvider::Deepseek => "deepseek",
+            AiProvider::Kimi => "kimi",
             AiProvider::Qwen => "qwen",
             AiProvider::MiniMax => "minimax",
             AiProvider::Ollama => "ollama",
@@ -311,6 +313,14 @@ pub struct AiChatSelectionState {
     pub effort_preferences: Vec<AiModelEffortPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_mode: Option<AiAssistantMode>,
+    /// Prompt template ids auto-applied when the AI panel opens, keyed by
+    /// connection db_type. BTreeMap keeps serialized key order stable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub default_templates_by_db_type: BTreeMap<String, Vec<String>>,
+    /// Prompt template ids from the most recent send, keyed by connection
+    /// db_type; used as fallback when no defaults are configured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_used_templates_by_db_type: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for AiChatSelectionState {
@@ -320,6 +330,8 @@ impl Default for AiChatSelectionState {
             active: None,
             effort_preferences: Vec::new(),
             default_mode: None,
+            default_templates_by_db_type: BTreeMap::new(),
+            last_used_templates_by_db_type: BTreeMap::new(),
         }
     }
 }
@@ -794,6 +806,7 @@ pub fn resolve_endpoint(config: &AiConfig) -> String {
     match config.provider {
         AiProvider::Openai
         | AiProvider::Deepseek
+        | AiProvider::Kimi
         | AiProvider::Qwen
         | AiProvider::MiniMax
         | AiProvider::Ollama
@@ -1258,11 +1271,13 @@ fn decorate_chat_completion_body(body: &mut serde_json::Value, config: &AiConfig
 /// Kimi K2.5+ models (including K2.7-Code) handle thinking flags differently
 /// and reject the OpenAI-compatible `extra_body.chat_template_kwargs` toggle.
 ///
-/// Matches `kimi-k2.5`, `kimi-k2.6`, `kimi-k2.7-code`, K3+, and future versions,
-/// while excluding older K2 variants (`kimi-k2`, `kimi-k2-thinking`, etc.).
-/// Regex equivalent: /kimi-k(?:2\.[5-9]\d*|[3-9]\d*)/
+/// Matches current Kimi IDs and legacy catalog aliases while excluding older K2
+/// variants (`kimi-k2`, `kimi-k2-thinking`, etc.).
 fn is_kimi_model(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
+    if matches!(model.as_str(), "k3" | "kimi-for-coding" | "kimi-for-coding-highspeed") {
+        return true;
+    }
     if let Some(rest) = model.strip_prefix("kimi-k") {
         if rest.starts_with("2.") && rest.len() > 2 {
             // K2.x — the digit after "2." must be >= 5 (so K2.5+)
@@ -1548,6 +1563,7 @@ fn provider_requires_api_key(provider: &AiProvider) -> bool {
             | AiProvider::Openai
             | AiProvider::Gemini
             | AiProvider::Deepseek
+            | AiProvider::Kimi
             | AiProvider::Qwen
             | AiProvider::MiniMax
     )
@@ -1555,6 +1571,16 @@ fn provider_requires_api_key(provider: &AiProvider) -> bool {
 
 fn normalized_api_key(config: &AiConfig) -> &str {
     config.api_key.trim()
+}
+
+fn is_jalapeno_config(config: &AiConfig) -> bool {
+    if !matches!(config.provider, AiProvider::OpenaiCompatible) {
+        return false;
+    }
+    reqwest::Url::parse(config.endpoint.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.eq_ignore_ascii_case("api.jalapeno-cloud.ai")))
+        .unwrap_or(false)
 }
 
 fn validate_config(config: &AiConfig) -> Result<(), String> {
@@ -1591,6 +1617,9 @@ fn validate_model_list_config(config: &AiConfig) -> Result<(), String> {
 pub fn maybe_bearer_headers(config: &AiConfig) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if is_jalapeno_config(config) {
+        headers.insert("HTTP-Referer", HeaderValue::from_static("https://dbxio.com"));
+    }
     let api_key = normalized_api_key(config);
     if !api_key.is_empty() {
         headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| e.to_string())?);
@@ -2009,6 +2038,7 @@ pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, Str
                 }
                 AiProvider::Openai
                 | AiProvider::Deepseek
+                | AiProvider::Kimi
                 | AiProvider::Qwen
                 | AiProvider::MiniMax
                 | AiProvider::OpenaiCompatible => list_openai_compatible_models(&client, config).await?,
@@ -3044,6 +3074,7 @@ pub async fn complete(request: &AiCompletionRequest) -> Result<String, String> {
                 }
                 AiProvider::Openai
                 | AiProvider::Deepseek
+                | AiProvider::Kimi
                 | AiProvider::Qwen
                 | AiProvider::MiniMax
                 | AiProvider::Ollama
@@ -3105,6 +3136,7 @@ pub async fn stream(
         }
         AiProvider::Openai
         | AiProvider::Deepseek
+        | AiProvider::Kimi
         | AiProvider::Qwen
         | AiProvider::MiniMax
         | AiProvider::Ollama
@@ -5942,6 +5974,30 @@ mod tests {
     }
 
     #[test]
+    fn kimi_provider_uses_openai_compatible_endpoints_and_requires_an_api_key() {
+        let config = AiConfig {
+            provider: AiProvider::Kimi,
+            api_key: "key".to_string(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "https://api.moonshot.cn/v1".to_string(),
+            model: "kimi-k2.5".to_string(),
+            ..test_config(AiProvider::Kimi)
+        };
+
+        assert_eq!(resolve_endpoint(&config), "https://api.moonshot.cn/v1/chat/completions");
+        assert_eq!(resolve_model_list_endpoint(&config).unwrap(), "https://api.moonshot.cn/v1/models");
+        assert!(provider_requires_api_key(&config.provider));
+        assert_eq!(
+            validate_config(&AiConfig { api_key: String::new(), ..config.clone() }).unwrap_err(),
+            "API key is required"
+        );
+
+        let provider_json = serde_json::to_string(&AiProvider::Kimi).unwrap();
+        assert_eq!(provider_json, r#""kimi""#);
+        assert!(matches!(serde_json::from_str::<AiProvider>(&provider_json).unwrap(), AiProvider::Kimi));
+    }
+
+    #[test]
     fn auto_adds_v1_to_openai_compatible_endpoints() {
         // Endpoint without /v1 — auto add
         let config = AiConfig {
@@ -6146,6 +6202,22 @@ mod tests {
 
         config.custom_headers = HashMap::from([("X-Test".to_string(), "bad\r\nvalue".to_string())]);
         assert!(maybe_bearer_headers(&config).unwrap_err().contains("Invalid AI custom header value"));
+    }
+
+    #[test]
+    fn jalapeno_requests_include_dbx_referer() {
+        let mut config = test_config(AiProvider::OpenaiCompatible);
+        config.endpoint = "https://api.jalapeno-cloud.ai/v1".to_string();
+
+        let headers = maybe_bearer_headers(&config).unwrap();
+        assert_eq!(headers.get("HTTP-Referer").unwrap(), "https://dbxio.com");
+
+        config.endpoint = "https://api.jalapeno-cloud.ai.example.com/v1".to_string();
+        assert!(maybe_bearer_headers(&config).unwrap().get("HTTP-Referer").is_none());
+
+        config.endpoint = "https://api.jalapeno-cloud.ai/v1".to_string();
+        config.provider = AiProvider::Custom;
+        assert!(maybe_bearer_headers(&config).unwrap().get("HTTP-Referer").is_none());
     }
 
     #[test]
@@ -6619,6 +6691,9 @@ mod tests {
         assert!(is_kimi_model("kimi-k2.6"));
         assert!(is_kimi_model("kimi-k2.5"));
         assert!(is_kimi_model("kimi-k3"));
+        assert!(is_kimi_model("K3"));
+        assert!(is_kimi_model("kimi-for-coding"));
+        assert!(is_kimi_model("kimi-for-coding-highspeed"));
 
         // Older K2 variants should not skip OpenAI-compatible thinking toggles.
         assert!(!is_kimi_model("kimi-k2"));
@@ -6850,8 +6925,8 @@ mod tests {
     }
 
     #[test]
-    fn omits_extra_body_for_kimi_test_connection_body() {
-        let config = AiConfig {
+    fn omits_extra_body_for_kimi_model_aliases() {
+        let mut config = AiConfig {
             provider: AiProvider::OpenaiCompatible,
             api_key: "key".to_string(),
             auth_method: AiAuthMethod::Bearer,
@@ -6884,17 +6959,20 @@ mod tests {
             qoder_cli_path: None,
             qoder_cli_env: Default::default(),
         };
-        let mut body = serde_json::json!({
-            "model": &config.model,
-            "messages": [{ "role": "user", "content": TEST_PROMPT }],
-            "max_tokens": 16,
-            "stream": true,
-        });
+        for model in ["kimi-k2.5", "K3", "kimi-for-coding", "kimi-for-coding-highspeed"] {
+            config.model = model.to_string();
+            let mut body = serde_json::json!({
+                "model": &config.model,
+                "messages": [{ "role": "user", "content": TEST_PROMPT }],
+                "max_tokens": 16,
+                "stream": true,
+            });
 
-        apply_chat_completion_thinking_toggle(&mut body, &config);
+            apply_chat_completion_thinking_toggle(&mut body, &config);
 
-        assert!(body.get("extra_body").is_none());
-        assert!(body.get("reasoning_effort").is_none());
+            assert!(body.get("extra_body").is_none(), "{model}");
+            assert!(body.get("reasoning_effort").is_none(), "{model}");
+        }
     }
 
     #[test]
@@ -8083,6 +8161,7 @@ mod tests {
             AiProvider::Custom,
             AiProvider::Gemini,
             AiProvider::Deepseek,
+            AiProvider::Kimi,
             AiProvider::Qwen,
             AiProvider::Ollama,
             AiProvider::MiniMax,
