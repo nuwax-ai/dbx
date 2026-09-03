@@ -2,21 +2,16 @@
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { DatabaseZap, FilePlus2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, FolderTree } from "@lucide/vue";
+import { DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, Package, FileDown, FolderTree } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
-import ToolbarUpdateIcon from "@/components/layout/ToolbarUpdateIcon.vue";
 import { MAC_TRAFFIC_LIGHT_X, macTrafficLightInsetPaddingForScale, shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
-import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { isSystemAppThemeMode, type AppThemeMode } from "@/lib/app/appTheme";
 
 const props = defineProps<{
-  isDark: boolean;
-  themeMode: AppThemeMode;
   showAiPanel: boolean;
   activeAiRunCount: number;
   /** Runs awaiting a write confirmation; the badge turns amber to outrank the
@@ -28,12 +23,6 @@ const props = defineProps<{
   showSqlFilePanel: boolean;
   showDriverStore: boolean;
   showSettingsPage: boolean;
-  checkingUpdates: boolean;
-  hasUpdateAvailable: boolean;
-  isDownloadingUpdate: boolean;
-  downloadProgress: number | null;
-  updateReadyToInstall: boolean;
-  updateReady: boolean;
   agentDriverUpdateCount: number;
   hasMcpUpdateAvailable: boolean;
   hasConnections: boolean;
@@ -43,14 +32,12 @@ const props = defineProps<{
 const emit = defineEmits<{
   "new-connection": [];
   "new-query": [];
-  "set-theme-mode": [mode: AppThemeMode];
   "toggle-ai": [];
   "toggle-history": [];
   "toggle-sql-library": [];
   "toggle-sql-file-panel": [];
   "open-settings": [];
   "open-driver-store": [];
-  "check-updates": [];
   "open-transfer": [];
   "open-sql-file": [];
   "open-schema-diff": [];
@@ -58,19 +45,9 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
-const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
-const checkingUpdates = computed(() => props.checkingUpdates);
-const updateTooltip = computed(() => {
-  if (props.isDownloadingUpdate) return t("updates.downloading", { progress: props.downloadProgress ?? 0 });
-  if (props.updateReady) return t("updates.restartRequiredTooltip");
-  if (props.updateReadyToInstall) return t("updates.updateReadyTooltip");
-  return t("updates.check");
-});
-// ToolbarUpdateIcon takes a 0..1 fraction, with null meaning the download size is unknown.
-const updateDownloadProgress = computed(() => (props.downloadProgress == null ? null : Math.min(1, Math.max(0, props.downloadProgress / 100))));
 const sqlLibrarySaveFeedbackActive = ref(false);
 const SQL_LIBRARY_BOOKMARK_PATH = "M10 2 L10 10 L13 7 L16 10 L16 2";
 const SQL_LIBRARY_CHECK_PATH = "M9 9.5 L9 9.5 L11 11.5 L15 7.5 L15 7.5";
@@ -106,30 +83,6 @@ watch(sqlLibrarySaveFeedbackActive, async (active) => {
   }
   animation.beginElement();
 });
-
-const themeTriggerIcon = computed(() => {
-  if (isSystemAppThemeMode(props.themeMode)) return SunMoon;
-  return props.isDark ? Moon : Sun;
-});
-
-const themeCycle: AppThemeMode[] = ["light", "dark", "system"];
-
-function nextThemeMode(mode: AppThemeMode): AppThemeMode {
-  const index = themeCycle.indexOf(mode);
-  return themeCycle[(index + 1) % themeCycle.length] ?? themeCycle[0];
-}
-
-function themeModeLabel(mode: AppThemeMode): string {
-  if (mode === "light") return t("toolbar.themeLight");
-  if (mode === "dark") return t("toolbar.themeDark");
-  return t("toolbar.themeSystem");
-}
-
-function cycleThemeMode() {
-  const next = nextThemeMode(props.themeMode);
-  emit("set-theme-mode", next);
-  toast(`${t("toolbar.theme")}: ${themeModeLabel(next)}`, 1600);
-}
 
 function onToolbarDblClick(e: MouseEvent) {
   if (isDesktop) return;
@@ -180,15 +133,6 @@ const collapsibleRightItemDefs = computed(() => {
     disabled: boolean;
   }
   const items: ItemDef[] = [];
-  if (toolbarItems.value.checkUpdates) {
-    items.push({
-      key: "checkUpdates",
-      label: t("updates.check"),
-      icon: CloudDownload,
-      action: () => emit("check-updates"),
-      disabled: checkingUpdates.value,
-    });
-  }
   items.push({
     key: "exportProgress",
     label: t("exportProgress.tooltip"),
@@ -229,15 +173,6 @@ const collapsibleRightItemDefs = computed(() => {
       label: "AI",
       icon: Bot,
       action: () => emit("toggle-ai"),
-      disabled: false,
-    });
-  }
-  if (toolbarItems.value.theme) {
-    items.push({
-      key: "theme",
-      label: t("toolbar.theme"),
-      icon: themeTriggerIcon.value,
-      action: cycleThemeMode,
       disabled: false,
     });
   }
@@ -574,19 +509,6 @@ const toolbarStyle = computed(() => {
 
     <!-- Right-side items wrapped in overflow-aware container -->
     <div ref="rightWrapper" class="flex min-w-0 items-center gap-1 overflow-hidden">
-      <template v-if="toolbarItems.checkUpdates">
-        <Tooltip>
-          <TooltipTrigger as-child>
-            <Button v-show="isRightItemVisible('checkUpdates')" data-toolbar-update-trigger variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :disabled="checkingUpdates" @click="emit('check-updates')">
-              <ToolbarUpdateIcon :loading="checkingUpdates" :downloading="isDownloadingUpdate" :progress="updateDownloadProgress" />
-              <span v-if="updateReady || updateReadyToInstall" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-emerald-500 ring-2 ring-background" />
-              <span v-else-if="hasUpdateAvailable && !isDownloadingUpdate" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{{ updateTooltip }}</TooltipContent>
-        </Tooltip>
-      </template>
-
       <div v-show="isRightItemVisible('exportProgress')" class="contents">
         <ExportProgressPopover />
       </div>
@@ -668,15 +590,6 @@ const toolbarStyle = computed(() => {
         </TooltipTrigger>
         <TooltipContent>AI</TooltipContent>
       </Tooltip>
-
-      <Tooltip v-if="toolbarItems.theme">
-        <TooltipTrigger as-child>
-          <Button v-show="isRightItemVisible('theme')" variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('toolbar.theme')" @click="cycleThemeMode">
-            <component :is="themeTriggerIcon" :key="themeMode" class="toolbar-action-icon toolbar-theme-icon h-4 w-4" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>{{ t("toolbar.theme") }}</TooltipContent>
-      </Tooltip>
     </div>
     <!-- /rightWrapper -->
 
@@ -703,8 +616,7 @@ const toolbarStyle = computed(() => {
     transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.toolbar-action-button:active:not(:disabled) .toolbar-action-icon,
-.toolbar-action-button:active:not(:disabled) :deep([data-toolbar-update-icon]) {
+.toolbar-action-button:active:not(:disabled) .toolbar-action-icon {
   transform: scale(0.82);
 }
 
@@ -725,10 +637,6 @@ const toolbarStyle = computed(() => {
   animation: toolbar-panel-status-in 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-.toolbar-theme-icon {
-  animation: toolbar-theme-icon-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
 @keyframes toolbar-panel-status-in {
   0% {
     opacity: 0;
@@ -740,17 +648,6 @@ const toolbarStyle = computed(() => {
   100% {
     opacity: 1;
     transform: translateX(-50%) translateY(0) scale(1);
-  }
-}
-
-@keyframes toolbar-theme-icon-in {
-  0% {
-    opacity: 0;
-    transform: rotate(-18deg) scale(0.72);
-  }
-  100% {
-    opacity: 1;
-    transform: rotate(0) scale(1);
   }
 }
 
@@ -798,8 +695,7 @@ const toolbarStyle = computed(() => {
 
 @media (prefers-reduced-motion: reduce) {
   .toolbar-action-icon,
-  .toolbar-panel-status,
-  .toolbar-theme-icon {
+  .toolbar-panel-status {
     animation: none;
     transition: none;
   }

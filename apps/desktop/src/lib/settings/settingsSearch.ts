@@ -37,7 +37,7 @@ export interface SettingsSearchRoute {
 
 export type Translate = (key: string) => string;
 
-type ToolbarVisibilityItemKey = "dataTransfer" | "driverManager" | "sqlFile" | "schemaDiff" | "dataCompare" | "checkUpdates" | "sqlLibrary" | "sqlFileTree" | "history" | "ai" | "theme";
+type ToolbarVisibilityItemKey = "dataTransfer" | "driverManager" | "sqlFile" | "schemaDiff" | "dataCompare" | "sqlLibrary" | "sqlFileTree" | "history" | "ai";
 
 export type ToolbarVisibilityItem = { key: ToolbarVisibilityItemKey; titleKey: string; title?: never } | { key: ToolbarVisibilityItemKey; title: string; titleKey?: never };
 
@@ -52,12 +52,10 @@ export const TOOLBAR_VISIBILITY_ITEMS: readonly ToolbarVisibilityItem[] = [
   { key: "sqlFile", titleKey: "sqlFile.title" },
   { key: "schemaDiff", titleKey: "diff.title" },
   { key: "dataCompare", titleKey: "dataCompare.title" },
-  { key: "checkUpdates", titleKey: "updates.check" },
   { key: "sqlLibrary", titleKey: "sqlLibrary.title" },
   { key: "sqlFileTree", titleKey: "sqlFileTree.title" },
   { key: "history", titleKey: "history.title" },
   { key: "ai", title: "AI" },
-  { key: "theme", titleKey: "toolbar.theme" },
 ];
 
 export function toolbarVisibilityItemLabel(item: ToolbarVisibilityItem, translate: Translate): string {

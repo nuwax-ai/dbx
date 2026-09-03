@@ -187,7 +187,7 @@ connectionStore.setBeforeConnectHandler(async (config) => {
   }
 });
 const { message: toastMessage, visible: toastVisible, action: toastAction, toast } = useToast();
-const { isDark, themeMode, applyTheme, setThemeMode } = useTheme();
+const { applyTheme } = useTheme();
 const { activeCount: activeBackgroundTaskCount } = useExportTracker();
 const trackedUpdateTaskCount = computed(() => countActiveUpdateBlockingTasks(activeBackgroundTaskCount.value, queryStore.tabs));
 const {
@@ -202,7 +202,6 @@ const {
   updateReady,
   isIgnoringUpdate,
   activeTaskCount: activeUpdateTaskCount,
-  hasUpdateAvailable,
   openUrl,
   checkUpdates,
   openLatestRelease,
@@ -648,7 +647,6 @@ function closeDriverStorePage() {
   driverStoreFocus.value = null;
 }
 const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
-const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
 const toolbarMcpUpdateAvailable = computed(() => updateNotificationsEnabled.value && mcpUpdateAvailable.value);
 const hasSqlFileConnections = computed(() => connectionStore.connections.some((c) => supportsSqlFileExecution(c.db_type)));
 const queryEditorDdlDatabaseType = computed(() => {
@@ -2998,8 +2996,6 @@ onUnmounted(() => {
     <TooltipProvider :delay-duration="300">
       <div class="h-screen w-screen max-w-full min-w-[760px] min-h-[600px] flex flex-col bg-background text-foreground overflow-hidden" :class="{ 'dbx-desktop-window-frame': drawDesktopWindowFrame }" :style="appUiFontFamilyStyle">
         <AppToolbar
-          :is-dark="isDark"
-          :theme-mode="themeMode"
           :show-ai-panel="showAiPanel"
           :active-ai-run-count="activeAiRunCount"
           :awaiting-ai-run-count="awaitingAiRunCount"
@@ -3009,26 +3005,18 @@ onUnmounted(() => {
           :show-sql-file-panel="showSqlFilePanel"
           :show-driver-store="showDriverStore"
           :show-settings-page="showSettingsPage"
-          :checking-updates="checkingUpdates"
-          :has-update-available="toolbarHasUpdateAvailable"
-          :is-downloading-update="isDownloadingUpdate"
-          :download-progress="downloadProgress"
-          :update-ready-to-install="updateDownloaded"
-          :update-ready="updateReady"
           :agent-driver-update-count="toolbarAgentDriverUpdateCount"
           :has-mcp-update-available="toolbarMcpUpdateAvailable"
           :has-connections="connectionStore.connections.length > 0"
           :has-sql-file-connections="hasSqlFileConnections"
           @new-connection="showConnectionDialog = true"
           @new-query="newQuery"
-          @set-theme-mode="setThemeMode"
           @toggle-ai="toggleRightSidebarPanel('ai')"
           @toggle-history="toggleRightSidebarPanel('history')"
           @toggle-sql-library="toggleRightSidebarPanel('sqlLibrary')"
           @toggle-sql-file-panel="toggleRightSidebarPanel('sqlFile')"
           @open-settings="openSettings(toolbarMcpUpdateAvailable ? 'mcp' : 'appearance')"
           @open-driver-store="openDriverStorePage"
-          @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"
           @open-schema-diff="dialogs.showSchemaDiffDialog.value = true"
