@@ -52,6 +52,7 @@ export interface SavedOpenTab {
   structureTableName?: string;
   objectBrowser?: QueryTab["objectBrowser"];
   objectSource?: QueryTab["objectSource"];
+  sourceView?: boolean;
   tableMeta?: QueryTab["tableMeta"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   resultEvicted?: boolean;
@@ -64,6 +65,23 @@ export interface SavedOpenTab {
 export interface RestoredOpenTabs {
   tabs: QueryTab[];
   activeTabId: string | null;
+}
+
+/** Group membership persisted with the open-tabs payload. */
+export interface PersistedEditorGroup {
+  id: string;
+  tabIds: string[];
+  activeTabId: string | null;
+}
+
+/** Shared open-tabs transport payload — the single definition both backend adapters persist. */
+export interface OpenTabsStatePayload {
+  tabs: unknown[];
+  activeTabId: string | null;
+  groups?: PersistedEditorGroup[];
+  focusedGroupId?: string;
+  orientation?: "vertical" | "horizontal";
+  sizes?: number[];
 }
 
 export type OpenTabsRestoreFilter = "all" | "pinned";
@@ -129,6 +147,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.structureTableName !== undefined ? { structureTableName: tab.structureTableName } : {}),
     objectBrowser: tab.objectBrowser,
     objectSource: tab.objectSource,
+    ...(tab.sourceView ? { sourceView: true } : {}),
     tableMeta: tab.tableMeta,
     ...(tab.mongoEditTarget !== undefined ? { mongoEditTarget: tab.mongoEditTarget } : {}),
     ...(tab.mode !== "data" && tab.resultEvicted ? { resultEvicted: true } : {}),

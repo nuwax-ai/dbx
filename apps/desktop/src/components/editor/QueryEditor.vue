@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
-import { AlignLeft, Camera, CaseLower, CaseUpper, ClipboardPaste, Code2, Download, Eye, FileCode, MessageSquareText, Minimize2, Pencil, PencilRuler, Play, Copy, List, Scissors, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
+import { AlignLeft, Camera, CaseLower, CaseSensitive, CaseUpper, ClipboardPaste, Code2, Download, Eye, FileCode, MessageSquareText, Minimize2, Pencil, PencilRuler, Play, Copy, List, Scissors, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { Completion, CompletionContext } from "@codemirror/autocomplete";
 import { Transaction, StateEffect } from "@codemirror/state";
@@ -32,6 +32,7 @@ import { createSqlSignatureTooltipDom } from "@/lib/editor/sqlSignatureTooltip";
 import { buildSqlInConditionFromPasteSource, insertTextForSqlInCondition } from "@/lib/sql/sqlInListPaste";
 import { resolveSqlSingleQuoteKeyAction } from "@/lib/sql/sqlQuoteCaret";
 import { convertSqlSelectionCase, type SqlSelectionCaseMode } from "@/lib/sql/sqlSelectionCase";
+import { convertToNextNamingStyle } from "@/lib/naming/namingStyleConverter";
 import { formatMongoShellText } from "@/lib/mongo/mongoFormatter";
 import { detectAndFormatElasticsearchRequests } from "@/lib/elasticsearch/elasticsearchFormatter";
 import { useConnectionStore, COMPLETION_METADATA_CONCURRENCY } from "@/stores/connectionStore";
@@ -177,6 +178,8 @@ import type { CompletionAssistantObjectKind, ColumnInfo, DatabaseType, IndexInfo
 
 const props = defineProps<{
   modelValue: string;
+  /** Identity of the tab owning the document. Changing it swaps in that tab's cached editor state (fresh undo history on first visit). */
+  tabId?: string;
   connectionId?: string;
   catalog?: string;
   database?: string;
@@ -556,6 +559,8 @@ let codeMirrorCloseBracketsKeymap: readonly import("@codemirror/view").KeyBindin
 let readOnlyComp: import("@codemirror/state").Compartment | null = null;
 let runGutterComp: import("@codemirror/state").Compartment | null = null;
 let runKeymapComp: import("@codemirror/state").Compartment | null = null;
+let historyResetComp: import("@codemirror/state").Compartment | null = null;
+let codeMirrorHistory: typeof import("@codemirror/commands").history | null = null;
 let defaultKeymapComp: import("@codemirror/state").Compartment | null = null;
 let completionComp: import("@codemirror/state").Compartment | null = null;
 let diagnosticComp: import("@codemirror/state").Compartment | null = null;
@@ -1337,6 +1342,11 @@ function updateEditorSelectionDropCursor(currentView: EditorViewType, event: Mou
 }
 
 function startEditorSelectionDrag(currentView: EditorViewType, event: MouseEvent): boolean {
+  // Shift is CodeMirror's native extend-selection gesture. Keep it out of the
+  // custom selection drag path so a shift-click inside the current selection
+  // extends or shrinks the selection instead of collapsing it to the cursor.
+  if (event.shiftKey) return false;
+
   const selection = selectedRangeAtPointer(currentView, event);
   if (!selection) return false;
 
@@ -1578,6 +1588,35 @@ function convertSelectedSqlCase(mode: SqlSelectionCaseMode): boolean {
     return {
       changes: { from: range.from, to: range.to, insert: convertedText },
       range: EditorSelection.range(range.from, range.from + convertedText.length),
+    };
+  });
+
+  if (!transaction.changes.empty) {
+    currentView.dispatch({
+      ...transaction,
+      scrollIntoView: true,
+      userEvent: "input",
+    });
+    focusEditor();
+    return true;
+  }
+  return false;
+}
+
+function convertSelectedNamingStyle(): boolean {
+  const currentView = view.value;
+  const EditorSelection = codeMirrorEditorSelection;
+  if (!currentView || !EditorSelection) return false;
+
+  const state = currentView.state;
+  const transaction = state.changeByRange((range) => {
+    if (range.empty) return { range };
+
+    const selectedText = state.doc.sliceString(range.from, range.to);
+    const result = convertToNextNamingStyle(selectedText);
+    return {
+      changes: { from: range.from, to: range.to, insert: result.text },
+      range: EditorSelection.range(range.from, range.from + result.text.length),
     };
   });
 
@@ -1946,6 +1985,13 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
       shortcut: shortcuts.lowercaseSelection,
     },
     {
+      label: t("editor.contextMenu.convertNamingStyle"),
+      action: convertSelectedNamingStyle,
+      disabled: !canCopySelectedSql.value,
+      icon: CaseSensitive,
+      shortcut: shortcuts.convertNamingStyle,
+    },
+    {
       label: t("editor.contextMenu.delimitedList"),
       action: openDelimitedListDialog,
       disabled: props.readOnly || !canCopySelectedSql.value,
@@ -2131,6 +2177,7 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
         ...binding(shortcuts.selectAllSelectionOccurrences, selectAllQueryEditorSelectionOccurrences),
         ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.uppercaseSelection, () => convertSelectedSqlCase("upper")),
         ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.lowercaseSelection, () => convertSelectedSqlCase("lower")),
+        ...createQueryEditorSelectionCaseShortcutBindings(shortcuts.convertNamingStyle, () => convertSelectedNamingStyle()),
         ...binding(shortcuts.toggleLineComment, (view) => codeMirrorToggleLineComment?.(view) ?? false),
         ...binding(shortcuts.toggleBlockComment, (view) => {
           if (!supportsQueryEditorBlockComments(props.databaseType)) return false;
@@ -2167,6 +2214,10 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
 }
 
 function handleEnter(view: EditorViewType): boolean {
+  // While an IME composition is active, Enter confirms the composition (the
+  // candidate list); intercepting it here would accept a completion popup on
+  // top of the composition instead of committing the typed text (issue #8029).
+  if (isEditorComposing(view)) return false;
   clearPendingCompletionEnter();
   if (isBatchColumnSelectionCompletionActive(codeMirrorCompletionStatus?.(view.state) ?? null) && applySelectedBatchColumnSelection(view)) return true;
   // CodeMirror's default completion keymap is disabled so batch selection can
@@ -2181,6 +2232,7 @@ function handleEnter(view: EditorViewType): boolean {
       selectFirstCompletion: codeMirrorSelectFirstCompletion,
       retryDelayMs: COMPLETION_TAB_RETRY_DELAY_MS,
       maxWaitMs: COMPLETION_ENTER_MAX_WAIT_MS,
+      isComposing: () => isEditorComposing(view),
       onUnavailable: () => insertNewlineWithoutCompletion(view),
       onSettled: () => {
         if (cancelPendingCompletionEnter === cancelRetry) cancelPendingCompletionEnter = null;
@@ -2233,6 +2285,7 @@ function acceptCompletionOrNextSnippetField(view: EditorViewType): boolean {
   // Any non-empty selection range means Tab is being used for block indent,
   // not word completion. A completion popup can still appear as a side effect
   // of the indent edit itself, so it must never hijack this or a following Tab.
+  if (isEditorComposing(view)) return false;
   if (view.state.selection.ranges.every((range) => range.empty)) {
     const completionStatus = codeMirrorCompletionStatus?.(view.state) ?? null;
     if (isBatchColumnSelectionCompletionActive(completionStatus) && applySelectedBatchColumnSelection(view)) return true;
@@ -2256,6 +2309,10 @@ function waitForCompletionTab(view: EditorViewType): boolean {
 
   const retry = () => {
     pendingCompletionTabTimer = null;
+    // The user started an IME composition while waiting for the pending
+    // completion; Tab now belongs to the candidate list, so drop the queued
+    // acceptance (and the normal-Tab fallback) instead of fighting the IME.
+    if (isEditorComposing(view)) return;
     const selectionRanges = view.state.selection.ranges;
     if (view.state.doc !== initialDoc || selectionRanges.length !== initialSelectionRanges.length || selectionRanges.some((range, index) => !range.empty || range.anchor !== initialSelectionRanges[index]?.anchor || range.head !== initialSelectionRanges[index]?.head)) return;
 
@@ -2896,15 +2953,14 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
 
   try {
     let hoverTables = cachedTables.filter((table) => hoverTableMatchesScope(table, hoverScope));
-    if (hoverTables.length === 0) {
-      const loadedTables = usesLocalOnlyCompletionMetadata()
-        ? connectionStore.lookupLocalCompletionTables(props.connectionId, hoverScope.database, tableLookupName, MAX_COMPLETION_TABLES, hoverScope.schema, hoverScope.catalog)
-        : await connectionStore.listCompletionTables(props.connectionId, hoverScope.database, tableLookupName, MAX_COMPLETION_TABLES, hoverScope.schema, false, hoverScope.schema, hoverScope.catalog);
-      hoverTables = scopeHoverTables(loadedTables, hoverScope);
-      cachedTables = mergeCompletionTables(cachedTables, hoverTables);
-    }
-
     let table = matchTable(qualifiedTableLookup, hoverTables) ?? matchTable(tableLookupName, hoverTables) ?? matchTable(identifier, hoverTables) ?? matchTable(name, hoverTables);
+    if (!table) {
+      const localTables = connectionStore.lookupLocalCompletionTables(props.connectionId, hoverScope.database, tableLookupName, MAX_COMPLETION_TABLES, hoverScope.schema, hoverScope.catalog);
+      const localHoverTables = scopeHoverTables(localTables, hoverScope);
+      hoverTables = mergeCompletionTables(localHoverTables, hoverTables);
+      cachedTables = mergeCompletionTables(localHoverTables, cachedTables);
+      table = matchTable(qualifiedTableLookup, hoverTables) ?? matchTable(tableLookupName, hoverTables) ?? matchTable(identifier, hoverTables) ?? matchTable(name, hoverTables);
+    }
     if (!table && !usesLocalOnlyCompletionMetadata()) {
       const loadedTables = await connectionStore.listCompletionTables(props.connectionId, hoverScope.database, tableLookupName, MAX_COMPLETION_TABLES, hoverScope.schema, false, hoverScope.schema, hoverScope.catalog);
       const remoteHoverTables = scopeHoverTables(loadedTables, hoverScope);
@@ -5580,6 +5636,7 @@ onMounted(async () => {
   readOnlyComp = new Compartment();
   runGutterComp = new Compartment();
   runKeymapComp = new Compartment();
+  historyResetComp = new Compartment();
   defaultKeymapComp = new Compartment();
   completionComp = new Compartment();
   diagnosticComp = new Compartment();
@@ -5607,6 +5664,7 @@ onMounted(async () => {
   codeMirrorMoveLineDown = moveLineDown;
   codeMirrorUndo = undo;
   codeMirrorRedo = redo;
+  codeMirrorHistory = history;
   codeMirrorSelectAll = selectAll;
   codeMirrorInsertNewlineKeepIndent = insertNewlineKeepIndent;
   codeMirrorToggleLineComment = toggleLineComment;
@@ -5721,7 +5779,27 @@ onMounted(async () => {
       },
       provide: (field) => lineNumberMarkers.from(field),
     });
-    return field;
+
+    const highlightField = StateField.define({
+      create() {
+        return Decoration.none;
+      },
+      update(decorations, transaction) {
+        for (const effect of transaction.effects) {
+          if (effect.is(effectType)) {
+            const range = effect.value;
+            if (!range) return Decoration.none;
+            const from = Math.max(0, Math.min(range.from, transaction.state.doc.length));
+            const to = Math.max(from, Math.min(range.to, transaction.state.doc.length));
+            return from === to ? Decoration.none : Decoration.set([Decoration.mark({ class: "cm-db-result-source-highlight" }).range(from, to)]);
+          }
+        }
+        if (transaction.docChanged || transaction.selection) return Decoration.none;
+        return decorations;
+      },
+      provide: (field) => EditorView.decorations.from(field),
+    });
+    return [field, highlightField];
   };
 
   class StatementExecutionStateMarker extends GutterMarker {
@@ -6050,7 +6128,7 @@ onMounted(async () => {
       currentStatementFrameExtension,
       highlightActiveLineGutter(),
       highlightSpecialChars(),
-      history(),
+      historyResetComp.of(history()),
       foldGutter({
         markerDOM(open: boolean) {
           const span = document.createElement("span");
@@ -6585,18 +6663,83 @@ watch(
   },
 );
 
-watch(
-  () => props.modelValue,
-  (val) => {
-    if (view.value && val !== view.value.state.doc.toString()) {
-      if (isEditorComposing(view.value)) return;
-      view.value.dispatch({
-        changes: { from: 0, to: view.value.state.doc.length, insert: val },
-      });
-      scheduleSemanticDiagnostics();
+// A single editor instance serves every tab, so the document swap on tab
+// switches must not push "previous tab's content → new content" onto a shared
+// undo history (one undo in the new tab restored the old tab's text). Each
+// tab's editor state — including its undo history — is cached per tabId and
+// reinstalled with setState; first-seen tabs get the document swapped in with a
+// transaction excluded from history, and the history extension is dropped and
+// re-added in two separate transactions (a compartment reconfigure alone keeps
+// the old field value) so the previous tab's edits cannot leak in.
+const tabStateCache = new Map<string, import("@codemirror/state").EditorState>();
+const MAX_CACHED_TAB_STATES = 16;
+
+function swapEditorDocument(doc: string) {
+  const currentView = view.value;
+  if (!currentView || !historyResetComp || !codeMirrorHistory) return;
+  if (doc !== currentView.state.doc.toString()) {
+    currentView.dispatch({
+      changes: { from: 0, to: currentView.state.doc.length, insert: doc },
+      annotations: Transaction.addToHistory.of(false),
+    });
+  }
+  currentView.dispatch({ effects: historyResetComp.reconfigure([]) });
+  currentView.dispatch({ effects: historyResetComp.reconfigure(codeMirrorHistory()) });
+  scheduleSemanticDiagnostics();
+}
+
+function activateTabDocument(prevTabId: string | undefined, tabId: string | undefined, doc: string) {
+  const currentView = view.value;
+  if (!currentView) return;
+  if (prevTabId !== undefined) {
+    tabStateCache.set(prevTabId, currentView.state);
+    if (tabStateCache.size > MAX_CACHED_TAB_STATES) {
+      const oldest = tabStateCache.keys().next();
+      if (!oldest.done) tabStateCache.delete(oldest.value);
     }
-  },
-);
+  }
+  const cached = tabId === undefined ? undefined : tabStateCache.get(tabId);
+  if (!cached) {
+    swapEditorDocument(doc);
+    return;
+  }
+  // setState swaps doc, selection, undo history and all fields at once, but it
+  // is not a transaction, so update-listener side effects are re-run manually.
+  currentView.setState(cached);
+  // Compartments in the restored state may lag behind settings that changed
+  // while another tab was active; re-sync them from current values.
+  void applyEditorAppearance();
+  applyEditorShortcutKeymaps();
+  applyEditorIndentExtension();
+  applyEditorCompletionExtension();
+  if (doc !== currentView.state.doc.toString()) {
+    // Content changed while the tab was inactive (external file change, AI
+    // edit, another split group): apply it as a regular undoable edit.
+    currentView.dispatch({
+      changes: { from: 0, to: currentView.state.doc.length, insert: doc },
+    });
+  }
+  searchPanelRef.value?.scheduleDocumentSearchUpdate();
+  invalidateSemanticDiagnosticsForDocumentChange();
+  restoreEditorSelection();
+  restoreEditorViewport();
+  scheduleSemanticDiagnostics();
+}
+
+watch([() => props.tabId, () => props.modelValue], ([tabId, val], [prevTabId]) => {
+  if (!view.value) return;
+  if (tabId !== prevTabId) {
+    activateTabDocument(prevTabId, tabId, val);
+    return;
+  }
+  if (val !== view.value.state.doc.toString()) {
+    if (isEditorComposing(view.value)) return;
+    view.value.dispatch({
+      changes: { from: 0, to: view.value.state.doc.length, insert: val },
+    });
+    scheduleSemanticDiagnostics();
+  }
+});
 
 watch(
   () => props.formatRequestId,
@@ -6710,75 +6853,97 @@ function getCurrentCustomThemeColors() {
   return activeTheme?.colors ?? settings.customThemeColors;
 }
 
-// Reactively apply editor settings changes
+// Reactively apply editor settings changes. Also called after restoring a
+// cached per-tab state, whose compartments predate any settings changed while
+// another tab was active.
+async function applyEditorAppearance() {
+  const ss = queryEditorAppearanceSettings.value;
+  if (!view.value || !codeMirrorTheme || !fontThemeComp || !wordWrapComp || !lineNumbersComp || !vimModeComp || !closeBracketsComp || !runGutterComp || !runKeymapComp || !editorViewModule) {
+    return;
+  }
+  if (!isGestureZooming.value && !zoomCommitScheduler.hasPendingCommit() && liveFontSize.value !== ss.fontSize) {
+    liveFontSize.value = ss.fontSize;
+  }
+  syncEditorFontCssVars(liveFontSize.value, ss.fontFamily);
+  syncEditorDiagnosticCssVars();
+  const themeColors = getCurrentCustomThemeColors();
+  const [themeExt] = await Promise.all([loadEditorTheme(ss.theme, editorThemeAppearance(), themeColors, themePalette.value), ss.vimModeEnabled ? ensureCodeMirrorVim() : Promise.resolve(false)]);
+  if (!view.value || !codeMirrorTheme || !wordWrapComp || !lineNumbersComp || !vimModeComp || !closeBracketsComp || !runGutterComp || !runKeymapComp || !editorViewModule) {
+    return;
+  }
+  view.value.dispatch({
+    effects: [
+      codeMirrorTheme.reconfigure(themeExt),
+      wordWrapComp.reconfigure(props.forceWordWrap || ss.wordWrap ? editorViewModule.EditorView.lineWrapping : []),
+      lineNumbersComp.reconfigure(lineNumbersExtension(ss.showLineNumbers)),
+      vimModeComp.reconfigure(vimModeExtension(settingsStore.editorSettings.vimModeEnabled)),
+      closeBracketsComp.reconfigure(closeBracketsExtension(settingsStore.editorSettings.autoCloseBrackets)),
+      runGutterComp.reconfigure(runStatementGutterExtension()),
+      runKeymapComp.reconfigure(runKeymapExtension(editorViewModule.keymap)),
+    ],
+  });
+}
+
 watch(
   [queryEditorAppearanceSettings, () => isDark.value, () => themePalette.value, editorThemeAppearance],
-  async ([ss]) => {
-    if (!view.value || !codeMirrorTheme || !fontThemeComp || !wordWrapComp || !lineNumbersComp || !vimModeComp || !closeBracketsComp || !runGutterComp || !runKeymapComp || !editorViewModule) {
-      return;
-    }
-    if (!isGestureZooming.value && !zoomCommitScheduler.hasPendingCommit() && liveFontSize.value !== ss.fontSize) {
-      liveFontSize.value = ss.fontSize;
-    }
-    syncEditorFontCssVars(liveFontSize.value, ss.fontFamily);
-    syncEditorDiagnosticCssVars();
-    const themeColors = getCurrentCustomThemeColors();
-    const [themeExt] = await Promise.all([loadEditorTheme(ss.theme, editorThemeAppearance(), themeColors, themePalette.value), ss.vimModeEnabled ? ensureCodeMirrorVim() : Promise.resolve(false)]);
-    if (!view.value || !codeMirrorTheme || !wordWrapComp || !lineNumbersComp || !vimModeComp || !closeBracketsComp || !runGutterComp || !runKeymapComp || !editorViewModule) {
-      return;
-    }
-    view.value.dispatch({
-      effects: [
-        codeMirrorTheme.reconfigure(themeExt),
-        wordWrapComp.reconfigure(props.forceWordWrap || ss.wordWrap ? editorViewModule.EditorView.lineWrapping : []),
-        lineNumbersComp.reconfigure(lineNumbersExtension(ss.showLineNumbers)),
-        vimModeComp.reconfigure(vimModeExtension(settingsStore.editorSettings.vimModeEnabled)),
-        closeBracketsComp.reconfigure(closeBracketsExtension(settingsStore.editorSettings.autoCloseBrackets)),
-        runGutterComp.reconfigure(runStatementGutterExtension()),
-        runKeymapComp.reconfigure(runKeymapExtension(editorViewModule.keymap)),
-      ],
-    });
+  () => {
+    void applyEditorAppearance();
   },
   { deep: true },
 );
+
+// Re-sync shortcut-driven keymap compartments; shared with per-tab state restore.
+function applyEditorShortcutKeymaps() {
+  if (!view.value || !editorViewModule) return;
+  const effects = [];
+  if (defaultKeymapComp) {
+    effects.push(defaultKeymapComp.reconfigure(defaultKeymapExtension()));
+  }
+  if (runKeymapComp) {
+    effects.push(runKeymapComp.reconfigure(runKeymapExtension(editorViewModule.keymap)));
+  }
+  if (effects.length > 0) {
+    view.value.dispatch({ effects });
+  }
+}
 
 watch(
   () => [settingsStore.editorSettings.shortcuts, settingsStore.editorSettings.sqlShortcuts],
   () => {
-    if (!view.value || !editorViewModule) return;
-    const effects = [];
-    if (defaultKeymapComp) {
-      effects.push(defaultKeymapComp.reconfigure(defaultKeymapExtension()));
-    }
-    if (runKeymapComp) {
-      effects.push(runKeymapComp.reconfigure(runKeymapExtension(editorViewModule.keymap)));
-    }
-    if (effects.length > 0) {
-      view.value.dispatch({ effects });
-    }
+    applyEditorShortcutKeymaps();
   },
   { deep: true },
 );
 
+// Re-sync the indent compartment; shared with per-tab state restore.
+function applyEditorIndentExtension() {
+  if (!view.value || !indentComp) return;
+  view.value.dispatch({ effects: indentComp.reconfigure(indentExtension()) });
+}
+
 watch(
   () => [settingsStore.editorSettings.sqlFormatter.tabWidth, settingsStore.editorSettings.sqlFormatter.useTabs],
   () => {
-    if (!view.value || !indentComp) return;
-    view.value.dispatch({ effects: indentComp.reconfigure(indentExtension()) });
+    applyEditorIndentExtension();
   },
 );
+
+// Re-sync the completion compartment; shared with per-tab state restore.
+function applyEditorCompletionExtension() {
+  completionEpoch++;
+  if (!view.value || !completionComp || !buildSqlCompletionExtension) return;
+  view.value.dispatch({
+    effects: completionComp.reconfigure(buildSqlCompletionExtension()),
+  });
+  if (codeMirrorCompletionStatus?.(view.value.state) === "active") {
+    codeMirrorStartCompletion?.(view.value);
+  }
+}
 
 watch(
   () => [settingsStore.editorSettings.snippets, settingsStore.editorSettings.sortCompletionColumnsAlphabetically, settingsStore.editorSettings.selectFirstCompletionOnOpen],
   () => {
-    completionEpoch++;
-    if (!view.value || !completionComp || !buildSqlCompletionExtension) return;
-    view.value.dispatch({
-      effects: completionComp.reconfigure(buildSqlCompletionExtension()),
-    });
-    if (codeMirrorCompletionStatus?.(view.value.state) === "active") {
-      codeMirrorStartCompletion?.(view.value);
-    }
+    applyEditorCompletionExtension();
   },
   { deep: true },
 );
@@ -7078,6 +7243,10 @@ defineExpose({
 
 :deep(.cm-db-execution-preview) {
   background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35));
+}
+
+:deep(.cm-db-result-source-highlight) {
+  background: var(--dbx-editor-selection-background, rgba(126, 34, 206, 0.2));
 }
 
 :deep(.cm-lineNumbers .cm-db-result-source-line-number) {

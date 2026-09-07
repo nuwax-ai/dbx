@@ -552,6 +552,14 @@ export interface IndexInfo {
   comment?: string | null;
   /** Parallel to `columns`: true at index i means columns[i] is a raw expression, not a plain column name. */
   key_is_expression?: boolean[] | null;
+  /** Parallel to `columns`: operator class name for each key column (PostgreSQL), if non-default. */
+  column_opclasses?: (string | null)[] | null;
+  /**
+   * True when the index is the object behind a PRIMARY KEY / UNIQUE constraint rather than a
+   * standalone index. Carried back to the backend inside the index draft's `original` snapshot:
+   * Dameng only accepts `ALTER TABLE ... ADD/DROP CONSTRAINT` for those indexes.
+   */
+  constraint_backed?: boolean | null;
 }
 
 export interface ReferenceKeyInfo {
@@ -823,6 +831,7 @@ export interface QueryResultRun {
   resultEvicted?: boolean;
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
+  queryWriteTargets?: QueryTab["queryWriteTargets"];
   resultColumnComments?: QueryTab["resultColumnComments"];
   queryDisplaySourceColumns?: QueryTab["queryDisplaySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
@@ -1255,6 +1264,7 @@ export interface QueryTab {
     | "sqlserver-trace"
     | "mysql-dashboard"
     | "postgres-dashboard"
+    | "xugu-dashboard"
     | "dolt-version-control";
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
   hbaseCreateTableOnOpen?: boolean;
@@ -1283,8 +1293,11 @@ export interface QueryTab {
     /** 显式的"新建事件"请求：单调递增，用于让已复用 tab 也能重复进入 CREATE 编辑器 */
     eventCreateRequestId?: number;
     initialObjectFilter?: "tables" | "events";
+    searchQuery?: string;
     viewport?: ObjectBrowserViewport;
   };
+  /** Opened to view object source, including objects without editable source metadata. */
+  sourceView?: boolean;
   objectSource?: {
     schema?: string;
     name: string;
@@ -1358,6 +1371,7 @@ export interface QueryTab {
     }[];
   };
   querySourceColumns?: Array<string | undefined>;
+  queryWriteTargets?: Array<{ tableMeta: NonNullable<QueryTab["tableMeta"]>; sourceColumns: Array<string | undefined> }>;
   /**
    * Column comments for a multi-source query result (e.g. JOIN), indexed by
    * result-column ordinal (projection order). Each entry is the comment of the

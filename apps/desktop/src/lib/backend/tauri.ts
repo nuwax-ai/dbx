@@ -8,6 +8,8 @@ import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
 import type { XuguTablespaceInfo } from "@/types/database";
 import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
+import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
+import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 
 /** Normalize Tauri rejections once at the public backend boundary. */
 async function invokeBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -248,10 +250,18 @@ export interface McpGlobalPolicy {
   readOnly: boolean;
   allowDangerousSql: boolean;
   allowedConnectionIds: string[] | null;
+  allowedGroupIds: string[];
   allowedToolNames: string[] | null;
   connectionPolicies: McpConnectionPolicy[];
+  groupPolicies: McpGroupPolicy[];
   configured: boolean;
   queryTimeoutSecs: number | null;
+}
+
+export interface McpGroupPolicy {
+  groupId: string;
+  readOnly: boolean;
+  allowDangerousSql: boolean;
 }
 
 export interface McpConnectionPolicy {
@@ -719,10 +729,8 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
   return invoke("save_max_retries", { maxRetries });
 }
 
-export interface OpenTabsStatePayload {
-  tabs: unknown[];
-  activeTabId: string | null;
-}
+export type { OpenTabsStatePayload, PersistedEditorGroup } from "@/lib/app/openTabsPersistence";
+import type { OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 
 export async function loadEditorSettings(): Promise<unknown | null> {
   return invoke("load_editor_settings");
@@ -3141,6 +3149,7 @@ export interface EtcdAuthUserListResponse {
 export interface EtcdAuthUserDetail {
   user: string;
   roles: string[];
+  authEnabled?: boolean;
 }
 export interface EtcdAuthPermission {
   access: "read" | "write" | "readwrite";
@@ -4825,6 +4834,10 @@ export interface ExportProgress {
   error: string | null;
   /** True while listing schema / prefetching metadata before objects are written. */
   preparing?: boolean;
+  /** Per-object failures written into the file as `-- ERROR` comments (lenient mode). */
+  errorCount?: number;
+  /** First lenient failure, for completion warnings without opening the file. */
+  errorSummary?: string | null;
 }
 
 // --- Table Export ---
@@ -4839,6 +4852,8 @@ export interface TableExportRequest {
   tableName: string;
   filePath: string;
   format: "csv" | "xlsx" | "json" | "markdown" | "sql" | "txt";
+  insertMode?: SqlInsertMode;
+  csvQuoteMode?: CsvQuoteMode;
   columns?: string[];
   columnTypes?: Array<string | null | undefined>;
   columnComments?: Array<string | null> | null;
@@ -4862,6 +4877,7 @@ export interface TableCsvExportOptions {
   columns?: string[];
   pageSize?: number;
   timeoutSecs?: number;
+  csvQuoteMode?: CsvQuoteMode;
 }
 
 export interface TableExportProgress {
@@ -4886,6 +4902,8 @@ export interface QueryResultExportRequest {
   useAgentCursor: boolean;
   filePath: string;
   format: "csv" | "xlsx" | "txt" | "sql";
+  insertMode?: SqlInsertMode;
+  csvQuoteMode?: CsvQuoteMode;
   includeSqlSheet?: boolean;
   pageSize: number;
   rowLimit?: number | null;
@@ -5029,12 +5047,13 @@ export async function recordDatabaseExportDestination(directory: string): Promis
   await invoke("record_database_export_destination", { directory });
 }
 
-export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
+export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all"): Promise<void> {
   return invoke("export_query_result_csv", {
     request: {
       filePath,
       columns,
       rows,
+      csvQuoteMode,
     },
   });
 }
@@ -5052,6 +5071,7 @@ export async function exportQueryResultXlsx(
   rows: readonly (readonly XlsxCellValue[])[],
   numericColumnRightAlign?: boolean,
   autoFilter?: boolean,
+  dateTimeFormat?: string,
 ): Promise<void> {
   return invoke("export_query_result_xlsx", {
     request: {
@@ -5063,6 +5083,7 @@ export async function exportQueryResultXlsx(
       rows,
       numericColumnRightAlign,
       autoFilter,
+      dateTimeFormat,
     },
   });
 }
@@ -5079,12 +5100,14 @@ export async function exportQueryResultsXlsx(
     autoFilter?: boolean;
   }[],
   autoFilter?: boolean,
+  dateTimeFormat?: string,
 ): Promise<void> {
   return invoke("export_query_results_xlsx", {
     request: {
       filePath,
       worksheets,
       autoFilter,
+      dateTimeFormat,
     },
   });
 }
