@@ -7,7 +7,7 @@ import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/table
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
 import { elasticsearchCursorPageJumpRequestCount } from "@/lib/dataGrid/dataGridPagination";
-import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import * as api from "@/lib/backend/api";
 import type { QueryTab } from "@/types/database";
@@ -77,6 +77,26 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     return tab.resultPageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
   }
 
+  function reconcileOracleTableType(tab: QueryTab): void {
+    const config = connectionStore.getConfig(tab.connectionId);
+    const databaseType = effectiveDatabaseTypeForConnection(config);
+    if (databaseType !== "oracle" && databaseType !== "oceanbase-oracle") return;
+    const tableMeta = tab.tableMeta;
+    if (!tableMeta?.tableName) return;
+
+    const normalize = (value: string | undefined) => value?.trim().toLowerCase() ?? "";
+    const resolvedSchema = tableMeta.schema?.trim() || config?.default_schema?.trim();
+    const matches = connectionStore
+      .lookupLocalCompletionTables(tab.connectionId, tableMeta.database ?? tab.database, tableMeta.tableName, 20, resolvedSchema, tableMeta.catalog)
+      .filter((candidate) => normalize(candidate.name) === normalize(tableMeta.tableName) && normalize(candidate.schema) === normalize(resolvedSchema) && normalize(candidate.catalog) === normalize(tableMeta.catalog));
+    if (matches.length !== 1) return;
+
+    const objectType = matches[0]?.type;
+    const resolvedTableType = objectType === "view" ? "VIEW" : objectType === "materialized_view" ? "MATERIALIZED_VIEW" : objectType === "table" ? "TABLE" : undefined;
+    if (!resolvedTableType || tableMeta.tableType?.trim().toUpperCase() === resolvedTableType) return;
+    queryStore.setTableMeta(tab.id, { ...tableMeta, tableType: resolvedTableType });
+  }
+
   function resultSortPagination(tab: QueryTab): { limit: number; offset: number } | undefined {
     const limit = tab.resultPageLimit;
     return typeof limit === "number" && limit > 0 ? { limit, offset: 0 } : undefined;
@@ -87,7 +107,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     const effectiveDbType = effectiveDatabaseTypeForConnection(config);
     const tableMeta = tableMetaForDataTab(tab);
     const primaryKeys = tab.tableMeta ? tab.tableMeta.primaryKeys : (tableMeta?.primaryKeys ?? []);
-    const useRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, tableMeta?.tableType);
+    const useRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, tableMeta?.tableType);
     // 列投影只信任真实元数据列：tableMetaForDataTab 的 fallback 列来自查询
     // 结果（可能是失败结果的 ["Error"]），进入 SQL 会生成非法投影；
     // 真实列缺失时省略 columns 让 builder 生成 SELECT *
@@ -120,7 +140,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     const target = {
       tabId: tab.id,
       connectionId: tab.connectionId,
-      database: tab.database,
+      database: tableMeta.database ?? tab.database,
       catalog: tableMeta.catalog,
       schema: tableMeta.schema,
       tableName: tableMeta.tableName,
@@ -161,13 +181,15 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     }
     const current = queryStore.tabs.find((item) => item.id === target.tabId);
     const currentMeta = current ? tableMetaForDataTab(current) : undefined;
-    if (!current || current.mode !== "data" || current.connectionId !== target.connectionId || current.database !== target.database || currentMeta?.tableName !== target.tableName || (currentMeta.schema ?? "") !== (target.schema ?? "") || (currentMeta.catalog ?? "") !== (target.catalog ?? "")) {
+    const currentSourceDatabase = currentMeta?.database ?? current?.database;
+    if (!current || current.mode !== "data" || current.connectionId !== target.connectionId || currentSourceDatabase !== target.database || currentMeta?.tableName !== target.tableName || (currentMeta.schema ?? "") !== (target.schema ?? "") || (currentMeta.catalog ?? "") !== (target.catalog ?? "")) {
       console.info("[DBX][reloadData:metadata:stale-tab]", { traceId: trace?.traceId, elapsed: trace?.elapsed(), table: target.tableName });
       return false;
     }
     const primaryKeys = metadata.primaryKeys;
     queryStore.setTableMeta(target.tabId, {
       catalog: target.catalog,
+      database: target.database,
       schema: target.schema,
       tableName: target.tableName,
       tableType: target.tableType,
@@ -191,6 +213,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     const startedAt = performance.now();
     const elapsed = () => `${Math.round(performance.now() - startedAt)}ms`;
     if (tab.mode === "data" && tableMetaForDataTab(tab)) {
+      reconcileOracleTableType(tab);
       tab.whereInput = whereInput ?? "";
       queryStore.clearInvalidDataTabSort(tab.id);
       const realColumnNames = tab.tableMeta?.columns.map((column) => column.name) ?? [];
@@ -395,7 +418,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       // request per skipped page (page 1 -> 101 sends 100 requests);
       // retainDisplayedResult only hides those intermediate pages from the UI.
       const currentResultSessionId = tab.resultSessionId ?? tab.result?.session_id;
-      if (usesElasticsearchCursor && !appendResult && typeof expectedNextOffset === "number" && limit === tab.resultPageLimit && currentResultSessionId) {
+      if (usesElasticsearchCursor && tab.result?.has_more === true && !appendResult && typeof expectedNextOffset === "number" && limit === tab.resultPageLimit && currentResultSessionId) {
         let nextOffset = expectedNextOffset;
         let nextSessionId: string | undefined = currentResultSessionId;
         const currentPage = Math.floor(nextOffset / limit);

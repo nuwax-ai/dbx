@@ -7510,7 +7510,7 @@ test("query execution is scoped to the tab client session", async () => {
     await store.executeTabSql(tabId, "select 1");
 
     assert.equal(executeBody.clientSessionId, tabId);
-    assert.equal(executeBody.timeoutSecs, 30);
+    assert.equal(executeBody.timeoutSecs, 60);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -7563,15 +7563,19 @@ test("Spark query execution applies the selected database as schema context", as
   }
 });
 
-test("Kingbase query execution sends the selected schema context", async () => {
+test.each([
+  { label: "PostgreSQL", connection: conn("postgres-1"), connectionId: "postgres-1" },
+  { label: "GaussDB", connection: clearableQuerySchemaConn("gaussdb-1", "gaussdb"), connectionId: "gaussdb-1" },
+  { label: "Kingbase", connection: kingbaseConn("kingbase-1"), connectionId: "kingbase-1" },
+])("$label query execution sends the selected schema context", async ({ connection, connectionId }) => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
   const store = useQueryStore();
   const originalFetch = globalThis.fetch;
 
-  connectionStore.addEphemeralConnection(kingbaseConn("kingbase-1"));
-  const tabId = store.createTab("kingbase-1", "qinzhou", "Query", "query", "sdy_smartsite");
+  connectionStore.addEphemeralConnection(connection);
+  const tabId = store.createTab(connectionId, "qinzhou", "Query", "query", "sdy_smartsite");
   let executeBody: any;
 
   globalThis.fetch = withConnectionHealthMock(async (input, init) => {
@@ -7729,7 +7733,7 @@ test("data tab execution uses a tab-scoped client session", async () => {
     await store.executeTabSql(tabId, "select * from users");
 
     assert.equal(executeBody.clientSessionId, tabId);
-    assert.equal(executeBody.timeoutSecs, 30);
+    assert.equal(executeBody.timeoutSecs, 60);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();

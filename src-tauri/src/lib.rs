@@ -696,6 +696,7 @@ fn open_ai_config_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocaleFamily {
+    Azerbaijani,
     English,
     SimplifiedChinese,
     TraditionalChinese,
@@ -726,6 +727,8 @@ fn locale_family(locale: &str) -> LocaleFamily {
         LocaleFamily::Japanese
     } else if is_language("ko") {
         LocaleFamily::Korean
+    } else if is_language("az") {
+        LocaleFamily::Azerbaijani
     } else if is_language("es") {
         LocaleFamily::Spanish
     } else if is_language("tr") {
@@ -745,6 +748,7 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
         LocaleFamily::TraditionalChinese => ("顯示 DBX", "退出 DBX"),
         LocaleFamily::Japanese => ("DBXを表示", "DBXを終了"),
         LocaleFamily::Korean => ("DBX 표시", "DBX 종료"),
+        LocaleFamily::Azerbaijani => ("DBX-i göstər", "DBX-dən çıx"),
         LocaleFamily::Spanish => ("Mostrar DBX", "Salir de DBX"),
         LocaleFamily::Italian => ("Mostra DBX", "Esci da DBX"),
         LocaleFamily::Turkish => ("DBX'i Göster", "DBX'ten Çık"),
@@ -761,6 +765,7 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
         LocaleFamily::TraditionalChinese => "複製支援資訊",
         LocaleFamily::Japanese => "サポート情報をコピー",
         LocaleFamily::Korean => "지원 정보 복사",
+        LocaleFamily::Azerbaijani => "Dəstək məlumatlarını kopyala",
         LocaleFamily::Spanish => "Copiar información",
         LocaleFamily::Italian => "Copia informazioni",
         LocaleFamily::Turkish => "Destek bilgilerini kopyala",
@@ -775,6 +780,7 @@ fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
         LocaleFamily::SimplifiedChinese | LocaleFamily::TraditionalChinese => format!("退出 {app_name}"),
         LocaleFamily::Japanese => format!("{app_name}を終了"),
         LocaleFamily::Korean => format!("{app_name} 종료"),
+        LocaleFamily::Azerbaijani => format!("{app_name}-dən çıx"),
         LocaleFamily::Spanish => format!("Salir de {app_name}"),
         LocaleFamily::Italian => format!("Esci da {app_name}"),
         LocaleFamily::Turkish => format!("{app_name} Uygulamasından Çık"),
@@ -985,6 +991,7 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("zh-MO"), ("顯示 DBX", "退出 DBX"));
         assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("DBXを表示", "DBXを終了"));
         assert_eq!(tray_menu_labels_for_locale("ko-KR"), ("DBX 표시", "DBX 종료"));
+        assert_eq!(tray_menu_labels_for_locale("az-AZ"), ("DBX-i göstər", "DBX-dən çıx"));
         assert_eq!(tray_menu_labels_for_locale("es-ES"), ("Mostrar DBX", "Salir de DBX"));
         assert_eq!(tray_menu_labels_for_locale("it-IT"), ("Mostra DBX", "Esci da DBX"));
         assert_eq!(tray_menu_labels_for_locale("pt-BR"), ("Mostrar DBX", "Sair do DBX"));
@@ -1002,12 +1009,14 @@ mod tests {
         assert_eq!(app_menu_quit_label("ja-JP", "DBX"), "DBXを終了");
         assert_eq!(app_menu_quit_label("ko-KR", "DBX"), "DBX 종료");
         assert_eq!(app_menu_quit_label("tr-TR", "DBX"), "DBX Uygulamasından Çık");
+        assert_eq!(app_menu_quit_label("az-AZ", "DBX"), "DBX-dən çıx");
         assert_eq!(app_menu_quit_label("en-US", "DBX"), "Quit DBX");
         assert_eq!(app_menu_quit_label("", "DBX"), "Quit DBX");
         assert_eq!(app_menu_copy_support_info_label("zh-CN"), "复制支持信息");
         assert_eq!(app_menu_copy_support_info_label("zh-TW"), "複製支援資訊");
         assert_eq!(app_menu_copy_support_info_label("ko-KR"), "지원 정보 복사");
         assert_eq!(app_menu_copy_support_info_label("tr-TR"), "Destek bilgilerini kopyala");
+        assert_eq!(app_menu_copy_support_info_label("az-AZ"), "Dəstək məlumatlarını kopyala");
         assert_eq!(app_menu_copy_support_info_label("en-US"), "Copy Support Info");
     }
 
@@ -1736,6 +1745,10 @@ pub fn run() {
             commands::app_settings::save_pinned_tree_node_ids,
             commands::app_settings::load_mcp_global_policy,
             commands::app_settings::save_mcp_global_policy,
+            commands::background_image::save_background_image,
+            commands::background_image::clear_background_image,
+            commands::background_image::read_background_image,
+            commands::background_image::check_background_image,
             commands::mcp_http_server::load_mcp_http_server_settings,
             commands::mcp_http_server::save_mcp_http_server_settings,
             commands::mcp_http_server::mcp_http_server_status,
@@ -1754,6 +1767,7 @@ pub fn run() {
             commands::app_settings::load_transfer_task_library,
             commands::app_settings::save_transfer_task_library,
             commands::app_settings::load_native_debug_logs,
+            commands::diagnostics::get_process_memory_info,
             commands::support_info::get_app_support_info,
             commands::cloud_sync::webdav_sync_test,
             commands::cloud_sync::webdav_password_status,
@@ -2462,6 +2476,7 @@ pub fn run() {
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,
             commands::database_export::clear_database_export_cancellation,
+            commands::database_export::database_export_destination_needs_confirmation,
             commands::database_export::record_database_export_destination,
             commands::table_export::start_table_export,
             commands::table_export::cancel_table_export,

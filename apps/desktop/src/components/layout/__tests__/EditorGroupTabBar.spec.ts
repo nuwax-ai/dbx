@@ -28,7 +28,8 @@ describe("EditorGroupTabBar compatibility with AppTabBar", () => {
     expect(source).toContain("function cleanupTabDrag(event?: Event)");
     expect(source).toContain('window.addEventListener("pointercancel", cleanupTabDrag)');
     expect(source).toContain('window.addEventListener("blur", cleanupTabDrag)');
-    expect(source).toContain("onUnmounted(cleanupTabDrag)");
+    expect(source).toContain("onUnmounted(() => {");
+    expect(source).toContain("cleanupTabDrag();");
   });
 
   it("validates drag source and target groups before moving", () => {
@@ -37,5 +38,14 @@ describe("EditorGroupTabBar compatibility with AppTabBar", () => {
     expect(source).toContain("const sourceGroupExists = queryStore.groups.some((group) => group.id === payload.sourceGroupId)");
     expect(source).toContain("const targetGroupExists = queryStore.groups.some((group) => group.id === targetGroupId)");
     expect(source).toContain("if (!sourceGroupExists || !targetGroupExists) {");
+  });
+
+  it("keeps pinned tabs in a separate row for horizontal placements", () => {
+    expect(source).toContain('hasHorizontalFixedRows.value ? "horizontal-fixed-tabs" : ""');
+    expect(source).toContain("horizontal-fixed-tabs-scroll");
+    expect(source).toContain("const stripSections = computed(() =>");
+    expect(source).toContain('{ key: "regular", pinned: false, entries: regularStripEntries.value }');
+    expect(source).toContain('{ key: "fixed", pinned: true, entries: pinnedStripEntries.value }');
+    expect(source).toContain("!isVerticalLayout.value && props.tabs.some((tab) => tab.pinned)");
   });
 });

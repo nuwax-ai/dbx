@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   setTableMeta: vi.fn(),
   clearInvalidDataTabSort: vi.fn(),
   activeResultExecutionTarget: vi.fn(),
+  lookupLocalCompletionTables: vi.fn(),
   metadataGeneration: 0,
 }));
 
@@ -47,6 +48,7 @@ vi.mock("@/stores/connectionStore", () => ({
     getConfig: mocks.getConfig,
     ensureConnected: mocks.ensureConnected,
     metadataGenerationFor: () => mocks.metadataGeneration,
+    lookupLocalCompletionTables: mocks.lookupLocalCompletionTables,
   }),
 }));
 
@@ -145,6 +147,7 @@ describe("useDataGridActions", () => {
     mocks.buildSortedQuerySql.mockResolvedValue({ ok: true, sql: "SELECT sorted" });
     mocks.ensureConnected.mockResolvedValue(undefined);
     mocks.activeResultExecutionTarget.mockReturnValue(undefined);
+    mocks.lookupLocalCompletionTables.mockReturnValue([]);
     mocks.getColumns.mockResolvedValue([{ name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null }]);
     mocks.listIndexes.mockResolvedValue([]);
   });
@@ -165,6 +168,39 @@ describe("useDataGridActions", () => {
     );
     expect(mocks.executeTabSql).toHaveBeenCalledWith("tab-1", "SELECT * FROM public.users LIMIT 250 OFFSET 0", expect.objectContaining({ pagination: { limit: 250, offset: 0 } }));
     expect(mocks.executeTabSql.mock.calls[0]?.[2]).not.toHaveProperty("preserveTotalRowCountDuringExecution");
+  });
+
+  it("repairs a restored Oracle view type before building paginated SQL", async () => {
+    mocks.getConfig.mockReturnValue({ id: "oracle-1", db_type: "oracle", default_schema: "REPORTING" });
+    mocks.lookupLocalCompletionTables.mockReturnValue([{ name: "REPORT_ROWS", schema: "REPORTING", type: "view" }]);
+    mocks.buildTableSelectSql.mockResolvedValueOnce('SELECT "ID" FROM "REPORTING"."REPORT_ROWS"');
+    const tab = tableDataTab({
+      connectionId: "oracle-1",
+      database: "XEPDB1",
+      title: "REPORT_ROWS",
+      tableMeta: {
+        schema: "REPORTING",
+        tableName: "REPORT_ROWS",
+        tableType: "TABLE",
+        columns: [{ name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: false, extra: null }],
+        primaryKeys: ["__DBX_ROWID"],
+      },
+    });
+    mocks.tabs.push(tab);
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 100, "refresh");
+
+    expect(tab.tableMeta?.tableType).toBe("VIEW");
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tableName: "REPORT_ROWS",
+        tableType: "VIEW",
+        includeRowId: false,
+        limit: 100,
+        offset: 100,
+      }),
+    );
   });
 
   it("executes the WHERE apply SQL on the emitting tab (#8216)", async () => {
@@ -212,6 +248,34 @@ describe("useDataGridActions", () => {
     expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ whereInput: "status = 'active'", orderBy: '"name" DESC' }));
     expect(tab.whereInput).toBe("status = 'active'");
     expect(tab.orderByInput).toBe('"name" DESC');
+  });
+
+  it("preserves a restored data tab's source database when rebuilding stale metadata", async () => {
+    mocks.getConfig.mockReturnValue({ id: "dameng-1", db_type: "dameng" });
+    const tab = tableDataTab({
+      connectionId: "dameng-1",
+      database: "SERVICE_DB",
+      schema: "APP_OWNER",
+      title: "ORDERS",
+      sql: "SELECT * FROM APP_OWNER.ORDERS",
+      tableMetaUpdatedAt: undefined,
+      tableMeta: {
+        database: "APP_OWNER",
+        schema: "APP_OWNER",
+        tableName: "ORDERS",
+        tableType: "TABLE",
+        columns: [{ name: "ID", data_type: "INTEGER", is_nullable: false, column_default: null, is_primary_key: true, extra: null }],
+        primaryKeys: ["ID"],
+      },
+    });
+    mocks.tabs.push(tab);
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onReloadData(tab.id, undefined, undefined, "", "");
+
+    expect(mocks.getColumns).toHaveBeenCalledWith("dameng-1", "APP_OWNER", "APP_OWNER", "ORDERS", undefined);
+    expect(mocks.setTableMeta).toHaveBeenCalledWith("tab-1", expect.objectContaining({ database: "APP_OWNER", schema: "APP_OWNER", tableName: "ORDERS" }));
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ database: "APP_OWNER", schema: "APP_OWNER", tableName: "ORDERS" }));
   });
 
   it("still clears the stored filter when a mounted grid refreshes with an emptied WHERE input", async () => {
@@ -670,6 +734,48 @@ describe("useDataGridActions", () => {
     expect(mocks.executeTabSql.mock.calls.map((call) => call[2].retainDisplayedResult)).toEqual([true, true, undefined]);
     expect(tab.resultPageOffset).toBe(300);
     expect(tab.resultPageJumpProgress).toBeUndefined();
+  });
+
+  it("does not reuse an exhausted Elasticsearch cursor for a new page", async () => {
+    mocks.infiniteScroll = false;
+    mocks.getConfig.mockReturnValue({ id: "elasticsearch-1", db_type: "elasticsearch" });
+    const tab = reactive({
+      id: "tab-1",
+      connectionId: "elasticsearch-1",
+      database: "",
+      title: "Query",
+      sql: "SELECT * FROM `dbx-app-logs-v1` AS dalv",
+      resultBaseSql: "SELECT * FROM `dbx-app-logs-v1` AS dalv",
+      resultPageLimit: 100,
+      resultPageOffset: 0,
+      resultSessionId: "exhausted-cursor",
+      resultClientSessionId: "client-1",
+      result: {
+        columns: ["message"],
+        rows: [["page-1"]],
+        affected_rows: 1,
+        execution_time_ms: 1,
+        session_id: "exhausted-cursor",
+        has_more: false,
+      },
+      mode: "query",
+      isDirty: false,
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+    } as QueryTab);
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onPaginate(tab.id, 100, 100);
+
+    expect(mocks.executeTabSql).toHaveBeenCalledWith(
+      "tab-1",
+      tab.sql,
+      expect.objectContaining({
+        pagination: { offset: 100, limit: 100, sessionId: undefined },
+      }),
+    );
+    expect(mocks.executeTabSql.mock.calls[0]?.[2]).not.toHaveProperty("retainDisplayedResult");
   });
 
   it("uses the active multi-database result target for pagination", async () => {

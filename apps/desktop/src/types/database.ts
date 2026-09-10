@@ -126,6 +126,7 @@ export interface ConnectionConfig {
   redis_database_aliases?: Record<string, string>;
   /** Key-search templates for the Redis browser. Non-empty overrides global settings. */
   redis_key_templates?: string[];
+  redis_key_grouping?: import("@/lib/redis/redisKeyGrouping").RedisKeyGrouping;
   etcd_endpoints?: string;
   gbase_server?: string;
   informix_server?: string;
@@ -799,6 +800,13 @@ export interface QueryResultRun {
   pinned?: boolean;
   /** Distinguishes successive result payloads that reuse the same run slot. */
   resultGridRevision?: string;
+  /**
+   * Logical-result identity for the tab-switch view snapshot cache. Distinct
+   * from `resultGridRevision` (the grid remount key): this one changes on every
+   * dataset replacement, including in-place refresh, and is preserved across
+   * disk eviction/restore. See `dataGridViewStateCache.ts`.
+   */
+  resultViewGeneration?: string;
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
@@ -1104,6 +1112,8 @@ export interface TableStructureEditorDraft {
   triggersLoaded?: boolean;
   loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
   scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
+  /** Request id of the structureInitialTab the editor already applied; remounts must not replay a consumed initial tab over the restored draft. */
+  appliedInitialTabRequestId?: number;
   initialized: boolean;
 }
 
@@ -1197,6 +1207,8 @@ export interface QueryTab {
   activeResultIndex?: number;
   /** Distinguishes successive result payloads that reuse the current result slot. */
   resultGridRevision?: string;
+  /** Logical-result identity for the tab-switch view snapshot cache; see QueryResultRun. */
+  resultViewGeneration?: string;
   resultRuns?: QueryResultRun[];
   activeResultRunId?: string;
   resultAutoSave?: boolean;
@@ -1304,6 +1316,7 @@ export interface QueryTab {
     objectType: ObjectSourceKind;
     signature?: string;
   };
+  tableComment?: string | null;
   tableMeta?: {
     schema?: string;
     tableName: string;
@@ -1466,6 +1479,10 @@ export interface TransferTaskConfig {
   targetTableNameCase: TransferTableNameCase;
   quoteTargetColumnNames: boolean;
   batchSize: number;
+  /** Legacy-compatible rebuild flag; true takes precedence over the saved DML mode. */
+  dropTargetBeforeCreate?: boolean;
+  /** Legacy field only. Saved confirmation is always ignored and reset to false. */
+  dropTargetConfirmed?: boolean;
 }
 
 export interface TransferTask {

@@ -57,6 +57,17 @@ describe("connection database browser", () => {
     expect(supportsConnectionDatabaseBrowser("redis")).toBe(false);
     expect(supportsConnectionDatabaseBrowser("mongodb")).toBe(false);
   });
+
+  it("hides the browse-databases entry for message brokers", () => {
+    // Kafka/Pulsar/RocketMQ/RabbitMQ/NATS all share db_type "mq" and differ only by
+    // driver_profile, so one exclusion covers every broker. They keep the
+    // objectBrowser capability for the tenant/topic tree, but have no database
+    // namespace, so the connection-level browser tab rendered an empty
+    // "no databases found" state (issue #8515). MQTT never had the entry.
+    expect(supportsObjectBrowser("mq")).toBe(true);
+    expect(supportsConnectionDatabaseBrowser("mq")).toBe(false);
+    expect(supportsConnectionDatabaseBrowser("mqtt")).toBe(false);
+  });
 });
 
 describe("object browser tree nodes", () => {
@@ -97,6 +108,21 @@ describe("connection query actions", () => {
     expect(supportsConnectionQueryActions("consul")).toBe(false);
     expect(supportsConnectionQueryActions("hbase")).toBe(false);
     expect(supportsConnectionQueryActions("zookeeper")).toBe(false);
+  });
+
+  it("hides the sidebar new-query entry for message brokers", () => {
+    // Kafka/Pulsar/RocketMQ/RabbitMQ all share db_type "mq" and have no SQL
+    // engine: the sidebar entry opened a plain SQL editor against a broker
+    // (issue #8415). MQTT has the same console-only surface.
+    expect(supportsConnectionQueryActions("mq")).toBe(false);
+    expect(supportsConnectionQueryActions("mqtt")).toBe(false);
+  });
+});
+
+describe("message queue query capabilities", () => {
+  it("does not advertise query execution for broker surfaces", () => {
+    expect(supportsQueryExecution("mq")).toBe(false);
+    expect(supportsQueryExecution("mqtt")).toBe(false);
   });
 });
 

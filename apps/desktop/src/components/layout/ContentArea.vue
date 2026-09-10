@@ -939,7 +939,7 @@ function refreshQueryEditorCompletionCache(): boolean {
 
 function reloadUnavailableDataTab() {
   const { whereInput, orderBy } = restoredDataTabReloadFilters(props.activeTab);
-  emit("reload", props.activeTab.id, undefined, whereInput, orderBy);
+  emit("reload", props.activeTab.id, undefined, undefined, whereInput, orderBy);
 }
 
 function refreshData(): boolean {
@@ -1305,6 +1305,7 @@ defineExpose({
               @preview-changes-available="emit('previewChangesAvailable', activeTab.id, $event)"
               @viewport-change="emit('editorViewportChange', activeTab.id, $event)"
               @selection-state-change="emit('editorSelectionStateChange', activeTab.id, $event)"
+              @editor-state-flushed="emit('editorStateFlushed', activeTab.id)"
               @format-error="emit('formatError', activeTab.id)"
               @execute="emit('execute', activeTab.id, $event)"
               @execute-in-new-result-tab="emit('executeInNewResultTab', activeTab.id, $event)"
@@ -1841,6 +1842,7 @@ defineExpose({
                 :cache-key="activeResultGridCacheKey"
                 :column-width-cache-key="activeResultGridColumnWidthCacheKey"
                 :pending-state-key="activeResultGridInstanceKey"
+                :view-generation="activeTab.resultViewGeneration"
                 class="flex-1 min-h-0"
                 :result="activeTab.result"
                 :sort-column="activeTab.resultSortColumn"
@@ -2269,6 +2271,7 @@ defineExpose({
           class="flex-1 min-h-0"
           :key="activeTab.id"
           :cache-key="activeTab.id"
+          :view-generation="activeTab.resultViewGeneration"
           :result="activeTab.result"
           :sort-column="activeTab.resultSortColumn"
           :sort-column-index="activeTab.resultSortColumnIndex"

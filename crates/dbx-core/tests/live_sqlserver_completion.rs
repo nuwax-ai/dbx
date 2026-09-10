@@ -63,6 +63,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         redis_scan_page_size: None,
         redis_database_aliases: Default::default(),
         redis_key_templates: Vec::new(),
+        redis_key_grouping: None,
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
         informix_server: String::new(),
@@ -1379,6 +1380,8 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         target_catalog: None,
         tables: vec![source_table.clone()],
         create_table: true,
+        drop_target_before_create: false,
+        drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
         objects: Vec::new(),
         mode: dbx_core::transfer::TransferMode::Append,
@@ -1398,6 +1401,7 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         &target_pool_key,
         &std::collections::HashMap::new(),
         &mut Vec::new(),
+        None,
         |_| {},
     )
     .await;

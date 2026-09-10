@@ -118,6 +118,12 @@ pub struct DdlDialectProfile {
     pub drop_index_uses_on_table: bool,
     /// `DROP FOREIGN KEY` (MySQL) vs `DROP CONSTRAINT`.
     pub drop_fk_as_foreign_key: bool,
+    /// `DROP TABLE t CASCADE` is accepted. Oracle's `CASCADE CONSTRAINTS` is a
+    /// different clause and does not count.
+    pub drop_table_supports_cascade: bool,
+    /// `DROP TABLE IF EXISTS t` is valid grammar. False for Oracle (pre-23c),
+    /// Access, Firebird, Db2, Informix, SAP HANA and Teradata.
+    pub drop_table_supports_if_exists: bool,
     /// Index method placement.
     pub index_type_placement: IndexTypePlacement,
     /// `INCLUDE (cols)` on indexes.
@@ -165,6 +171,9 @@ pub struct DdlDialectProfile {
     pub rule_drop_template: Option<&'static str>,
     /// `ALTER {object_type} {name} OWNER TO {owner};`
     pub owner_alter_template: Option<&'static str>,
+    /// `DROP TABLE {table}{cascade};` — the caller quotes `{table}` itself. Engines
+    /// that drop a differently-named object override the whole shape.
+    pub drop_table_template: &'static str,
     /// Optional session lock-timeout preamble for generated scripts.
     pub lock_timeout_sql: Option<&'static str>,
     /// Data-driven base-type rewrites for this target (empty → rely on matrix / normalize only).
@@ -200,6 +209,14 @@ impl DdlDialectProfile {
         }
     }
 
+    pub fn alter_modify_keyword(&self) -> &'static str {
+        if self.database_type == DatabaseType::Dameng {
+            "MODIFY"
+        } else {
+            "MODIFY COLUMN"
+        }
+    }
+
     /// Replace `{key}` placeholders. Unknown keys are left unchanged.
     pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
         let mut out = template.to_string();
@@ -222,6 +239,9 @@ const SQLSERVER_SEQ_ALTER: &str =
     "ALTER SEQUENCE {name} RESTART WITH {start_value} INCREMENT BY {increment} MINVALUE {min_value} MAXVALUE {max_value} {cycle};";
 const RULE_DROP: &str = "DROP RULE IF EXISTS {rule_name} ON {table_name}{cascade};";
 const OWNER_ALTER: &str = "ALTER {object_type} {name} OWNER TO {owner};";
+/// Shared ANSI `DROP TABLE` shape. `{if_exists}` is deliberately absent: whether a
+/// dialect accepts `IF EXISTS` is a capability flag, not part of the rendered shape.
+const DROP_TABLE: &str = "DROP TABLE {table}{cascade};";
 
 // ---------------------------------------------------------------------------
 // Type maps (data only — no per-database logic at call sites)
@@ -325,6 +345,8 @@ fn mysql_family(db: DatabaseType) -> DdlDialectProfile {
         foreign_keys_inline_in_create: false,
         drop_index_uses_on_table: true,
         drop_fk_as_foreign_key: true,
+        drop_table_supports_cascade: false,
+        drop_table_supports_if_exists: true,
         index_type_placement: IndexTypePlacement::UsingBeforeOn,
         index_supports_include: false,
         index_supports_filter: false,
@@ -354,6 +376,7 @@ fn mysql_family(db: DatabaseType) -> DdlDialectProfile {
         sequence_drop_template: None,
         rule_drop_template: None,
         owner_alter_template: None,
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: Some("SET SESSION lock_wait_timeout = 3;"),
         type_map: &[],
     }
@@ -371,6 +394,8 @@ fn postgres_family(db: DatabaseType) -> DdlDialectProfile {
         foreign_keys_inline_in_create: false,
         drop_index_uses_on_table: false,
         drop_fk_as_foreign_key: false,
+        drop_table_supports_cascade: true,
+        drop_table_supports_if_exists: true,
         index_type_placement: IndexTypePlacement::UsingSuffix,
         index_supports_include: true,
         index_supports_filter: true,
@@ -400,6 +425,7 @@ fn postgres_family(db: DatabaseType) -> DdlDialectProfile {
         sequence_drop_template: Some(SEQ_DROP),
         rule_drop_template: Some(RULE_DROP),
         owner_alter_template: Some(OWNER_ALTER),
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: Some("SET lock_timeout = '3s';"),
         type_map: &[],
     }
@@ -420,6 +446,9 @@ fn oracle_family(db: DatabaseType) -> DdlDialectProfile {
         foreign_keys_inline_in_create: false,
         drop_index_uses_on_table: false,
         drop_fk_as_foreign_key: false,
+        // Oracle spells it `CASCADE CONSTRAINTS`, and `IF EXISTS` only landed in 23c.
+        drop_table_supports_cascade: false,
+        drop_table_supports_if_exists: false,
         index_type_placement: IndexTypePlacement::None,
         index_supports_include: false,
         index_supports_filter: false,
@@ -450,6 +479,7 @@ fn oracle_family(db: DatabaseType) -> DdlDialectProfile {
         sequence_drop_template: Some(SEQ_DROP),
         rule_drop_template: None,
         owner_alter_template: None,
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: Some("ALTER SESSION SET DDL_LOCK_TIMEOUT = 3;"),
         type_map: &[],
     }
@@ -467,6 +497,9 @@ fn sqlserver_family(db: DatabaseType) -> DdlDialectProfile {
         foreign_keys_inline_in_create: false,
         drop_index_uses_on_table: false,
         drop_fk_as_foreign_key: false,
+        drop_table_supports_cascade: false,
+        // `DROP TABLE IF EXISTS` is valid on SQL Server 2016+.
+        drop_table_supports_if_exists: true,
         index_type_placement: IndexTypePlacement::TypePrefix,
         index_supports_include: true,
         index_supports_filter: true,
@@ -496,6 +529,7 @@ fn sqlserver_family(db: DatabaseType) -> DdlDialectProfile {
         sequence_drop_template: Some(SEQ_DROP),
         rule_drop_template: None,
         owner_alter_template: None,
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: Some("SET LOCK_TIMEOUT 3000;"),
         type_map: &[],
     }
@@ -513,6 +547,8 @@ fn sqlite_family(db: DatabaseType) -> DdlDialectProfile {
         foreign_keys_inline_in_create: true,
         drop_index_uses_on_table: false,
         drop_fk_as_foreign_key: false,
+        drop_table_supports_cascade: false,
+        drop_table_supports_if_exists: true,
         index_type_placement: IndexTypePlacement::None,
         index_supports_include: false,
         index_supports_filter: true,
@@ -542,6 +578,7 @@ fn sqlite_family(db: DatabaseType) -> DdlDialectProfile {
         sequence_drop_template: None,
         rule_drop_template: None,
         owner_alter_template: None,
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: None,
         type_map: SQLITE_TYPE_MAP,
     }
@@ -559,6 +596,9 @@ fn access_profile() -> DdlDialectProfile {
         foreign_keys_inline_in_create: false,
         drop_index_uses_on_table: false,
         drop_fk_as_foreign_key: false,
+        // Jet SQL has neither CASCADE nor IF EXISTS on DROP TABLE.
+        drop_table_supports_cascade: false,
+        drop_table_supports_if_exists: false,
         index_type_placement: IndexTypePlacement::None,
         index_supports_include: false,
         index_supports_filter: false,
@@ -588,6 +628,7 @@ fn access_profile() -> DdlDialectProfile {
         sequence_drop_template: None,
         rule_drop_template: None,
         owner_alter_template: None,
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: None,
         type_map: ACCESS_TYPE_MAP,
     }
@@ -605,6 +646,10 @@ fn h2_profile() -> DdlDialectProfile {
         foreign_keys_inline_in_create: false,
         drop_index_uses_on_table: false,
         drop_fk_as_foreign_key: false,
+        // H2 accepts CASCADE, but it stays off to keep the cascade set aligned with
+        // the frontend preview list in `dbAdminSql.ts`.
+        drop_table_supports_cascade: false,
+        drop_table_supports_if_exists: true,
         index_type_placement: IndexTypePlacement::None,
         index_supports_include: false,
         index_supports_filter: false,
@@ -634,6 +679,7 @@ fn h2_profile() -> DdlDialectProfile {
         sequence_drop_template: None,
         rule_drop_template: None,
         owner_alter_template: None,
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: None,
         type_map: &[],
     }
@@ -656,6 +702,10 @@ fn conservative_ansi(db: DatabaseType) -> DdlDialectProfile {
         foreign_keys_inline_in_create: false,
         drop_index_uses_on_table: false,
         drop_fk_as_foreign_key: false,
+        drop_table_supports_cascade: false,
+        // Most engines in this bucket accept `IF EXISTS`; `profile_for` opts out the
+        // ones that do not.
+        drop_table_supports_if_exists: true,
         index_type_placement: IndexTypePlacement::None,
         index_supports_include: false,
         index_supports_filter: false,
@@ -685,6 +735,7 @@ fn conservative_ansi(db: DatabaseType) -> DdlDialectProfile {
         sequence_drop_template: None,
         rule_drop_template: None,
         owner_alter_template: None,
+        drop_table_template: DROP_TABLE,
         lock_timeout_sql: None,
         type_map: &[],
     }
@@ -698,6 +749,14 @@ fn clickhouse_profile() -> DdlDialectProfile {
     p
 }
 
+fn influxdb_profile() -> DdlDialectProfile {
+    let mut p = conservative_ansi(DatabaseType::InfluxDb);
+    // InfluxDB drops a measurement, not a table, and has no IF EXISTS form.
+    p.drop_table_template = "DROP MEASUREMENT {table};";
+    p.drop_table_supports_if_exists = false;
+    p
+}
+
 /// Resolve DDL profile for a concrete target database type.
 ///
 /// This is the **only** place that maps [`DatabaseType`] → profile data.
@@ -708,12 +767,29 @@ pub fn profile_for(db_type: DatabaseType) -> DdlDialectProfile {
         // MySQL family
         Mysql | Doris | StarRocks | Goldendb | Sundb | Databend | Gbase | ManticoreSearch => mysql_family(db_type),
 
+        Dameng => {
+            let mut profile = oracle_family(db_type);
+            profile.alter_uses_modify_column = true;
+            profile
+        }
+
         // PostgreSQL family
-        Postgres | Redshift | Gaussdb | Kingbase | Highgo | Vastbase | OpenGauss | Kwdb | Firebird | Vertica
-        | Exasol | Uxdb => postgres_family(db_type),
+        Postgres | Redshift | Gaussdb | Kingbase | Highgo | Vastbase | OpenGauss | Kwdb | Uxdb => {
+            postgres_family(db_type)
+        }
+
+        // PostgreSQL-shaped DDL, but not the PostgreSQL `DROP TABLE` grammar:
+        // Firebird has neither CASCADE nor IF EXISTS; Vertica and Exasol are kept off
+        // CASCADE so the set stays aligned with the frontend preview list.
+        Firebird | Vertica | Exasol => {
+            let mut profile = postgres_family(db_type);
+            profile.drop_table_supports_cascade = false;
+            profile.drop_table_supports_if_exists = db_type != Firebird;
+            profile
+        }
 
         // Oracle family
-        Oracle | Dameng | OceanbaseOracle | Yashandb | Xugu | Iris => oracle_family(db_type),
+        Oracle | OceanbaseOracle | Yashandb | Xugu | Iris => oracle_family(db_type),
 
         // SQL Server (not Access)
         SqlServer => sqlserver_family(db_type),
@@ -728,13 +804,23 @@ pub fn profile_for(db_type: DatabaseType) -> DdlDialectProfile {
 
         ClickHouse => clickhouse_profile(),
 
-        DuckDb | Questdb | SapHana | Teradata | Snowflake | Trino | PrestoSql | Hive | Kyuubi | Impala | Argo
-        | Spark | Db2 | Informix | Bigquery | Spanner | Kylin | Ignite | Ignite3 | Oscar | Tdengine | Iotdb
-        | Databricks | Jdbc => conservative_ansi(db_type),
+        // Engines whose DROP TABLE grammar has no `IF EXISTS`.
+        Db2 | Informix | SapHana | Teradata => {
+            let mut profile = conservative_ansi(db_type);
+            profile.drop_table_supports_if_exists = false;
+            profile
+        }
+
+        DuckDb | Questdb | Snowflake | Trino | PrestoSql | Hive | Kyuubi | Impala | Argo | Spark | Bigquery
+        | Spanner | Kylin | Ignite | Ignite3 | Oscar | Tdengine | Iotdb | Databricks | Jdbc => {
+            conservative_ansi(db_type)
+        }
+
+        InfluxDb => influxdb_profile(),
 
         // Non-tabular / not applicable for relational CREATE TABLE
         Redis | MongoDb | DynamoDb | Elasticsearch | Easysearch | Meilisearch | Qdrant | Milvus | Weaviate
-        | ChromaDb | Neo4j | Cassandra | Etcd | ZooKeeper | Nacos | Consul | InfluxDb | InfluxDb3 | VictoriaMetrics
+        | ChromaDb | Neo4j | Cassandra | Etcd | ZooKeeper | Nacos | Consul | InfluxDb3 | VictoriaMetrics
         | MessageQueue | Mqtt | Hbase => conservative_ansi(db_type),
     }
 }
@@ -809,5 +895,75 @@ mod tests {
             &[("name", "\"public\".\"f\""), ("cascade", " CASCADE")],
         );
         assert_eq!(rendered, "DROP FUNCTION IF EXISTS \"public\".\"f\" CASCADE;");
+    }
+
+    #[test]
+    fn drop_table_if_exists_support_matches_dialect_grammar() {
+        for db in [
+            DatabaseType::Mysql,
+            DatabaseType::Postgres,
+            DatabaseType::SqlServer,
+            DatabaseType::Sqlite,
+            DatabaseType::DuckDb,
+            DatabaseType::ClickHouse,
+            DatabaseType::H2,
+            DatabaseType::Snowflake,
+        ] {
+            assert!(profile_for(db).drop_table_supports_if_exists, "{db:?} does support DROP TABLE IF EXISTS");
+        }
+        // Oracle only gained `IF EXISTS` in 23c; the rest have no such grammar at all.
+        for db in [
+            DatabaseType::Oracle,
+            DatabaseType::Dameng,
+            DatabaseType::OceanbaseOracle,
+            DatabaseType::Access,
+            DatabaseType::Firebird,
+            DatabaseType::Db2,
+            DatabaseType::Informix,
+            DatabaseType::SapHana,
+            DatabaseType::Teradata,
+            DatabaseType::InfluxDb,
+        ] {
+            assert!(!profile_for(db).drop_table_supports_if_exists, "{db:?} does not support DROP TABLE IF EXISTS");
+        }
+    }
+
+    #[test]
+    fn drop_table_cascade_support_is_limited_to_the_postgres_grammar() {
+        for db in [
+            DatabaseType::Postgres,
+            DatabaseType::Redshift,
+            DatabaseType::Gaussdb,
+            DatabaseType::Kwdb,
+            DatabaseType::Kingbase,
+            DatabaseType::Highgo,
+            DatabaseType::Uxdb,
+            DatabaseType::Vastbase,
+            DatabaseType::OpenGauss,
+        ] {
+            assert!(profile_for(db).drop_table_supports_cascade, "{db:?} should keep DROP TABLE … CASCADE");
+        }
+        // Oracle's `CASCADE CONSTRAINTS` is a different clause; Firebird, Vertica and Exasol
+        // share the PostgreSQL profile but stay out of the cascade set so the backend matches
+        // the frontend preview list in `dbAdminSql.ts`.
+        for db in [
+            DatabaseType::Oracle,
+            DatabaseType::Firebird,
+            DatabaseType::Vertica,
+            DatabaseType::Exasol,
+            DatabaseType::Mysql,
+            DatabaseType::Sqlite,
+            DatabaseType::DuckDb,
+            DatabaseType::SqlServer,
+            DatabaseType::H2,
+        ] {
+            assert!(!profile_for(db).drop_table_supports_cascade, "{db:?} must not emit DROP TABLE … CASCADE");
+        }
+    }
+
+    #[test]
+    fn drop_table_template_carries_the_whole_statement_shape() {
+        assert_eq!(profile_for(DatabaseType::Postgres).drop_table_template, "DROP TABLE {table}{cascade};");
+        assert_eq!(profile_for(DatabaseType::InfluxDb).drop_table_template, "DROP MEASUREMENT {table};");
     }
 }
