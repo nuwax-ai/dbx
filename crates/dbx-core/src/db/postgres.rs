@@ -6638,7 +6638,16 @@ fn postgres_set_preserved_search_path_sql(
         configured.to_string()
     };
     let selected_schema = pg_quote_ident(schema);
-    let mut path = if baseline.first_resolved_schema.as_deref() == Some(schema) {
+    // The first resolved schema can come from "$user". Once that placeholder is
+    // removed for compatible servers, the selected schema must replace it unless
+    // the configured path also contains that schema explicitly.
+    let selected_schema_is_explicit = configured_elements
+        .iter()
+        .any(|element| !is_postgres_user_placeholder(element) && (*element == schema || *element == selected_schema));
+    let selected_schema_was_removed = drops_user_placeholder
+        && baseline.first_resolved_schema.as_deref() == Some(schema)
+        && !selected_schema_is_explicit;
+    let mut path = if baseline.first_resolved_schema.as_deref() == Some(schema) && !selected_schema_was_removed {
         configured
     } else if configured.is_empty() {
         selected_schema.clone()
@@ -6887,6 +6896,44 @@ pub async fn execute_query_with_max_rows(
             messages: Vec::new(),
         })
     }
+}
+
+/// Progress-aware variant of [`execute_query_with_max_rows`] for long transfers.
+///
+/// Row-returning queries run under an *inactivity* budget: the clock is reset
+/// every time PostgreSQL actually delivers a row, so a large table that keeps
+/// streaming is never cancelled merely for exceeding the timeout in total. Only
+/// a genuine stall (no row for the whole timeout) is reported as a timeout.
+/// Statements that return no rows have no incremental progress to report, so
+/// they keep the plain wall-clock path.
+pub(crate) async fn execute_query_with_max_rows_progress(
+    pool: &Pool,
+    sql: &str,
+    max_rows: Option<usize>,
+    progress_clock: Arc<StreamProgressClock>,
+    timeout: Option<Duration>,
+) -> Result<QueryResult, String> {
+    if !postgres_statement_returns_rows(sql) {
+        // DDL/DML expose no incremental progress, so keep the original wall-clock
+        // budget: a hung write must still be bounded by the configured timeout.
+        return crate::query::wait_for_query_opt(None, timeout, execute_query_with_max_rows(pool, sql, max_rows)).await;
+    }
+
+    let start = Instant::now();
+    let row_limit = query_result_row_limit(max_rows);
+    let timeout_error = format!("Query timed out after {} seconds", timeout.map_or(0, |timeout| timeout.as_secs()));
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let clock_for_select = progress_clock.clone();
+    await_stream_with_progress_timeout(
+        async move {
+            execute_select_query_with_progress(&client, sql, start, row_limit, Some(&clock_for_select), false).await
+        },
+        timeout,
+        progress_clock,
+        None,
+        timeout_error,
+    )
+    .await
 }
 
 pub async fn execute_query_with_max_rows_and_cancel(
@@ -9756,6 +9803,47 @@ mod tests {
     }
 
     #[test]
+    fn postgres_search_path_replaces_matching_user_placeholder_with_selected_schema() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "\"$user\", public".to_string(),
+            first_resolved_schema: Some("dbx_test".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"dbx_test\", public, pg_catalog"
+        );
+
+        let explicit_baseline = PostgresSearchPathBaseline {
+            configured: "dbx_test, \"$user\", public".to_string(),
+            first_resolved_schema: Some("dbx_test".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &explicit_baseline),
+            "SET search_path TO dbx_test, public, pg_catalog"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_GAUSSDB_URL, DBX_TEST_GAUSSDB_SCHEMA, and DBX_TEST_GAUSSDB_TABLE"]
+    async fn gaussdb_selected_schema_matching_user_is_applied() {
+        let url = std::env::var("DBX_TEST_GAUSSDB_URL").expect("DBX_TEST_GAUSSDB_URL");
+        let schema = std::env::var("DBX_TEST_GAUSSDB_SCHEMA").expect("DBX_TEST_GAUSSDB_SCHEMA");
+        let table = std::env::var("DBX_TEST_GAUSSDB_TABLE").expect("DBX_TEST_GAUSSDB_TABLE");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect gaussdb");
+
+        let current_schema =
+            execute_query_with_schema(&pool, &schema, "SELECT current_schema()").await.expect("query current schema");
+        assert_eq!(current_schema.rows[0][0].as_str(), Some(schema.as_str()));
+
+        execute_query_with_schema(&pool, &schema, &format!("SELECT 1 FROM {} LIMIT 1", pg_quote_ident(&table)))
+            .await
+            .expect("query unqualified table in selected schema");
+    }
+
+    #[test]
     fn postgres_search_path_user_placeholder_only_baseline_falls_back_to_selected_schema() {
         let baseline = PostgresSearchPathBaseline {
             configured: "\"$user\"".to_string(),
@@ -11384,6 +11472,42 @@ mod tests {
         .await;
 
         assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_LIVE_PG_TRANSFER_SOURCE_URL pointing at a disposable PostgreSQL"]
+    async fn live_postgres_progress_read_survives_a_total_duration_beyond_the_timeout() {
+        let Ok(url) = std::env::var("DBX_LIVE_PG_TRANSFER_SOURCE_URL") else {
+            return;
+        };
+        let pool = connect(&url, Duration::from_secs(5)).await.unwrap();
+
+        // 20 rows produced ~50 ms apart: the statement streams for ~1 s in total,
+        // well beyond the 200 ms budget, while never stalling that long between
+        // rows — the exact shape a progress-aware transfer read has to survive.
+        // Each row carries >8 KB so PostgreSQL flushes it immediately instead of
+        // buffering the whole (tiny) result set and sending it in one packet.
+        let sql = "SELECT pg_sleep(0.05) IS NULL AS slept, repeat('x', 20000) AS payload, n \
+                   FROM generate_series(1, 20) AS n";
+
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let result =
+            execute_query_with_max_rows_progress(&pool, sql, None, progress_clock, Some(Duration::from_millis(200)))
+                .await;
+        assert!(result.is_ok(), "progress-aware read must survive a total duration beyond the timeout: {result:?}");
+        assert_eq!(result.unwrap().rows.len(), 20);
+
+        // Contrast: the same statement under a plain, never-reset wall-clock budget
+        // must time out, proving this test actually exercises the difference.
+        let wall_clock = await_stream_with_progress_timeout(
+            execute_query_with_max_rows(&pool, sql, None),
+            Some(Duration::from_millis(200)),
+            Arc::new(StreamProgressClock::new()),
+            None,
+            "Query timed out after 0 seconds".to_string(),
+        )
+        .await;
+        assert!(wall_clock.is_err(), "the wall-clock path must still time out");
     }
 
     #[tokio::test]

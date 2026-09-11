@@ -2,7 +2,7 @@
 import { computed, markRaw, nextTick, ref, shallowRef, onMounted, onUnmounted, onActivated, onDeactivated, watch } from "vue";
 import type { CalendarDateTime } from "@internationalized/date";
 import { useI18n } from "vue-i18n";
-import { Search, RefreshCw, Loader2, ChevronRight, ChevronDown, FolderClosed, FolderOpen, Trash2, Plus, KeyRound, TerminalSquare, Asterisk, History, Radio, Clock, Copy } from "@lucide/vue";
+import { Search, RefreshCw, Loader2, ChevronRight, ChevronDown, FolderClosed, FolderOpen, Trash2, Plus, KeyRound, TerminalSquare, Asterisk, History, Radio, Clock, Copy, X } from "@lucide/vue";
 import { RecycleScroller } from "vue-virtual-scroller";
 import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
 import { Splitpanes, Pane } from "splitpanes";
@@ -60,6 +60,7 @@ import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle
 import { useToast } from "@/composables/useToast";
 import { redisFuzzySearchScanBudget, redisKeySearchPattern, redisGroupSubtreePattern } from "@/lib/redis/redisKeyPattern";
 import { filterRedisKeyTemplates, resolveRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
+import { forgetRedisKeySearchHistory, loadRedisKeySearchHistory, rememberRedisKeySearchHistory, type RedisKeySearchHistoryScope } from "@/lib/redis/redisKeySearchHistory";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redis/redisKeyPattern";
 import { chunkRedisKeyRaws, collectUniqueRedisKeys } from "@/lib/redis/redisKeyBatch";
 import { getRedisCreateKeyTypeHelp, redisCreateKeyTypeHelpOptionOnOpen, shouldActivateRedisCreateKeyTypeHelpOnFocus } from "@/lib/redis/redisCreateKeyTypeHelp";
@@ -69,6 +70,7 @@ import { shouldLoadMoreRedisKeys } from "@/lib/redis/redisKeyInfiniteScroll";
 import { formatTtl } from "@/lib/common/ttlFormat";
 import { computeTtlCountdownValue } from "@/lib/redis/redisAutoRefresh";
 import { createRedisKeyViewYield } from "@/lib/redis/redisKeyViewScheduler";
+import { restoreRedisKeyBrowserState, saveRedisKeyBrowserState } from "@/lib/tabs/redisKeyBrowserStateCache";
 
 const { t, locale } = useI18n();
 const { toast } = useToast();
@@ -121,8 +123,14 @@ const props = defineProps<{
   connectionId: string;
   db: number;
   blockDangerousRedisCommands: boolean;
+  /** Tab id; search conditions are cached per tab and restored on remount. */
+  stateKey?: string;
 }>();
 
+// This component is keyed by tab in ContentArea and unmounted on every tab
+// switch; without restoring from the per-tab cache, coming back to the tab
+// would silently drop the user's search pattern / mode / local filters.
+const restoredRedisKeyBrowserState = props.stateKey ? restoreRedisKeyBrowserState(props.stateKey) : undefined;
 const redisExpiryTransport = {
   setTtl: api.redisSetTtl,
   setExpireAt: api.redisSetExpireAt,
@@ -145,12 +153,16 @@ let redisKeyScrollRevision = 0;
 let latestRedisKeyScrollAnchor: RedisKeyViewportAnchor | null = null;
 const valueViewerRef = ref<{ focusSearch: () => boolean } | null>(null);
 const commandTerminalRef = ref<HTMLElement>();
-const searchPattern = ref("");
-const searchMode = ref<RedisSearchMode>("key");
-const fuzzyKeySearch = ref(false);
+const searchPattern = ref(restoredRedisKeyBrowserState?.searchPattern ?? "");
+const searchMode = ref<RedisSearchMode>(restoredRedisKeyBrowserState?.searchMode ?? "key");
+const fuzzyKeySearch = ref(restoredRedisKeyBrowserState?.fuzzyKeySearch ?? false);
 const keyTemplateMenuOpen = ref(false);
 const keyTemplateSelectedIndex = ref(0);
 const keyTemplateListboxId = `redis-key-template-suggestions-${uuid()}`;
+const searchHistoryMenuOpen = ref(false);
+const searchHistoryItems = ref<string[]>([]);
+const searchHistorySelectedIndex = ref(-1);
+const searchHistoryListboxId = `redis-key-search-history-${uuid()}`;
 let keyTemplateBlurTimer: ReturnType<typeof setTimeout> | null = null;
 const selectedKeyRaw = ref<string | null>(null);
 const hasMore = ref(false);
@@ -291,8 +303,22 @@ const searchPlaceholder = computed(() => {
 });
 const redisKeyTemplates = computed(() => resolveRedisKeyTemplates(connectionStore.getConfig(props.connectionId)?.redis_key_templates, settingsStore.editorSettings.redisKeyTemplates ?? []));
 const keyTemplateSuggestions = computed(() => (searchMode.value === "key" ? filterRedisKeyTemplates(redisKeyTemplates.value, searchPattern.value) : []));
-const keyTemplateMenuVisible = computed(() => keyTemplateMenuOpen.value && searchMode.value === "key" && keyTemplateSuggestions.value.length > 0);
+const keyTemplateMenuVisible = computed(() => keyTemplateMenuOpen.value && !searchHistoryMenuOpen.value && searchMode.value === "key" && keyTemplateSuggestions.value.length > 0);
 const keyTemplateActiveDescendant = computed(() => (keyTemplateMenuVisible.value ? `${keyTemplateListboxId}-option-${keyTemplateSelectedIndex.value}` : undefined));
+const searchHistoryScope = computed<RedisKeySearchHistoryScope>(() => ({
+  connectionId: props.connectionId,
+  db: props.db,
+}));
+const searchHistoryMenuVisible = computed(() => searchHistoryMenuOpen.value);
+const searchHistoryEmptyText = computed(() => t("redis.keySearchHistoryEmpty"));
+const searchHistoryActiveDescendant = computed(() => (searchHistoryMenuVisible.value && searchHistorySelectedIndex.value >= 0 ? `${searchHistoryListboxId}-option-${searchHistorySelectedIndex.value}` : undefined));
+const searchComboboxExpanded = computed(() => keyTemplateMenuVisible.value || searchHistoryMenuVisible.value);
+const searchComboboxControls = computed(() => {
+  if (searchHistoryMenuVisible.value) return searchHistoryListboxId;
+  if (keyTemplateMenuVisible.value) return keyTemplateListboxId;
+  return undefined;
+});
+const searchComboboxActiveDescendant = computed(() => searchHistoryActiveDescendant.value ?? keyTemplateActiveDescendant.value);
 const loadingEmptyText = computed(() => (isValueSearchMode.value && valueQuery.value ? t(searchMode.value === "all" ? "redis.searchingAll" : "redis.searchingValues") : t("redis.loadingKeys")));
 const redisKeySeparator = computed(() => connectionStore.getConfig(props.connectionId)?.redis_key_separator ?? ":");
 const redisScanPageSize = computed(() => connectionStore.getConfig(props.connectionId)?.redis_scan_page_size ?? REDIS_SCAN_PAGE_SIZE_DEFAULT);
@@ -312,7 +338,19 @@ watch(redisKeySeparator, () => {
 const lastTotalKeys = ref(0);
 // “仅看无过期”过滤开关：开启后只保留 TTL 为 -1（永不过期）的已加载 key。
 // TTL 为 -2 的行（fetch-all 链路未查询 TTL）不会出现在过滤结果里。
-const noExpiryOnly = ref(false);
+const noExpiryOnly = ref(restoredRedisKeyBrowserState?.noExpiryOnly ?? false);
+
+function persistRedisKeyBrowserState() {
+  if (!props.stateKey) return;
+  saveRedisKeyBrowserState(props.stateKey, {
+    searchPattern: searchPattern.value,
+    searchMode: searchMode.value,
+    fuzzyKeySearch: fuzzyKeySearch.value,
+    noExpiryOnly: noExpiryOnly.value,
+  });
+}
+
+watch([searchPattern, searchMode, fuzzyKeySearch, noExpiryOnly], persistRedisKeyBrowserState);
 const fetchAllFilteredKeyCount = ref<number | null>(null);
 // 过滤后的平铺 key 列表：未开启过滤时与 flatKeys 完全一致，避免额外开销
 const filteredFlatKeys = computed(() => {
@@ -971,6 +1009,7 @@ async function loadKeys() {
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = null;
   searchPending.value = false;
+  rememberRedisKeySearchHistory(searchHistoryScope.value, searchPattern.value);
   const requestId = invalidateScanRequests();
   isFetchingAll.value = false;
   fetchAllStopRequested.value = false;
@@ -2243,11 +2282,77 @@ function dismissKeyTemplateMenu() {
   }
 }
 
+function dismissSearchHistoryMenu() {
+  searchHistoryMenuOpen.value = false;
+  searchHistoryItems.value = [];
+  searchHistorySelectedIndex.value = -1;
+}
+
+function refreshSearchHistoryItems() {
+  // ChevronDown shows the full connection+db history so earlier patterns stay
+  // visible after the user switches to another search (or key/value mode).
+  searchHistoryItems.value = loadRedisKeySearchHistory(searchHistoryScope.value);
+  if (searchHistorySelectedIndex.value >= searchHistoryItems.value.length) {
+    searchHistorySelectedIndex.value = searchHistoryItems.value.length > 0 ? searchHistoryItems.value.length - 1 : -1;
+  }
+}
+
+function openSearchHistoryMenu() {
+  dismissKeyTemplateMenu();
+  refreshSearchHistoryItems();
+  searchHistoryMenuOpen.value = true;
+  searchHistorySelectedIndex.value = -1;
+}
+
+function toggleSearchHistoryMenu() {
+  if (searchHistoryMenuOpen.value) {
+    dismissSearchHistoryMenu();
+    return;
+  }
+  openSearchHistoryMenu();
+}
+
+function selectSearchHistory(index: number) {
+  const entry = searchHistoryItems.value[index];
+  if (!entry) return;
+  if (searchTimer) {
+    clearTimeout(searchTimer);
+    searchTimer = null;
+  }
+  searchPending.value = false;
+  searchPattern.value = entry;
+  dismissSearchHistoryMenu();
+  dismissKeyTemplateMenu();
+  void nextTick(() => getSearchInput()?.focus());
+}
+
+function forgetSearchHistory(value: string) {
+  forgetRedisKeySearchHistory(searchHistoryScope.value, value);
+  refreshSearchHistoryItems();
+  searchHistoryMenuOpen.value = true;
+  void nextTick(() => getSearchInput()?.focus());
+}
+
+function moveSearchHistorySelection(direction: number): boolean {
+  if (!searchHistoryMenuVisible.value || searchHistoryItems.value.length === 0) return false;
+  const count = searchHistoryItems.value.length;
+  if (searchHistorySelectedIndex.value < 0) {
+    searchHistorySelectedIndex.value = direction > 0 ? 0 : count - 1;
+  } else {
+    searchHistorySelectedIndex.value = Math.min(Math.max(searchHistorySelectedIndex.value + direction, 0), count - 1);
+  }
+  void nextTick(() => {
+    document.getElementById(`${searchHistoryListboxId}-option-${searchHistorySelectedIndex.value}`)?.scrollIntoView({ block: "nearest" });
+  });
+  return true;
+}
+
 function openKeyTemplateMenu() {
   if (searchMode.value !== "key" || redisKeyTemplates.value.length === 0) {
     dismissKeyTemplateMenu();
     return;
   }
+  dismissSearchHistoryMenu();
   keyTemplateMenuOpen.value = true;
   keyTemplateSelectedIndex.value = 0;
 }
@@ -2289,11 +2394,13 @@ function onSearchBlur() {
   if (keyTemplateBlurTimer) clearTimeout(keyTemplateBlurTimer);
   keyTemplateBlurTimer = setTimeout(() => {
     dismissKeyTemplateMenu();
+    dismissSearchHistoryMenu();
     keyTemplateBlurTimer = null;
   }, 150);
 }
 
 function onSearchInput() {
+  dismissSearchHistoryMenu();
   if (searchMode.value === "key" && redisKeyTemplates.value.length > 0) {
     keyTemplateMenuOpen.value = true;
     keyTemplateSelectedIndex.value = 0;
@@ -2338,6 +2445,7 @@ function onSearchInput() {
 function setSearchMode(mode: RedisSearchMode) {
   if (searchMode.value === mode) return;
   searchMode.value = mode;
+  dismissSearchHistoryMenu();
   if (mode !== "key") dismissKeyTemplateMenu();
   void loadKeys();
 }
@@ -2525,6 +2633,35 @@ function focusSearch(): boolean {
 }
 
 function onSearchKeydown(event: KeyboardEvent) {
+  if (event.isComposing) return;
+
+  if (searchHistoryMenuVisible.value) {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveSearchHistorySelection(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveSearchHistorySelection(-1);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (searchHistorySelectedIndex.value >= 0) {
+        selectSearchHistory(searchHistorySelectedIndex.value);
+      } else {
+        dismissSearchHistoryMenu();
+        void loadKeys();
+      }
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      dismissSearchHistoryMenu();
+      return;
+    }
+  }
   if (keyTemplateMenuVisible.value) {
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -2555,6 +2692,7 @@ function onSearchKeydown(event: KeyboardEvent) {
   event.preventDefault();
   searchPattern.value = "";
   dismissKeyTemplateMenu();
+  dismissSearchHistoryMenu();
   void loadKeys();
 }
 
@@ -2911,7 +3049,7 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
                   <Loader2 v-if="loading" class="h-3 w-3 animate-spin" />
                   <RefreshCw v-else class="h-3 w-3" />
                 </Button>
-                <Button variant="ghost" size="icon" class="h-6 w-6 shrink-0" :title="t('redis.createKey')" @click="openCreateKeyDialog">
+                <Button variant="ghost" size="icon" class="h-6 w-6 shrink-0" :title="t('redis.createKey')" @click="openCreateKeyDialog()">
                   <Plus class="h-3 w-3" />
                 </Button>
               </div>
@@ -2923,17 +3061,56 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
                   v-model="searchPattern"
                   data-redis-search-input
                   role="combobox"
-                  class="h-8 border-border/70 bg-background pl-8 pr-3 text-xs shadow-sm caret-primary placeholder:text-muted-foreground/80 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-primary/20"
+                  class="h-8 border-border/70 bg-background pl-8 pr-8 text-xs shadow-sm caret-primary placeholder:text-muted-foreground/80 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-primary/20"
                   :placeholder="searchPlaceholder"
-                  :aria-expanded="keyTemplateMenuVisible"
-                  :aria-controls="keyTemplateMenuVisible ? keyTemplateListboxId : undefined"
-                  :aria-activedescendant="keyTemplateActiveDescendant"
+                  :aria-expanded="searchComboboxExpanded"
+                  :aria-controls="searchComboboxControls"
+                  :aria-activedescendant="searchComboboxActiveDescendant"
                   autocomplete="off"
                   @input="onSearchInput"
                   @keydown="onSearchKeydown"
                   @focus="onSearchFocus"
                   @blur="onSearchBlur"
                 />
+                <button
+                  type="button"
+                  data-redis-search-history-toggle
+                  class="absolute right-1.5 top-1/2 z-[1] -translate-y-1/2 rounded-sm p-0.5 text-muted-foreground hover:text-foreground"
+                  :title="t('redis.keySearchHistory')"
+                  :aria-label="t('redis.keySearchHistory')"
+                  :aria-expanded="searchHistoryMenuVisible"
+                  :aria-controls="searchHistoryMenuVisible ? searchHistoryListboxId : undefined"
+                  @mousedown.prevent
+                  @click="toggleSearchHistoryMenu"
+                >
+                  <ChevronDown class="h-3 w-3" />
+                </button>
+                <div
+                  v-if="searchHistoryMenuVisible"
+                  :id="searchHistoryListboxId"
+                  role="listbox"
+                  data-redis-search-history-list
+                  :aria-label="t('redis.keySearchHistory')"
+                  class="absolute left-0 right-0 top-[calc(100%+0.25rem)] z-30 max-h-60 overflow-y-auto rounded-md border bg-popover py-1 text-popover-foreground shadow-md"
+                >
+                  <div
+                    v-for="(entry, index) in searchHistoryItems"
+                    :id="`${searchHistoryListboxId}-option-${index}`"
+                    :key="entry"
+                    role="option"
+                    data-redis-search-history-item
+                    class="dbx-editor-font-family flex w-full cursor-pointer items-center px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+                    :class="searchHistorySelectedIndex === index ? 'bg-accent text-accent-foreground' : ''"
+                    :aria-selected="searchHistorySelectedIndex === index"
+                    @mousedown.prevent="selectSearchHistory(index)"
+                  >
+                    <span class="min-w-0 flex-1 truncate" :title="entry">{{ entry }}</span>
+                    <button type="button" data-redis-search-history-forget class="ml-2 shrink-0 text-muted-foreground hover:text-foreground" :aria-label="t('redis.keySearchHistoryForget')" @mousedown.stop.prevent="forgetSearchHistory(entry)">
+                      <X class="h-3 w-3" />
+                    </button>
+                  </div>
+                  <div v-if="searchHistoryItems.length === 0" class="px-3 py-2 text-xs text-muted-foreground">{{ searchHistoryEmptyText }}</div>
+                </div>
                 <div v-if="keyTemplateMenuVisible" :id="keyTemplateListboxId" role="listbox" :aria-label="t('redis.keyTemplateSuggestions')" class="absolute left-0 right-0 top-[calc(100%+0.25rem)] z-30 max-h-60 overflow-y-auto rounded-md border bg-popover py-1 text-popover-foreground shadow-md">
                   <button
                     v-for="(template, index) in keyTemplateSuggestions"
@@ -2956,7 +3133,7 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
                   variant="ghost"
                   size="sm"
                   class="h-8 max-w-full shrink-0 whitespace-nowrap px-2 text-xs"
-                  :class="fuzzyKeySearch ? 'bg-accent text-accent-foreground' : 'border border-dashed border-border/70 text-muted-foreground hover:text-foreground'"
+                  :class="fuzzyKeySearch ? 'bg-foreground/10 text-foreground hover:bg-foreground/15 hover:text-foreground dark:bg-foreground/20 dark:hover:bg-foreground/25' : 'border border-border text-muted-foreground hover:bg-accent hover:text-foreground'"
                   :title="t('redis.fuzzyMatchTitle')"
                   :aria-pressed="fuzzyKeySearch"
                   @click="toggleFuzzyKeySearch"
@@ -2969,7 +3146,7 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
                   variant="ghost"
                   size="sm"
                   class="h-8 shrink-0 whitespace-nowrap px-2 text-xs"
-                  :class="noExpiryOnly ? 'bg-accent text-accent-foreground' : 'border border-dashed border-border/70 text-muted-foreground hover:text-foreground'"
+                  :class="noExpiryOnly ? 'bg-foreground/10 text-foreground hover:bg-foreground/15 hover:text-foreground dark:bg-foreground/20 dark:hover:bg-foreground/25' : 'border border-border text-muted-foreground hover:bg-accent hover:text-foreground'"
                   :title="t('redis.noExpiryOnlyTitle')"
                   :aria-pressed="noExpiryOnly"
                   :disabled="isFetchingAll"

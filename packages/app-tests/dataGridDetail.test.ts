@@ -45,9 +45,11 @@ test("buildDataGridCellDetail preserves full value metadata", () => {
     rawValuePreview: '{"ok":true,"items":[1,2]}',
     displayValue: 'formatted:{"ok":tr',
     displayValuePreview: 'formatted:{"ok":tr',
+    isSourceTruncated: false,
     isValuePreviewTruncated: false,
     imagePreviewUrl: null,
     length: 25,
+    isNull: false,
     formattedJson: '{\n  "ok": true,\n  "items": [\n    1,\n    2\n  ]\n}',
     isEditable: true,
   });

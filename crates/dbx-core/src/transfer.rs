@@ -18,7 +18,7 @@ use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::object_source_sql::{build_executable_object_source_statements, EditableObjectSourceSqlInput};
 use crate::query::{
     agent_execute_query_params, is_dbx_query_timeout_error, pool_error_action, query_timeout_duration,
-    wait_for_query_opt, PoolErrorAction, QueryExecutionOptions, AGENT_PROTOCOL_MAX_ROWS,
+    wait_for_query_opt, PoolErrorAction, QueryExecutionOptions, StreamProgressClock, AGENT_PROTOCOL_MAX_ROWS,
 };
 use crate::sql::{split_sql_statements, split_sql_statements_for_database};
 use crate::sql_dialect::{
@@ -1341,7 +1341,12 @@ fn is_postgres_compat_transfer(source_db: &DatabaseType, target_db: &DatabaseTyp
 fn is_postgres_transfer_dialect(db_type: &DatabaseType) -> bool {
     // KingbaseES supports the PostgreSQL DDL, type, and ON CONFLICT paths used by transfer;
     // other PG-wire databases stay opt-in until their transfer behavior is verified.
-    matches!(db_type, DatabaseType::Postgres | DatabaseType::Kingbase)
+    // openGauss runs the native PostgreSQL wire protocol pool and its server-side
+    // pg_get_tabledef() DDL contains multiple statements per table, so it needs the
+    // same statement-splitting create-table path (verified against openGauss 6.0.3).
+    // openGauss has no ON CONFLICT support, so upsert routing still excludes it
+    // (see uses_mysql_style_upsert).
+    matches!(db_type, DatabaseType::Postgres | DatabaseType::Kingbase | DatabaseType::OpenGauss)
 }
 
 fn transfer_table_needs_inline_postgres_schema_ensure(
@@ -3795,6 +3800,17 @@ pub fn generate_upsert_typed(
     )
 }
 
+/// Upsert targets that take the MySQL-style `INSERT ... ON DUPLICATE KEY UPDATE
+/// ... VALUES(col)` arm. openGauss belongs here instead of the PostgreSQL
+/// `ON CONFLICT` arm: its INSERT grammar has no `ON CONFLICT` clause, but it
+/// does support `ON DUPLICATE KEY UPDATE` with `VALUES(column_name)` references
+/// (openGauss SQL Reference, INSERT — docs.opengauss.org, 5.1.0). Identifier
+/// quoting inside the arm still follows `db_type`, so openGauss keeps
+/// double-quoted PostgreSQL-style names.
+fn uses_mysql_style_upsert(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::OpenGauss)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_upsert_typed_for_transfer(
     columns: &[String],
@@ -3830,8 +3846,10 @@ fn generate_upsert_typed_for_transfer(
     }
 
     match db_type {
+        // openGauss has no ON CONFLICT support; it is routed to the
+        // ON DUPLICATE KEY UPDATE arm below instead (uses_mysql_style_upsert).
         db_type
-            if is_postgres_transfer_dialect(db_type)
+            if (is_postgres_transfer_dialect(db_type) && !matches!(db_type, DatabaseType::OpenGauss))
                 || matches!(db_type, DatabaseType::Sqlite | DatabaseType::CloudflareD1 | DatabaseType::DuckDb) =>
         {
             let pk_list = pk_columns
@@ -3861,7 +3879,7 @@ fn generate_upsert_typed_for_transfer(
             }
             sql
         }
-        DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => {
+        db_type if uses_mysql_style_upsert(db_type) => {
             let mut sql = format!("INSERT INTO {full_table} ({col_list}) VALUES\n{}", value_rows.join(",\n"));
             if non_pk_columns.is_empty() {
                 sql.push_str("\nON DUPLICATE KEY UPDATE ");
@@ -4828,6 +4846,212 @@ fn value_to_sql_literal(value: &serde_json::Value, _db_type: &DatabaseType) -> S
     }
 }
 
+/// Source dialects whose transfer read loop may page with a keyset cursor
+/// (`WHERE (pk...) > <last page's keys>`) instead of `LIMIT n OFFSET m`.
+/// Keyset paging renders the cursor values as SQL text literals, so a dialect
+/// is only enabled once that rendering has been audited for it; the Postgres
+/// family shares quoting and implicit-cast rules and is covered first. Other
+/// dialects keep OFFSET paging (each page rescans and discards the rows before
+/// it, which is quadratic in table size) until their literal rules are audited.
+fn transfer_keyset_pagination_supported(db_type: &DatabaseType) -> bool {
+    matches!(
+        db_type,
+        DatabaseType::Postgres
+            | DatabaseType::OpenGauss
+            | DatabaseType::Gaussdb
+            | DatabaseType::Kingbase
+            | DatabaseType::Mysql
+            | DatabaseType::Doris
+            | DatabaseType::StarRocks
+            | DatabaseType::ManticoreSearch
+            | DatabaseType::Sqlite
+            | DatabaseType::SqlServer
+    )
+}
+
+/// Column types whose keyset cursor value round-trips through a SQL text
+/// literal in a `>` comparison. Exotic types (arrays, interval, bytea, money,
+/// network/range types...) keep OFFSET paging: their JSON form does not
+/// reliably re-parse as the same value, and a failed cast aborting the
+/// transfer mid-way is worse than a slow scan.
+fn postgres_keyset_column_type_supported(data_type: &str) -> bool {
+    let normalized = data_type.trim().to_ascii_lowercase();
+    let base = normalized.split('(').next().unwrap_or("").trim();
+    if base.is_empty() || base.contains('[') || base.contains("range") || base.starts_with("interval") {
+        return false;
+    }
+    const SUPPORTED_PREFIXES: &[&str] = &[
+        "int",
+        "bigint",
+        "smallint",
+        "serial",
+        "bigserial",
+        "smallserial",
+        "numeric",
+        "decimal",
+        "real",
+        "float",
+        "double",
+        "text",
+        "varchar",
+        "char",
+        "bpchar",
+        "name",
+        "bool",
+        "date",
+        "time",
+        "timestamp",
+        "uuid",
+    ];
+    SUPPORTED_PREFIXES.iter().any(|prefix| base.starts_with(prefix))
+}
+
+/// Dialect-aware keyset column-type gate. The Postgres family is covered by
+/// [`postgres_keyset_column_type_supported`]; MySQL-family, SQLite and SQL Server
+/// primary-key types that round-trip through `value_to_sql_literal` are enabled
+/// here. Binary types stay OFF — their JSON form is lossy — so those keys keep
+/// OFFSET paging.
+fn keyset_column_type_supported(db_type: &DatabaseType, data_type: &str) -> bool {
+    match db_type {
+        DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch => {
+            mysql_keyset_column_type_supported(data_type)
+        }
+        DatabaseType::Sqlite => sqlite_keyset_column_type_supported(data_type),
+        DatabaseType::SqlServer => sqlserver_keyset_column_type_supported(data_type),
+        _ => postgres_keyset_column_type_supported(data_type),
+    }
+}
+
+fn mysql_keyset_column_type_supported(data_type: &str) -> bool {
+    let base = data_type.trim().to_ascii_lowercase();
+    let base = base.split('(').next().unwrap_or("").trim();
+    const SUPPORTED: &[&str] = &[
+        "int",
+        "integer",
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "bigint",
+        "char",
+        "varchar",
+        "date",
+        "datetime",
+        "timestamp",
+        "year",
+        "decimal",
+        "numeric",
+    ];
+    SUPPORTED.iter().any(|prefix| base.starts_with(prefix))
+}
+
+fn sqlite_keyset_column_type_supported(data_type: &str) -> bool {
+    let base = data_type.trim().to_ascii_lowercase();
+    let base = base.split('(').next().unwrap_or("").trim();
+    const SUPPORTED: &[&str] = &["int", "integer", "text", "char", "varchar", "character", "numeric", "decimal"];
+    SUPPORTED.iter().any(|prefix| base.starts_with(prefix))
+}
+
+fn sqlserver_keyset_column_type_supported(data_type: &str) -> bool {
+    let base = data_type.trim().to_ascii_lowercase();
+    let base = base.split('(').next().unwrap_or("").trim();
+    const SUPPORTED: &[&str] = &[
+        "int",
+        "bigint",
+        "smallint",
+        "tinyint",
+        "char",
+        "varchar",
+        "nchar",
+        "nvarchar",
+        "uniqueidentifier",
+        "date",
+        "datetime",
+        "datetime2",
+        "smalldatetime",
+        "time",
+        "decimal",
+        "numeric",
+        "money",
+        "smallmoney",
+    ];
+    SUPPORTED.iter().any(|prefix| base.starts_with(prefix))
+}
+
+/// Resolves the source primary key columns to their positions in the selected
+/// column list. Returns None — meaning the read loop keeps OFFSET paging — when
+/// the dialect is not keyset-capable, when a key column is not among the
+/// transferred columns (its cursor value could not be read back), or when a key
+/// column's type cannot round-trip through a text literal.
+fn transfer_keyset_column_indexes(
+    columns: &[db::ColumnInfo],
+    primary_keys: &[String],
+    db_type: &DatabaseType,
+) -> Option<Vec<usize>> {
+    if primary_keys.is_empty() || !transfer_keyset_pagination_supported(db_type) {
+        return None;
+    }
+    primary_keys
+        .iter()
+        .map(|pk| {
+            let index = columns.iter().position(|column| column.name == *pk)?;
+            keyset_column_type_supported(db_type, &columns[index].data_type).then_some(index)
+        })
+        .collect()
+}
+
+/// Reads the keyset cursor (the primary key values ordering the pages) from the
+/// last row of a page. A NULL component means the metadata overstated the key
+/// (for example a nullable unique column reported as a key): the caller must
+/// fall back to OFFSET paging, which stays consistent because it keeps ordering
+/// by the same key columns.
+fn keyset_cursor_from_last_row(
+    rows: &[Vec<serde_json::Value>],
+    key_indexes: &[usize],
+) -> Option<Vec<serde_json::Value>> {
+    let last = rows.last()?;
+    key_indexes
+        .iter()
+        .map(|&index| {
+            let value = last.get(index).cloned().unwrap_or(serde_json::Value::Null);
+            (!value.is_null()).then_some(value)
+        })
+        .collect()
+}
+
+/// Outcome of advancing the keyset cursor from the page just read.
+enum KeysetAdvance {
+    /// The cursor moved to the page's last row; the next page continues after it.
+    Advanced,
+    /// A key component was NULL, so the key metadata does not allow keyset
+    /// paging (for example a nullable unique column reported as a key). The
+    /// caller falls back to OFFSET paging for the remaining pages, which stays
+    /// consistent because it keeps ordering by the same key columns.
+    FallBackToOffset,
+}
+
+/// Advances the keyset cursor from the page just read. Returns Err when the
+/// cursor did not move, which would re-read the same page forever.
+fn advance_keyset_cursor(
+    cursor: &mut Vec<serde_json::Value>,
+    rows: &[Vec<serde_json::Value>],
+    key_indexes: &[usize],
+    table: &str,
+) -> Result<KeysetAdvance, String> {
+    if rows.is_empty() {
+        return Ok(KeysetAdvance::Advanced);
+    }
+    match keyset_cursor_from_last_row(rows, key_indexes) {
+        Some(next) if next == *cursor => {
+            Err(format!("Transfer stalled for table '{table}': keyset pagination did not advance past key {next:?}"))
+        }
+        Some(next) => {
+            *cursor = next;
+            Ok(KeysetAdvance::Advanced)
+        }
+        None => Ok(KeysetAdvance::FallBackToOffset),
+    }
+}
+
 fn is_mongodb_transfer_type(db_type: &DatabaseType) -> bool {
     matches!(db_type, DatabaseType::MongoDb)
 }
@@ -5132,7 +5356,10 @@ fn transfer_ddl_statements(sql: &str, db_type: &DatabaseType) -> Vec<String> {
             statements
                 .into_iter()
                 .map(|statement| strip_inline_foreign_key_constraint_lines(&statement))
-                .filter(|statement| !is_postgres_post_table_index_statement(statement))
+                .filter(|statement| {
+                    !is_postgres_post_table_index_statement(statement)
+                        && !is_postgres_post_table_foreign_key_alter_statement(statement)
+                })
                 .collect()
         }
     } else if matches!(db_type, DatabaseType::Dameng) {
@@ -5190,6 +5417,24 @@ fn is_postgres_post_table_index_statement(statement: &str) -> bool {
     normalized.starts_with("CREATE INDEX ")
         || normalized.starts_with("CREATE UNIQUE INDEX ")
         || normalized.starts_with("COMMENT ON INDEX ")
+}
+
+/// Standalone `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` statements are
+/// dropped from reused PostgreSQL-dialect DDL, mirroring how inline FK lines are
+/// stripped from `CREATE TABLE`: openGauss's `pg_get_tabledef()` emits one ALTER
+/// per foreign key, which would run at create time — failing when the referenced
+/// table does not exist yet — and then collide with the same-named constraint
+/// re-added from source metadata by `restore_postgres_table_schema_objects`
+/// (`duplicate_object` 42710). Foreign keys must come from the restore phase
+/// alone. Non-FK ALTERs (`ADD CONSTRAINT ... CHECK`, `SET (...)`, ...) are kept.
+fn is_postgres_post_table_foreign_key_alter_statement(statement: &str) -> bool {
+    // Mask string literals and comments first so a CHECK expression or comment
+    // that merely mentions "foreign key" cannot match.
+    let (code, _) = protect_sql_literals(statement, true);
+    let normalized = code.trim_start().to_ascii_uppercase();
+    normalized.starts_with("ALTER TABLE ")
+        && normalized.contains(" ADD CONSTRAINT ")
+        && normalized.contains(" FOREIGN KEY ")
 }
 
 pub async fn execute_on_pool_with_max_rows(
@@ -5330,24 +5575,47 @@ async fn execute_on_pool_once(
     let pool_handle = state.pool_handle(pool_key).await;
     let pool = pool_handle.as_ref().ok_or("Connection not found")?;
 
+    // Transfer reads run under the per-connection operation budget. Drivers that
+    // expose an incremental result stream (MySQL, PostgreSQL, SQLite, SQL Server)
+    // use a *progress-aware* budget: the configured query timeout is an inactivity
+    // window reset for every row the server delivers, so transferring a large
+    // table is no longer cancelled just for exceeding the timeout in total. Drivers
+    // whose protocol returns the whole result in one shot — ClickHouse, InfluxDB,
+    // the Agent/JDBC path, external drivers and the DuckDB sidecar worker — expose
+    // no incremental progress, so they keep the plain wall-clock timeout.
     let result = match pool {
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
             let bare = *mode == crate::connection::MysqlMode::Bare;
-            wait_for_query_opt(
-                None,
+            // Row-returning reads run under a progress-aware budget: the timeout
+            // resets for every row the server delivers, so a large table is no
+            // longer cancelled just for taking longer than the timeout overall.
+            let progress_clock = Arc::new(StreamProgressClock::new());
+            db::mysql::execute_query_with_max_rows_progress(
+                &p,
+                sql,
+                bare,
+                max_rows,
+                Default::default(),
+                progress_clock,
                 query_timeout,
-                db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, Default::default()),
             )
             .await
         }
         PoolKind::Postgres(p) => {
             let p = p.clone();
-            wait_for_query_opt(None, query_timeout, db::postgres::execute_query_with_max_rows(&p, sql, max_rows)).await
+            // Row-returning reads — the paging SELECTs a transfer issues — run
+            // under the driver's progress-aware budget: the configured query
+            // timeout becomes an inactivity window reset by every row the server
+            // delivers, so a large table is no longer cancelled just for taking
+            // longer than the timeout in total.
+            let progress_clock = Arc::new(StreamProgressClock::new());
+            db::postgres::execute_query_with_max_rows_progress(&p, sql, max_rows, progress_clock, query_timeout).await
         }
         PoolKind::Sqlite(p) => {
             let p = p.clone();
-            wait_for_query_opt(None, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows)).await
+            let progress_clock = Arc::new(StreamProgressClock::new());
+            db::sqlite::execute_query_with_max_rows_progress(&p, sql, max_rows, progress_clock, query_timeout).await
         }
         PoolKind::ClickHouse(client) => {
             let client = client.clone();
@@ -5377,10 +5645,16 @@ async fn execute_on_pool_once(
         PoolKind::SqlServer(client) => {
             let client = client.clone();
             let mut client = client.lock().await;
-            let result = wait_for_query_opt(
-                None,
+            // Row-returning reads use the driver's progress-aware budget (see the
+            // SQL Server driver): a long but steady stream is never cancelled just
+            // for exceeding the timeout in total.
+            let progress_clock = Arc::new(StreamProgressClock::new());
+            let result = db::sqlserver::execute_query_with_max_rows_progress(
+                &mut client,
+                sql,
+                max_rows,
+                progress_clock,
                 query_timeout,
-                db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows),
             )
             .await;
             drop(client);
@@ -6501,8 +6775,38 @@ fn postgres_transfer_routines_sql(schema: &str, has_prokind: bool) -> String {
          FROM pg_catalog.pg_proc p \
          JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = {schema} AND {routine_filter} \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_depend d \
+             JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+             WHERE d.classid = 'pg_catalog.pg_proc'::regclass \
+               AND d.objid = p.oid \
+               AND d.refclassid = 'pg_catalog.pg_extension'::regclass \
+               AND d.deptype = 'e' \
+               AND e.extnamespace = n.oid \
+           ) \
          ORDER BY CASE WHEN {routine_kind} = 'PROCEDURE' THEN 0 ELSE 1 END, p.proname, p.oid",
         schema = quote_string_literal(schema),
+    )
+}
+
+fn postgres_transfer_relation_sources_sql(schema: &str, relkind: char) -> String {
+    format!(
+        "SELECT c.relname, pg_get_viewdef(c.oid, true) \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {} AND c.relkind = {} \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_depend d \
+             JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+             WHERE d.classid = 'pg_catalog.pg_class'::regclass \
+               AND d.objid = c.oid \
+               AND d.refclassid = 'pg_catalog.pg_extension'::regclass \
+               AND d.deptype = 'e' \
+               AND e.extnamespace = n.oid \
+           ) \
+         ORDER BY c.relname",
+        quote_string_literal(schema),
+        quote_string_literal(&relkind.to_string()),
     )
 }
 
@@ -6512,14 +6816,7 @@ async fn get_postgres_schema_object_sources_for_transfer(
     schema: &str,
     has_prokind: bool,
 ) -> Result<Vec<db::ObjectSource>, String> {
-    let views_sql = format!(
-        "SELECT c.relname, pg_get_viewdef(c.oid, true) \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {} AND c.relkind = 'v' \
-         ORDER BY c.relname",
-        quote_string_literal(schema)
-    );
+    let views_sql = postgres_transfer_relation_sources_sql(schema, 'v');
     let routines_sql = postgres_transfer_routines_sql(schema, has_prokind);
 
     let mut sources = Vec::new();
@@ -6566,14 +6863,7 @@ async fn get_postgres_materialized_view_sources_for_transfer(
     pool_key: &str,
     schema: &str,
 ) -> Result<Vec<PostgresMaterializedViewSource>, String> {
-    let sql = format!(
-        "SELECT c.relname, pg_get_viewdef(c.oid, true) \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {} AND c.relkind = 'm' \
-         ORDER BY c.relname",
-        quote_string_literal(schema)
-    );
+    let sql = postgres_transfer_relation_sources_sql(schema, 'm');
     let rows = execute_on_pool(state, pool_key, &sql).await?.rows;
     Ok(rows
         .into_iter()
@@ -7343,6 +7633,11 @@ where
     let mut sql_target_column_names: Vec<String> = Vec::new();
     let mut sql_target_column_types: Vec<Option<String>> = Vec::new();
     let mut sql_target_prepared = false;
+    // Keyset paging state for SQL sources: pages seek with
+    // `WHERE (pk...) > <cursor>` instead of OFFSET, which rescans and discards
+    // every previously read row (quadratic in table size).
+    let mut keyset_cursor: Vec<serde_json::Value> = Vec::new();
+    let mut keyset_usable = true;
 
     loop {
         if is_cancelled(&request.transfer_id).await {
@@ -7386,17 +7681,50 @@ where
             .await?;
             let col_names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
             let primary_key_columns = transfer_key_columns(&columns, source_db_type);
-            let sql = pagination_sql_with_order(
-                &col_names,
-                table,
-                &request.source_schema,
-                source_db_type,
-                offset,
-                batch_size,
-                &primary_key_columns,
-                request.source_catalog.as_deref(),
-            );
-            let result = execute_on_pool(state, source_pool_key, &sql).await?;
+            let keyset_indexes = if keyset_usable {
+                transfer_keyset_column_indexes(&columns, &primary_key_columns, source_db_type)
+            } else {
+                None
+            };
+            let sql = if keyset_indexes.is_some() {
+                keyset_pagination_sql(
+                    &col_names,
+                    table,
+                    &request.source_schema,
+                    source_db_type,
+                    &primary_key_columns,
+                    &keyset_cursor,
+                    batch_size,
+                )
+            } else {
+                pagination_sql_with_order(
+                    &col_names,
+                    table,
+                    &request.source_schema,
+                    source_db_type,
+                    offset,
+                    batch_size,
+                    &primary_key_columns,
+                    request.source_catalog.as_deref(),
+                )
+            };
+            // Cap the result at `batch_size` (not the 10k default row limit): the
+            // paging SELECT is already `LIMIT batch_size`, and the loop below treats a
+            // short page as the last page. Capping lower than `batch_size` would make a
+            // large batch look short and truncate the transfer early.
+            let result = execute_on_pool_with_max_rows(state, source_pool_key, &sql, Some(batch_size)).await?;
+            if let Some(indexes) = keyset_indexes.as_deref() {
+                match advance_keyset_cursor(&mut keyset_cursor, &result.rows, indexes, table)? {
+                    KeysetAdvance::Advanced => {}
+                    KeysetAdvance::FallBackToOffset => {
+                        log::warn!(
+                            "[transfer] {table}: NULL value in a key column at row {offset}; \
+                             falling back to OFFSET paging for the remaining rows"
+                        );
+                        keyset_usable = false;
+                    }
+                }
+            }
             sql_rows_to_mongo_documents(&col_names, &result.rows)
         };
 
@@ -8538,6 +8866,13 @@ where
     let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
     let mut offset: u64 = 0;
     let mut total_transferred: u64 = 0;
+    // Keyset paging state: when the source can page by key cursor, each page
+    // seeks with `WHERE (pk...) > <cursor>` instead of OFFSET, which rescans
+    // and discards every previously read row (quadratic in table size). Falls
+    // back to OFFSET (keeping the same key ordering) when the key metadata
+    // does not hold up mid-table.
+    let mut keyset_indexes = transfer_keyset_column_indexes(&writable_columns, &primary_key_columns, source_db_type);
+    let mut keyset_cursor: Vec<serde_json::Value> = Vec::new();
     // A single Agent cursor keeps Kyuubi/Impala rows in one query execution.
     // Re-running LIMIT/OFFSET pages is unstable for tables without a unique key.
     let use_hive_server_cursor = matches!(source_db_type, DatabaseType::Kyuubi | DatabaseType::Impala);
@@ -8572,25 +8907,55 @@ where
                     false,
                 )
             } else {
-                let sql = pagination_sql_with_order(
-                    &col_names,
-                    table,
-                    &request.source_schema,
-                    source_db_type,
-                    offset,
-                    batch_size,
-                    &primary_key_columns,
-                    request.source_catalog.as_deref(),
-                );
+                let sql = if keyset_indexes.is_some() {
+                    keyset_pagination_sql(
+                        &col_names,
+                        table,
+                        &request.source_schema,
+                        source_db_type,
+                        &primary_key_columns,
+                        &keyset_cursor,
+                        batch_size,
+                    )
+                } else {
+                    pagination_sql_with_order(
+                        &col_names,
+                        table,
+                        &request.source_schema,
+                        source_db_type,
+                        offset,
+                        batch_size,
+                        &primary_key_columns,
+                        request.source_catalog.as_deref(),
+                    )
+                };
                 let (sql, mysql_spatial_markers) =
                     mysql_spatial_transfer_select_sql(sql, &col_names, &col_types, source_db_type, target_db_type);
-                (execute_on_pool(state, source_pool_key, &sql).await?, mysql_spatial_markers)
+                // Cap the result at `batch_size` (not the 10k default row limit), so a
+                // large batch is never truncated into looking like a short final page.
+                (
+                    execute_on_pool_with_max_rows(state, source_pool_key, &sql, Some(batch_size)).await?,
+                    mysql_spatial_markers,
+                )
             };
             let has_more = result.has_more;
             let row_count = result.rows.len();
 
             if row_count == 0 {
                 break;
+            }
+
+            if let Some(indexes) = keyset_indexes.as_deref() {
+                match advance_keyset_cursor(&mut keyset_cursor, &result.rows, indexes, table)? {
+                    KeysetAdvance::Advanced => {}
+                    KeysetAdvance::FallBackToOffset => {
+                        log::warn!(
+                            "[transfer] {table}: NULL value in a key column at row {offset}; \
+                             falling back to OFFSET paging for the remaining rows"
+                        );
+                        keyset_indexes = None;
+                    }
+                }
             }
 
             let write_statements = generate_transfer_write_sql_batches_with_column_quoting(
@@ -10958,6 +11323,30 @@ mod tests {
             assert!(legacy.contains("'FUNCTION'"));
             assert!(legacy.contains("NOT p.proisagg"));
             assert!(legacy.contains("NOT p.proiswindow"));
+
+            for sql in [modern, legacy] {
+                assert!(sql.contains("JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid"));
+                assert!(sql.contains("d.classid = 'pg_catalog.pg_proc'::regclass"));
+                assert!(sql.contains("d.objid = p.oid"));
+                assert!(sql.contains("d.refclassid = 'pg_catalog.pg_extension'::regclass"));
+                assert!(sql.contains("d.deptype = 'e'"));
+                assert!(sql.contains("e.extnamespace = n.oid"));
+            }
+        }
+
+        #[test]
+        fn postgres_transfer_relation_sources_exclude_extension_members() {
+            for relkind in ['v', 'm'] {
+                let sql = postgres_transfer_relation_sources_sql("public", relkind);
+
+                assert!(sql.contains(&format!("c.relkind = '{relkind}'")));
+                assert!(sql.contains("JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid"));
+                assert!(sql.contains("d.classid = 'pg_catalog.pg_class'::regclass"));
+                assert!(sql.contains("d.objid = c.oid"));
+                assert!(sql.contains("d.refclassid = 'pg_catalog.pg_extension'::regclass"));
+                assert!(sql.contains("d.deptype = 'e'"));
+                assert!(sql.contains("e.extnamespace = n.oid"));
+            }
         }
 
         #[test]
@@ -11829,6 +12218,74 @@ mod tests {
             vec![
                 "CREATE TABLE \"public\".\"items\" (\"id\" integer)".to_string(),
                 "COMMENT ON TABLE \"public\".\"items\" IS 'items'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn opengauss_transfer_ddl_splits_reused_multi_statement_table_ddl() {
+        // openGauss reuses the source table DDL verbatim via pg_get_tabledef(), which
+        // emits several statements per table. Without the PostgreSQL dialect path the
+        // whole DDL runs as one prepared statement and fails with "cannot insert
+        // multiple commands into a prepared statement".
+        let ddl = "SET search_path = public;\n\
+                   CREATE TABLE \"public\".\"items\" (\"id\" integer);\n\
+                   COMMENT ON TABLE \"public\".\"items\" IS 'items';";
+
+        let statements = transfer_ddl_statements(ddl, &DatabaseType::OpenGauss);
+
+        assert_eq!(
+            statements,
+            vec![
+                "SET search_path = public".to_string(),
+                "CREATE TABLE \"public\".\"items\" (\"id\" integer)".to_string(),
+                "COMMENT ON TABLE \"public\".\"items\" IS 'items'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn opengauss_transfer_ddl_skips_reused_foreign_key_alter_statements() {
+        // openGauss's pg_get_tabledef() emits one `ALTER TABLE ... ADD CONSTRAINT
+        // ... FOREIGN KEY` per foreign key. Keeping them would run the FK at create
+        // time (referenced tables may not exist yet) and then duplicate the named
+        // constraint re-added by restore_postgres_table_schema_objects (42710).
+        let ddl = "SET search_path = public;\n\
+                   CREATE TABLE \"public\".\"items\" (\"id\" integer, \"order_id\" integer);\n\
+                   ALTER TABLE \"public\".\"items\" ADD CONSTRAINT \"items_order_id_fkey\" FOREIGN KEY (\"order_id\") REFERENCES \"public\".\"orders\" (\"id\") ON DELETE CASCADE;\n\
+                   CREATE INDEX \"items_order_id_idx\" ON \"public\".\"items\" (\"order_id\");\n\
+                   COMMENT ON TABLE \"public\".\"items\" IS 'items';";
+
+        let statements = transfer_ddl_statements(ddl, &DatabaseType::OpenGauss);
+
+        assert_eq!(
+            statements,
+            vec![
+                "SET search_path = public".to_string(),
+                "CREATE TABLE \"public\".\"items\" (\"id\" integer, \"order_id\" integer)".to_string(),
+                "COMMENT ON TABLE \"public\".\"items\" IS 'items'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_transfer_ddl_keeps_non_foreign_key_alter_statements() {
+        // Only FK-ADD ALTERs are deferred; CHECK/SET ALTERs and literals that merely
+        // mention "foreign key" must survive the filter.
+        let ddl = "CREATE TABLE \"public\".\"items\" (\"id\" integer, \"amount\" integer, \"note\" text);\n\
+                   ALTER TABLE \"public\".\"items\" ADD CONSTRAINT \"items_amount_check\" CHECK (amount > 0);\n\
+                   ALTER TABLE \"public\".\"items\" ADD CONSTRAINT \"items_note_check\" CHECK (note <> 'foreign key (demo)');\n\
+                   ALTER TABLE \"public\".\"items\" SET (autovacuum_enabled = false);";
+
+        let statements = transfer_ddl_statements(ddl, &DatabaseType::Postgres);
+
+        assert_eq!(
+            statements,
+            vec![
+                "CREATE TABLE \"public\".\"items\" (\"id\" integer, \"amount\" integer, \"note\" text)".to_string(),
+                "ALTER TABLE \"public\".\"items\" ADD CONSTRAINT \"items_amount_check\" CHECK (amount > 0)".to_string(),
+                "ALTER TABLE \"public\".\"items\" ADD CONSTRAINT \"items_note_check\" CHECK (note <> 'foreign key (demo)')".to_string(),
+                "ALTER TABLE \"public\".\"items\" SET (autovacuum_enabled = false)".to_string(),
             ]
         );
     }
@@ -12863,6 +13320,149 @@ mod tests {
             sql,
             "SELECT TOP (100) [tenant_id], [id], [name] FROM [dbo].[users] WHERE ([tenant_id] > 10 OR ([tenant_id] = 10 AND [id] > 25)) ORDER BY [tenant_id] ASC, [id] ASC"
         );
+    }
+
+    #[test]
+    fn keyset_column_indexes_require_keyset_capable_dialect() {
+        let columns = vec![db::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "integer".to_string(),
+            is_primary_key: true,
+            ..Default::default()
+        }];
+        let pks = vec!["id".to_string()];
+
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Postgres), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::OpenGauss), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Gaussdb), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Kingbase), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Mysql), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Sqlite), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::SqlServer), Some(vec![0]));
+        // Dialects whose cursor literal rendering is not audited keep OFFSET paging.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::ClickHouse), None);
+        // No primary key → no keyset cursor.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &[], &DatabaseType::Postgres), None);
+    }
+
+    #[test]
+    fn mysql_sqlite_sqlserver_keyset_column_types_are_audited() {
+        // MySQL-family: integers, strings, dates and decimals round-trip; binary/blob stay OFF.
+        assert!(keyset_column_type_supported(&DatabaseType::Mysql, "int"));
+        assert!(keyset_column_type_supported(&DatabaseType::Mysql, "bigint unsigned"));
+        assert!(keyset_column_type_supported(&DatabaseType::Mysql, "varchar(64)"));
+        assert!(keyset_column_type_supported(&DatabaseType::Mysql, "datetime"));
+        assert!(!keyset_column_type_supported(&DatabaseType::Mysql, "binary(16)"));
+        assert!(!keyset_column_type_supported(&DatabaseType::Mysql, "varbinary(255)"));
+        assert!(!keyset_column_type_supported(&DatabaseType::Mysql, "blob"));
+
+        // SQLite: integer/text; blob stays OFF.
+        assert!(keyset_column_type_supported(&DatabaseType::Sqlite, "INTEGER"));
+        assert!(keyset_column_type_supported(&DatabaseType::Sqlite, "TEXT"));
+        assert!(!keyset_column_type_supported(&DatabaseType::Sqlite, "BLOB"));
+
+        // SQL Server: integers, strings, uniqueidentifier, dates; binary stays OFF.
+        assert!(keyset_column_type_supported(&DatabaseType::SqlServer, "int"));
+        assert!(keyset_column_type_supported(&DatabaseType::SqlServer, "nvarchar(64)"));
+        assert!(keyset_column_type_supported(&DatabaseType::SqlServer, "uniqueidentifier"));
+        assert!(keyset_column_type_supported(&DatabaseType::SqlServer, "datetime2"));
+        assert!(!keyset_column_type_supported(&DatabaseType::SqlServer, "varbinary(32)"));
+    }
+
+    #[test]
+    fn keyset_column_indexes_require_selected_round_trippable_key_columns() {
+        let columns = vec![
+            db::ColumnInfo { name: "payload".to_string(), data_type: "jsonb".to_string(), ..Default::default() },
+            db::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                is_primary_key: true,
+                ..Default::default()
+            },
+        ];
+        let pks = vec!["id".to_string()];
+
+        // The key column may sit anywhere in the selected column list.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Postgres), Some(vec![1]));
+
+        // A key column that is not selected (e.g. a generated-always identity
+        // excluded from the writable columns) cannot be read back from a page.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &["missing".to_string()], &DatabaseType::Postgres), None);
+
+        // Key types that do not round-trip through a text literal keep OFFSET paging.
+        let columns = vec![db::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bytea".to_string(),
+            is_primary_key: true,
+            ..Default::default()
+        }];
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Postgres), None);
+    }
+
+    #[test]
+    fn postgres_keyset_column_type_support() {
+        for supported in [
+            "integer",
+            "int4",
+            "bigint",
+            "smallint",
+            "bigserial",
+            "numeric(10, 2)",
+            "decimal",
+            "real",
+            "double precision",
+            "float8",
+            "text",
+            "character varying(255)",
+            "bpchar",
+            "name",
+            "boolean",
+            "date",
+            "timestamp without time zone",
+            "timestamptz",
+            "time with time zone",
+            "uuid",
+        ] {
+            assert!(postgres_keyset_column_type_supported(supported), "{supported}");
+        }
+        for unsupported in
+            ["integer[]", "bytea", "interval", "money", "jsonb", "inet", "int4range", "numrange", "bit", ""]
+        {
+            assert!(!postgres_keyset_column_type_supported(unsupported), "{unsupported}");
+        }
+    }
+
+    #[test]
+    fn keyset_cursor_reads_key_values_from_last_row() {
+        let rows = vec![vec![json!(1), json!("a")], vec![json!(2), json!("b")]];
+
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[0]), Some(vec![json!(2)]));
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[1]), Some(vec![json!("b")]));
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[0, 1]), Some(vec![json!(2), json!("b")]));
+        // Missing column index reads as NULL → no keyset cursor.
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[5]), None);
+        assert_eq!(keyset_cursor_from_last_row(&Vec::new(), &[0]), None);
+        let null_rows = vec![vec![json!(1), serde_json::Value::Null]];
+        assert_eq!(keyset_cursor_from_last_row(&null_rows, &[1]), None);
+    }
+
+    #[test]
+    fn advance_keyset_cursor_detects_stall_and_null_fallback() {
+        let mut cursor = Vec::new();
+        let rows = vec![vec![json!(1)], vec![json!(2)]];
+
+        assert!(matches!(advance_keyset_cursor(&mut cursor, &rows, &[0], "t"), Ok(KeysetAdvance::Advanced)));
+        assert_eq!(cursor, vec![json!(2)]);
+        // Re-reading the same page must fail instead of looping forever.
+        assert!(advance_keyset_cursor(&mut cursor, &rows, &[0], "t").is_err());
+        // NULL keys degrade to OFFSET paging.
+        let null_rows = vec![vec![serde_json::Value::Null]];
+        assert!(matches!(
+            advance_keyset_cursor(&mut cursor, &null_rows, &[0], "t"),
+            Ok(KeysetAdvance::FallBackToOffset)
+        ));
+        // Empty pages leave the cursor untouched.
+        assert!(matches!(advance_keyset_cursor(&mut cursor, &Vec::new(), &[0], "t"), Ok(KeysetAdvance::Advanced)));
     }
 
     #[test]
@@ -14912,6 +15512,44 @@ SELECT 1 FROM dual"#
         );
 
         assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""), "sql: {sql}");
+    }
+
+    #[test]
+    fn opengauss_upsert_uses_on_duplicate_key_update() {
+        // openGauss has no `ON CONFLICT` support; its INSERT grammar provides the
+        // MySQL-style `ON DUPLICATE KEY UPDATE` with VALUES(col) references
+        // (openGauss SQL Reference, INSERT — docs.opengauss.org, 5.1.0).
+        let sql = generate_upsert_typed(
+            &[String::from("id"), String::from("name")],
+            &[Some(String::from("integer")), Some(String::from("text"))],
+            &[vec![json!(1), json!("updated")]],
+            "items",
+            "public",
+            &DatabaseType::OpenGauss,
+            &[String::from("id")],
+            None,
+        );
+
+        assert!(sql.starts_with("INSERT INTO \"public\".\"items\" (\"id\", \"name\") VALUES"), "sql: {sql}");
+        assert!(sql.contains("ON DUPLICATE KEY UPDATE \"name\" = VALUES(\"name\")"), "sql: {sql}");
+        assert!(!sql.contains("ON CONFLICT"), "sql: {sql}");
+    }
+
+    #[test]
+    fn opengauss_upsert_primary_key_only_updates_nothing() {
+        let sql = generate_upsert_typed(
+            &[String::from("id")],
+            &[Some(String::from("integer"))],
+            &[vec![json!(1)]],
+            "items",
+            "public",
+            &DatabaseType::OpenGauss,
+            &[String::from("id")],
+            None,
+        );
+
+        assert!(sql.contains("ON DUPLICATE KEY UPDATE \"id\" = \"id\""), "sql: {sql}");
+        assert!(!sql.contains("ON CONFLICT"), "sql: {sql}");
     }
 
     #[test]

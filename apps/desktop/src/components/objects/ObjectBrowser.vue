@@ -42,6 +42,7 @@ import {
   Search,
   ScrollText,
   ShieldCheck,
+  Sparkles,
   Square,
   Table,
   Table2,
@@ -70,7 +71,7 @@ import * as api from "@/lib/backend/api";
 import type { ColumnInfo, ConnectionConfig, ConstraintInfo, ForeignKeyInfo, IndexInfo, ObjectBrowserViewMode, ObjectBrowserViewport, ObjectInfo, ObjectSourceKind, ObjectStatistics, TableInfoTab, TreeNode, TriggerInfo } from "@/types/database";
 import { sortTablesByFkDependency, type TableWithFk } from "@/lib/table/tableDependencySort";
 import { isSchemaAware, supportsTableVacuum, supportsTransfer } from "@/lib/database/databaseCapabilities";
-import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/database/databaseFeatureSupport";
+import { supportsAiAssistantContext, supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/database/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, objectListSchemaForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { getTableMetadataCapabilities, type TableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
@@ -179,6 +180,7 @@ const props = defineProps<{
   /** 显式"新建事件"请求号：每次菜单点击递增，用于打开/重新进入 CREATE 编辑器 */
   initialEventCreateRequestId?: number;
   initialObjectFilter?: "tables" | "events";
+  selectedObjectFilter?: ObjectFilter;
   initialSearchQuery?: string;
   viewport?: ObjectBrowserViewport;
 }>();
@@ -188,6 +190,8 @@ const emit = defineEmits<{
   schemaChange: [schema: string | undefined];
   viewportChange: [viewport: ObjectBrowserViewport];
   searchChange: [query: string];
+  filterChange: [filter: ObjectFilter];
+  addToAi: [tables: Array<{ name: string; schema?: string }>];
 }>();
 
 const { t } = useI18n();
@@ -2108,9 +2112,9 @@ async function exportData(row: ObjectBrowserRow, format: "csv" | "json" | "sql")
     await exportDataLegacy(row, format);
     return;
   }
-  const insertMode = format === "sql" ? await showSqlInsertModeDialog() : undefined;
-  if (format === "sql" && insertMode === null) return;
-  await exportTableData(row, format, undefined, "name", true, insertMode ?? "batch");
+  const sqlExportOptions = format === "sql" ? await showSqlInsertModeDialog({ allowSplit: true }) : undefined;
+  if (format === "sql" && sqlExportOptions === null) return;
+  await exportTableData(row, format, undefined, "name", true, sqlExportOptions?.insertMode ?? "batch", sqlExportOptions?.splitMaxMb);
 }
 
 function showObjectBrowserXlsxHeaderDialog(hasComments: boolean): Promise<XlsxExportOptions | null> {
@@ -2153,17 +2157,18 @@ async function exportDataXlsx(row: ObjectBrowserRow) {
   await exportTableData(row, "xlsx", columnInfos, exportOptions.headerMode, exportOptions.autoFilter);
 }
 
-async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "sql", columnInfos?: ColumnInfo[], headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode: SqlInsertMode = "batch") {
+async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "sql", columnInfos?: ColumnInfo[], headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode: SqlInsertMode = "batch", splitMaxMb?: number) {
   const schema = row.schema || selectedSchema.value;
+  const splitSqlOutput = format === "sql" && splitMaxMb !== undefined;
 
   // Save dialog first
   let filePath = "";
-  const defaultName = `${row.name}.${format}`;
+  const defaultName = `${row.name}.${splitSqlOutput ? "zip" : format}`;
 
   if (isTauriRuntime()) {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
-      const filter = format === "csv" ? { name: "CSV", extensions: ["csv"] } : format === "xlsx" ? { name: "Excel", extensions: ["xlsx"] } : { name: "SQL", extensions: ["sql"] };
+      const filter = format === "csv" ? { name: "CSV", extensions: ["csv"] } : format === "xlsx" ? { name: "Excel", extensions: ["xlsx"] } : splitSqlOutput ? { name: "ZIP", extensions: ["zip"] } : { name: "SQL", extensions: ["sql"] };
       const path = await save({
         defaultPath: defaultName,
         filters: [filter],
@@ -2176,7 +2181,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
     }
   } else {
     const webExportId = generateDatabaseExportId();
-    filePath = `__web_export_${webExportId}.${format}`;
+    filePath = `__web_export_${webExportId}.${splitSqlOutput ? "zip" : format}`;
   }
 
   let task: ExportTask | null = null;
@@ -2227,7 +2232,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
       tableName: row.name,
       filePath,
       format,
-      ...(format === "sql" ? { insertMode } : {}),
+      ...(format === "sql" ? { insertMode, splitMaxMb } : {}),
       csvQuoteMode: settingsStore.editorSettings.csvQuoteMode,
       columns,
       columnComments: format === "xlsx" ? columnComments : undefined,
@@ -2803,7 +2808,7 @@ function openInitialEventIfNeeded() {
 
 function finishObjectBrowserRowsLoad() {
   loadingObjects.value = false;
-  const preferredFilter = props.initialObjectFilter ?? (props.initialEventName || props.initialEventCreateRequestId !== undefined ? "events" : "tables");
+  const preferredFilter = props.initialEventName || props.initialEventCreateRequestId !== undefined ? "events" : (props.selectedObjectFilter ?? props.initialObjectFilter ?? "tables");
   if (!userHasSelectedFilter.value && objectCounts.value[preferredFilter] > 0) {
     // The default table filter is a presentation choice, not a user query
     // change, so preserve the tab's saved scroll offset across remounts.
@@ -2815,7 +2820,10 @@ function finishObjectBrowserRowsLoad() {
 }
 
 watch([() => props.initialEventName, () => props.initialEventOpenRequestId, () => props.initialEventCreateRequestId], ([name, requestId, createRequestId], [previousName, previousRequestId, previousCreateRequestId]) => {
-  if (name !== previousName || requestId !== previousRequestId || createRequestId !== previousCreateRequestId) openedInitialEvent.value = "";
+  if (name !== previousName || requestId !== previousRequestId || createRequestId !== previousCreateRequestId) {
+    openedInitialEvent.value = "";
+    if (name || createRequestId !== undefined) objectFilter.value = "events";
+  }
   openInitialEventIfNeeded();
 });
 
@@ -2852,14 +2860,13 @@ async function loadObjects(options?: { allowCached?: boolean; preserveExistingRo
 
   const cached = options?.allowCached ? getCachedObjectBrowserRowsForScaffold(request.scope) : undefined;
   if (cached) {
-    // Scaffold the last-known rows so returning to this tab shows them instantly
-    // instead of flashing an empty list. A fresh entry (< TTL) is authoritative on
-    // its own; a stale one is presented and then revalidated in the background.
+    // Restore the last-known rows when remounting this tab. The cached list is
+    // authoritative for navigation restores, including entries older than the
+    // freshness TTL; re-querying here makes every tab switch look like a refresh.
+    // Explicit refresh and metadata invalidation still bypass this branch.
     applyObjectBrowserRows(cached.rows);
     finishOnce();
-    if (!cached.stale) return;
-    scaffoldRefresh = true;
-    refreshingObjects.value = true;
+    return;
   } else {
     // No scaffold: first load in this scope, cache invalidated by a DDL mutation,
     // or the caller wants a true reload. If the caller explicitly asked to keep the
@@ -3008,6 +3015,12 @@ function filterLabel(filter: ObjectFilter) {
   return `${t(key)} ${filterCount(filter)}`;
 }
 
+function selectObjectFilter(filter: ObjectFilter) {
+  userHasSelectedFilter.value = true;
+  objectFilter.value = filter;
+  emit("filterChange", filter);
+}
+
 function getSearchInput(): HTMLInputElement | null {
   return rootRef.value?.querySelector<HTMLInputElement>("[data-object-search-input]") ?? null;
 }
@@ -3108,6 +3121,22 @@ function isSelectedBatchTableContext(item: ObjectBrowserRow): boolean {
   return item.type === "TABLE" && selectedTableCount.value > 1 && selectedTableIds.value.has(item.id);
 }
 
+function addToAiMenuItem(item: ObjectBrowserRow): ContextMenuItem {
+  const useBatch = isSelectedBatchTableContext(item);
+  const count = selectedTableCount.value;
+  // Schema stays per-row: the consumer (App.vue addToAi) resolves the final
+  // schema with its own fallback chain (table.schema || tab.schema — no
+  // database fallback, mirroring the sidebar tree path). ObjectBrowser is a
+  // single-schema view, but keeping row-level schemas makes the payload honest
+  // and future-proof if multi-schema selection ever appears.
+  const targets = useBatch ? selectedTableRows.value.map((row) => ({ name: row.name, schema: row.schema })) : [{ name: item.name, schema: item.schema }];
+  return {
+    label: useBatch ? t("contextMenu.addToAiMultiple", { count }) : t("contextMenu.addToAi"),
+    action: () => emit("addToAi", targets),
+    icon: Sparkles,
+  };
+}
+
 function selectedBatchTableCountLabel(key: "batchDrop" | "batchTruncate" | "batchEmpty"): string {
   return t(`contextMenu.${key}`, { count: selectedTableCount.value });
 }
@@ -3117,6 +3146,7 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     return [
       { label: t("contextMenu.viewData"), action: () => openViewData(item), icon: Table2 },
       { label: t("contextMenu.newQuery"), action: () => openNewQuery(item), icon: TerminalSquare },
+      ...(supportsAiAssistantContext(effectiveDatabaseType.value) ? [addToAiMenuItem(item)] : []),
       { label: "", separator: true },
       exportDataSubmenu(item),
       { label: "", separator: true },
@@ -3160,6 +3190,7 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     ...(canOpenStructureEditor.value ? [{ label: t("contextMenu.editStructure"), action: () => openStructureEditor(item), icon: PencilRuler }] : []),
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
     { label: t("contextMenu.newQuery"), action: () => openNewQuery(item), icon: TerminalSquare },
+    ...(supportsAiAssistantContext(effectiveDatabaseType.value) ? [addToAiMenuItem(item)] : []),
     ...(canOpenDiagram.value ? [{ label: t("diagram.open"), action: () => openDiagram(item), icon: Network }] : []),
     ...(canOpenTableImport.value ? [{ label: t("contextMenu.importData"), action: () => openTableImport(item), icon: Download }] : []),
     { label: t("dataCompare.title"), action: () => openDataCompare(item), icon: ArrowRightLeft },
@@ -3303,17 +3334,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           </button>
         </div>
         <div v-if="showObjectFilter && showInlineObjectFilter" class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
-          <button
-            v-for="filter in objectFilters"
-            :key="filter"
-            type="button"
-            class="h-6 rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:text-foreground"
-            :class="{ 'bg-background text-foreground shadow-sm': objectFilter === filter }"
-            @click="
-              userHasSelectedFilter = true;
-              objectFilter = filter;
-            "
-          >
+          <button v-for="filter in objectFilters" :key="filter" type="button" class="h-6 rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:text-foreground" :class="{ 'bg-background text-foreground shadow-sm': objectFilter === filter }" @click="selectObjectFilter(filter)">
             {{ filterLabel(filter) }}
           </button>
         </div>
@@ -3399,17 +3420,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         <DropdownMenuCheckboxItem :model-value="settingsStore.editorSettings.objectBrowserShowCheckbox" @select.prevent @update:model-value="toggleCheckboxColumn()">{{ t("objects.toggleCheckbox") }}</DropdownMenuCheckboxItem>
         <template v-if="showObjectFilter && toolbarTier >= 2">
           <DropdownMenuSeparator />
-          <DropdownMenuCheckboxItem
-            v-for="filter in objectFilters"
-            :key="filter"
-            :model-value="objectFilter === filter"
-            @select.prevent
-            @update:model-value="
-              userHasSelectedFilter = true;
-              objectFilter = filter;
-            "
-            >{{ filterLabel(filter) }}</DropdownMenuCheckboxItem
-          >
+          <DropdownMenuCheckboxItem v-for="filter in objectFilters" :key="filter" :model-value="objectFilter === filter" @select.prevent @update:model-value="selectObjectFilter(filter)">{{ filterLabel(filter) }}</DropdownMenuCheckboxItem>
         </template>
       </ToolbarOverflowMenu>
     </div>

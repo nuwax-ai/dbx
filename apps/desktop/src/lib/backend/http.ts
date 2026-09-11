@@ -77,6 +77,7 @@ import type {
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
+  DownloadedUpdate,
   UpdateDownloadSource,
   RedisCollectionPage,
   RedisDatabaseInfo,
@@ -120,6 +121,7 @@ import type {
   HistoryConnectionOption,
   SqlFileRequest,
   SqlFilePreview,
+  SqlFileTable,
   SqlFileProgress,
   TransferRequest,
   TransferProgress,
@@ -2251,6 +2253,10 @@ export async function executeSqlFile(request: SqlFileRequest): Promise<void> {
   return post("/api/sql-file/execute", { request });
 }
 
+export async function inspectSqlFileTables(filePath: string): Promise<SqlFileTable[]> {
+  return post("/api/sql-file/tables", { filePath });
+}
+
 export async function executeSqlFiles(request: SqlFileRequest, filePaths: string[]): Promise<void> {
   return post("/api/sql-file/execute", { request, filePaths });
 }
@@ -2988,8 +2994,8 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   });
 }
 
-export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
-  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`));
+export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
+  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}&monitor=${monitor}`));
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
@@ -3862,7 +3868,7 @@ export async function mongoCloneCollection(connectionId: string, database: strin
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
   const collections = await documentListCollections(connectionId, "default");
-  return collections.map((c) => c.name);
+  return [...new Set(collections.flatMap((collection) => [collection.name, ...(collection.aliases ?? [])].filter((name) => name.trim())))];
 }
 
 /** Lists every Meilisearch index visible to the current connection credentials. */
@@ -4482,13 +4488,19 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
 }
 
-export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion: string, _attemptId: string, _releaseNotes?: string): Promise<DownloadedUpdate> {
   throw new Error("In-app update downloads are only available in the desktop app.");
 }
 
 export async function cancelUpdateDownload(): Promise<void> {}
 
-export async function installDownloadedUpdate(): Promise<void> {
+export async function getDownloadedUpdate(): Promise<DownloadedUpdate | null> {
+  return null;
+}
+
+export async function discardDownloadedUpdate(_cacheId: string): Promise<void> {}
+
+export async function installDownloadedUpdate(_cacheId: string, _expectedVersion: string): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
 }
 

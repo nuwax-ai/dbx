@@ -2,16 +2,18 @@
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, Package, FileDown, FolderTree } from "@lucide/vue";
+import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, FolderTree } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
+import ToolbarUpdateIcon from "@/components/layout/ToolbarUpdateIcon.vue";
 import { MAC_TRAFFIC_LIGHT_X, macTrafficLightInsetPaddingForScale, shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 const props = defineProps<{
+  showSidebarExpand?: boolean;
   showAiPanel: boolean;
   activeAiRunCount: number;
   /** Runs awaiting a write confirmation; the badge turns amber to outrank the
@@ -23,6 +25,13 @@ const props = defineProps<{
   showSqlFilePanel: boolean;
   showDriverStore: boolean;
   showSettingsPage: boolean;
+  checkingUpdates: boolean;
+  updateVersion?: string;
+  hasUpdateAvailable: boolean;
+  isDownloadingUpdate: boolean;
+  downloadProgress: number | null;
+  updateReadyToInstall: boolean;
+  updateReady: boolean;
   agentDriverUpdateCount: number;
   hasMcpUpdateAvailable: boolean;
   hasConnections: boolean;
@@ -30,6 +39,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  "expand-sidebar": [];
   "new-connection": [];
   "new-query": [];
   "toggle-ai": [];
@@ -38,6 +48,7 @@ const emit = defineEmits<{
   "toggle-sql-file-panel": [];
   "open-settings": [];
   "open-driver-store": [];
+  "check-updates": [];
   "open-transfer": [];
   "open-sql-file": [];
   "open-schema-diff": [];
@@ -48,6 +59,14 @@ const { t } = useI18n();
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
+// The in-app updater misbehaves in this fork's Docker deployment; keep its toolbar entries hidden.
+const UPDATER_ENABLED = false;
+const updateTooltip = computed(() => {
+  if (props.hasUpdateAvailable && props.updateReady) return t("updates.restartRequiredTooltip");
+  if (props.hasUpdateAvailable && props.updateReadyToInstall) return t("updates.downloadedReady", { version: props.updateVersion ?? "" });
+  return t("updates.check");
+});
+
 const sqlLibrarySaveFeedbackActive = ref(false);
 const SQL_LIBRARY_BOOKMARK_PATH = "M10 2 L10 10 L13 7 L16 10 L16 2";
 const SQL_LIBRARY_CHECK_PATH = "M9 9.5 L9 9.5 L11 11.5 L15 7.5 L15 7.5";
@@ -133,6 +152,15 @@ const collapsibleRightItemDefs = computed(() => {
     disabled: boolean;
   }
   const items: ItemDef[] = [];
+  if (UPDATER_ENABLED && toolbarItems.value.checkUpdates) {
+    items.push({
+      key: "checkUpdates",
+      label: t("updates.check"),
+      icon: CloudDownload,
+      action: () => emit("check-updates"),
+      disabled: false,
+    });
+  }
   items.push({
     key: "exportProgress",
     label: t("exportProgress.tooltip"),
@@ -295,6 +323,11 @@ function handleWindowResize() {
 
 watch(collapsibleRightItemDefs, () => scheduleToolbarLayout(), { flush: "post" });
 watch(
+  () => props.showSidebarExpand,
+  () => scheduleToolbarLayout(),
+  { flush: "post" },
+);
+watch(
   () => settingsStore.editorSettings.uiScale,
   () => {
     measuredTrafficLightInset.value = null;
@@ -449,6 +482,14 @@ const toolbarStyle = computed(() => {
 
 <template>
   <div ref="toolbarEl" class="app-toolbar h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :style="toolbarStyle" data-tauri-drag-region @dblclick="onToolbarDblClick">
+    <Tooltip v-if="showSidebarExpand">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('sidebar.expand')" @click="emit('expand-sidebar')">
+          <ChevronsRight class="h-4 w-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ t("sidebar.expand") }}</TooltipContent>
+    </Tooltip>
     <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-connection')">
       <span class="inline-flex items-center gap-1">
         <DatabaseZap class="h-3.5 w-3.5" />
@@ -509,6 +550,18 @@ const toolbarStyle = computed(() => {
 
     <!-- Right-side items wrapped in overflow-aware container -->
     <div ref="rightWrapper" class="flex min-w-0 items-center gap-1 overflow-hidden">
+      <template v-if="UPDATER_ENABLED && toolbarItems.checkUpdates">
+        <Tooltip>
+          <TooltipTrigger as-child>
+            <Button v-show="isRightItemVisible('checkUpdates')" data-toolbar-update-trigger variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" @click="emit('check-updates')">
+              <ToolbarUpdateIcon />
+              <span v-if="hasUpdateAvailable" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{{ updateTooltip }}</TooltipContent>
+        </Tooltip>
+      </template>
+
       <div v-show="isRightItemVisible('exportProgress')" class="contents">
         <ExportProgressPopover />
       </div>

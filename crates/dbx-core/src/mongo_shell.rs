@@ -1,5 +1,8 @@
+use chrono::{SecondsFormat, Utc};
+use mongodb::bson::oid::ObjectId;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind")]
@@ -732,6 +735,21 @@ fn trim_mongo_outer_comments(mut source: &str) -> &str {
 }
 
 fn parse_collection_prefix(source: &str) -> Result<(String, usize), String> {
+    // db["orders-2024"] reaches names that are not valid identifiers, the same way the shell does.
+    if source.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("db[")) {
+        let close = matching_bracket(source, 2).ok_or("Invalid db[\"collection\"] accessor.")?;
+        let collection = parse_string_arg(source[3..close].trim())?;
+        if collection.is_empty() {
+            return Err("Invalid MongoDB collection name.".to_string());
+        }
+        let end = close + 1;
+        let suffix = &source[end..];
+        let trimmed = suffix.trim_start();
+        if !trimmed.starts_with('.') {
+            return Err("MongoDB collection method is required.".to_string());
+        }
+        return Ok((collection, end + suffix.len() - trimmed.len()));
+    }
     if !source.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("db.")) {
         return Err("MongoDB command must start with db.<collection>.".to_string());
     }
@@ -1045,6 +1063,23 @@ fn is_shell_regex_value_prefix(previous_significant: Option<char>) -> bool {
     previous_significant.is_none_or(|character| matches!(character, ':' | '[' | ',' | '('))
 }
 
+/// Shell value constructors rewritten to extended JSON before json5 parsing.
+/// `Date` is only recognised after `new`, matching the shell where a bare `Date()`
+/// returns a string rather than a date.
+const SHELL_CONSTRUCTORS: [&str; 11] = [
+    "ObjectId",
+    "ISODate",
+    "Date",
+    "NumberLong",
+    "NumberInt",
+    "NumberDecimal",
+    "UUID",
+    "BinData",
+    "Timestamp",
+    "MinKey",
+    "MaxKey",
+];
+
 fn transform_shell_constructors(input: &str) -> Result<String, String> {
     let mut output = String::with_capacity(input.len());
     let mut index = 0;
@@ -1069,27 +1104,167 @@ fn transform_shell_constructors(input: &str) -> Result<String, String> {
             output.push_str(&input[start..index]);
             continue;
         }
-        let constructor = if rest.starts_with("ObjectId(") {
-            Some("ObjectId(")
-        } else if rest.starts_with("ISODate(") {
-            Some("ISODate(")
-        } else {
-            None
-        };
-        let Some(constructor) = constructor else {
-            output.push(ch);
-            index += ch.len_utf8();
+        if let Some((json, end)) = shell_constructor_call(input, index)? {
+            output.push_str(&json);
+            index = end;
             continue;
-        };
-        let open = index + constructor.len() - 1;
-        let close = matching_paren(input, open).ok_or("Unclosed MongoDB value constructor.")?;
-        let inner = input[open + 1..close].trim();
-        let value = parse_string_arg(inner)?;
-        let key = if constructor.starts_with("ObjectId") { "$oid" } else { "$date" };
-        output.push_str(&format!("{{\"{key}\":{}}}", serde_json::to_string(&value).unwrap()));
-        index = close + 1;
+        }
+        if let Some((json, end)) = shell_bare_constant(input, index) {
+            output.push_str(&json);
+            index = end;
+            continue;
+        }
+        output.push(ch);
+        index += ch.len_utf8();
     }
     Ok(output)
+}
+
+/// Rewrite a bare `MinKey` / `MaxKey` at `index`, as in `{ $lt: MaxKey }`.
+/// A following `:` means it is an object key, not a value.
+fn shell_bare_constant(input: &str, index: usize) -> Option<(String, usize)> {
+    if input[..index].ends_with(|ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.')) {
+        return None;
+    }
+    let rest = &input[index..];
+    let name = ["MinKey", "MaxKey"].into_iter().find(|name| rest.starts_with(name))?;
+    let after = &rest[name.len()..];
+    if after.starts_with(|ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$')) {
+        return None;
+    }
+    if after.trim_start().starts_with([':', '(']) {
+        return None;
+    }
+    Some((key_constant_json(name), index + name.len()))
+}
+
+fn key_constant_json(name: &str) -> String {
+    if name == "MinKey" {
+        r#"{"$minKey":1}"#.to_string()
+    } else {
+        r#"{"$maxKey":1}"#.to_string()
+    }
+}
+
+/// Rewrite one `Name(...)` / `new Name(...)` call at `index`, or None when it is not a known constructor.
+fn shell_constructor_call(input: &str, index: usize) -> Result<Option<(String, usize)>, String> {
+    let rest = &input[index..];
+    let (name_start, is_new) = match rest.strip_prefix("new") {
+        Some(after) if after.starts_with(|ch: char| ch.is_whitespace()) => {
+            (index + 3 + after.len() - after.trim_start().len(), true)
+        }
+        _ => (index, false),
+    };
+    let name_len = input[name_start..]
+        .find(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '$')
+        .unwrap_or(input.len() - name_start);
+    let name = &input[name_start..name_start + name_len];
+    if !SHELL_CONSTRUCTORS.contains(&name) {
+        return Ok(None);
+    }
+    if name == "Date" && !is_new {
+        return Ok(None);
+    }
+    let after_name = &input[name_start + name_len..];
+    let paren_offset = after_name.len() - after_name.trim_start().len();
+    if !after_name[paren_offset..].starts_with('(') {
+        return Ok(None);
+    }
+    let open = name_start + name_len + paren_offset;
+    let close = matching_paren(input, open).ok_or("Unclosed MongoDB value constructor.")?;
+    let inner = input[open + 1..close].trim();
+    Ok(Some((shell_constructor_to_extended_json(name, inner)?, close + 1)))
+}
+
+fn shell_constructor_to_extended_json(name: &str, inner: &str) -> Result<String, String> {
+    if matches!(name, "BinData" | "Timestamp") {
+        return two_argument_constructor_to_extended_json(name, inner);
+    }
+    let integer = inner.parse::<i64>().ok();
+    match name {
+        "MinKey" | "MaxKey" if inner.is_empty() => Ok(key_constant_json(name)),
+        "MinKey" | "MaxKey" => Err(format!("MongoDB {name}() takes no arguments.")),
+        "UUID" if inner.is_empty() => Ok(extended_json("$uuid", &Uuid::new_v4().to_string())),
+        "UUID" => Ok(extended_json("$uuid", &parse_uuid_arg(inner)?)),
+        "ObjectId" if inner.is_empty() => Ok(extended_json("$oid", &ObjectId::new().to_hex())),
+        "ObjectId" => Ok(extended_json("$oid", &parse_string_arg(inner)?)),
+        "ISODate" | "Date" if inner.is_empty() => {
+            Ok(extended_json("$date", &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)))
+        }
+        // `new Date(1735689600000)` takes epoch milliseconds, which extended JSON
+        // carries as a nested $numberLong rather than a bare number.
+        "ISODate" | "Date" => match integer {
+            Some(millis) => Ok(format!(r#"{{"$date":{{"$numberLong":"{millis}"}}}}"#)),
+            None => Ok(extended_json("$date", &parse_string_arg(inner)?)),
+        },
+        "NumberLong" | "NumberInt" => {
+            let key = if name == "NumberLong" { "$numberLong" } else { "$numberInt" };
+            let value = match integer {
+                Some(value) => value.to_string(),
+                None => parse_string_arg(inner)?,
+            };
+            value.parse::<i64>().map_err(|_| format!("MongoDB {name}() requires an integer argument."))?;
+            Ok(extended_json(key, &value))
+        }
+        "NumberDecimal" => {
+            let value = match parse_json_value(inner) {
+                Some(Value::Number(number)) => number.to_string(),
+                _ => parse_string_arg(inner)?,
+            };
+            value.parse::<f64>().map_err(|_| "MongoDB NumberDecimal() requires a numeric argument.".to_string())?;
+            Ok(extended_json("$numberDecimal", &value))
+        }
+        _ => Err(format!("Unsupported MongoDB value constructor {name}().")),
+    }
+}
+
+/// `UUID("...")` takes the canonical 8-4-4-4-12 hex form, matching mongosh
+/// (hex digits only, dashes required, upper or lower case).
+fn parse_uuid_arg(arg: &str) -> Result<String, String> {
+    let value = parse_string_arg(arg)?;
+    if is_canonical_uuid(&value) {
+        Ok(value)
+    } else {
+        Err("MongoDB UUID() requires a canonical 8-4-4-4-12 hex string.".to_string())
+    }
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn two_argument_constructor_to_extended_json(name: &str, inner: &str) -> Result<String, String> {
+    let args = split_top_level(inner);
+    if args.len() != 2 {
+        return Err(format!("MongoDB {name}() requires exactly two arguments."));
+    }
+    if name == "Timestamp" {
+        // Timestamp(t, i): two unsigned 32-bit integers, seconds and ordinal.
+        let parse = |value: &str| value.trim().parse::<u32>();
+        return match (parse(&args[0]), parse(&args[1])) {
+            (Ok(seconds), Ok(ordinal)) => Ok(format!(r#"{{"$timestamp":{{"t":{seconds},"i":{ordinal}}}}}"#)),
+            _ => Err("MongoDB Timestamp() requires two unsigned 32-bit integers.".to_string()),
+        };
+    }
+    // BinData(subType, base64): extended JSON carries the subtype as two hex digits.
+    let sub_type = args[0]
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| "MongoDB BinData() subtype must be an integer from 0 to 255.".to_string())?;
+    let base64 = parse_string_arg(&args[1])?;
+    Ok(format!(
+        r#"{{"$binary":{{"base64":{},"subType":"{sub_type:02x}"}}}}"#,
+        serde_json::to_string(&base64).unwrap_or_else(|_| "null".to_string())
+    ))
+}
+
+fn extended_json(key: &str, value: &str) -> String {
+    format!("{{\"{key}\":{}}}", serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
 }
 
 fn parse_json_value(value: &str) -> Option<Value> {
@@ -1184,6 +1359,43 @@ fn matching_paren(source: &str, open: usize) -> Option<usize> {
         } else if ch == '(' {
             depth += 1;
         } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+/// Offset of the `]` closing the bracket at `open`, ignoring brackets inside strings.
+fn matching_bracket(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut quote = None;
+    let mut escape = false;
+    let mut index = open;
+    while index < source.len() {
+        let ch = source[index..].chars().next()?;
+        if escape {
+            escape = false;
+            index += ch.len_utf8();
+            continue;
+        }
+        if quote.is_some() {
+            if ch == '\\' {
+                escape = true;
+            } else if Some(ch) == quote {
+                quote = None;
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '[' {
+            depth += 1;
+        } else if ch == ']' {
             depth -= 1;
             if depth == 0 {
                 return Some(index);
@@ -1313,6 +1525,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_bracket_collection_accessor() {
+        assert_eq!(
+            parse(r#"db["orders-2024"].find({a: 1})"#).unwrap(),
+            MongoCommand::Find {
+                collection: "orders-2024".to_string(),
+                filter: r#"{"a":1}"#.to_string(),
+                projection: None,
+                sort: None,
+                collation: None,
+                skip: 0,
+                limit: 100,
+            }
+        );
+
+        // Single quotes, a dotted name, and a chained method all behave like db.<name>.
+        assert_eq!(
+            parse("db['audit.logs'].count()").unwrap(),
+            MongoCommand::Count { collection: "audit.logs".to_string(), filter: "{}".to_string(), accurate: false }
+        );
+        assert!(matches!(
+            parse(r#"db["orders-2024"].updateOne({a: 1}, {$set: {b: 2}}, {upsert: true})"#).unwrap(),
+            MongoCommand::Update { many: false, .. }
+        ));
+
+        for source in [r#"db[].find({})"#, r#"db[""].find({})"#, r#"db["x"]find({})"#, r#"db["x"]"#] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn parses_get_collection_and_count() {
         assert_eq!(
             parse("db.getCollection('audit.logs').count()").unwrap(),
@@ -1375,6 +1617,141 @@ mod tests {
         assert_eq!(validate_safety(&command, false, false, false), Err(MongoSafetyError::WritesDisabled));
         assert_eq!(validate_safety(&command, true, false, false), Err(MongoSafetyError::Dangerous));
         assert_eq!(validate_safety(&command, true, true, false), Ok(()));
+    }
+
+    #[test]
+    fn fills_in_zero_argument_value_constructors() {
+        let MongoCommand::Update { update, filter, options, .. } = parse(
+            r#"db.reports.updateOne(
+                {phone_number: "+84905421172", code: "VN"},
+                {$set: {type: ObjectId("5bbc28701f3fd80f00e0211c"), created_at: new Date(), updated_at: ISODate()}},
+                {upsert: true}
+            )"#,
+        )
+        .unwrap() else {
+            panic!("expected an update command");
+        };
+        assert_eq!(filter, r#"{"phone_number":"+84905421172","code":"VN"}"#);
+        assert_eq!(options.as_deref(), Some(r#"{"upsert":true}"#));
+
+        let set = &parse_json_value(&update).unwrap()["$set"];
+        assert_eq!(set["type"]["$oid"], "5bbc28701f3fd80f00e0211c");
+        for field in ["created_at", "updated_at"] {
+            let filled = set[field]["$date"].as_str().expect("filled-in date");
+            let filled = chrono::DateTime::parse_from_rfc3339(filled).expect("rfc3339 date");
+            assert!(
+                (Utc::now() - filled.with_timezone(&Utc)).num_seconds().abs() < 60,
+                "{field} is not the current time"
+            );
+        }
+
+        let MongoCommand::Find { filter, .. } = parse("db.reports.find({_id: ObjectId()})").unwrap() else {
+            panic!("expected a find command");
+        };
+        let oid = parse_json_value(&filter).unwrap()["_id"]["$oid"].as_str().unwrap().to_string();
+        assert!(oid.len() == 24 && oid.chars().all(|ch| ch.is_ascii_hexdigit()), "{oid}");
+    }
+
+    #[test]
+    fn rewrites_epoch_millisecond_and_numeric_value_constructors() {
+        let MongoCommand::Find { filter, .. } =
+            parse(r#"db.orders.find({at: new Date(1735689600000), qty: NumberInt(3), sequence: NumberLong("9223372036854775807"), total: NumberDecimal("12.34")})"#)
+                .unwrap()
+        else {
+            panic!("expected a find command");
+        };
+        assert_eq!(
+            filter,
+            r#"{"at":{"$date":{"$numberLong":"1735689600000"}},"qty":{"$numberInt":"3"},"sequence":{"$numberLong":"9223372036854775807"},"total":{"$numberDecimal":"12.34"}}"#
+        );
+    }
+
+    #[test]
+    fn rewrites_uuid_binary_timestamp_and_key_constants() {
+        let MongoCommand::Find { filter, .. } = parse(
+            r#"db.c.find({
+                u: UUID("3b241101-e2bb-4255-8caf-4136c566a962"),
+                b: BinData(128, "AQID"),
+                t: Timestamp(1735689600, 7),
+                lo: MinKey,
+                hi: MaxKey(),
+                range: {$gt: MinKey(), $lt: MaxKey},
+                list: [MinKey, MaxKey]
+            })"#,
+        )
+        .unwrap() else {
+            panic!("expected a find command");
+        };
+        assert_eq!(
+            parse_json_value(&filter).unwrap(),
+            serde_json::json!({
+                "u": {"$uuid": "3b241101-e2bb-4255-8caf-4136c566a962"},
+                "b": {"$binary": {"base64": "AQID", "subType": "80"}},
+                "t": {"$timestamp": {"t": 1735689600, "i": 7}},
+                "lo": {"$minKey": 1},
+                "hi": {"$maxKey": 1},
+                "range": {"$gt": {"$minKey": 1}, "$lt": {"$maxKey": 1}},
+                "list": [{"$minKey": 1}, {"$maxKey": 1}],
+            })
+        );
+
+        let MongoCommand::Find { filter, .. } = parse("db.c.find({u: UUID()})").unwrap() else {
+            panic!("expected a find command");
+        };
+        let generated = parse_json_value(&filter).unwrap()["u"]["$uuid"].as_str().unwrap().to_string();
+        assert!(Uuid::parse_str(&generated).is_ok(), "{generated}");
+    }
+
+    #[test]
+    fn leaves_key_constant_names_alone_outside_value_positions() {
+        let MongoCommand::Find { filter, .. } =
+            parse(r#"db.c.find({MinKey: 1, MaxKey: 2, label: "MinKey", nested: {MaxKey: true}})"#).unwrap()
+        else {
+            panic!("expected a find command");
+        };
+        assert_eq!(filter, r#"{"MinKey":1,"MaxKey":2,"label":"MinKey","nested":{"MaxKey":true}}"#);
+    }
+
+    #[test]
+    fn rejects_malformed_uuid_binary_timestamp_and_key_constants() {
+        for (source, expected) in [
+            (r#"db.c.find({b: BinData(256, "x")})"#, "BinData"),
+            (r#"db.c.find({b: BinData(0)})"#, "BinData"),
+            (r#"db.c.find({b: BinData("00", "x")})"#, "BinData"),
+            (r#"db.c.find({t: Timestamp(1)})"#, "Timestamp"),
+            (r#"db.c.find({t: Timestamp(-1, 0)})"#, "Timestamp"),
+            (r#"db.c.find({t: Timestamp(4294967296, 0)})"#, "Timestamp"),
+            (r#"db.c.find({u: UUID(1)})"#, "string"),
+            (r#"db.c.find({a: MinKey(1)})"#, "MinKey"),
+            (r#"db.c.find({a: MaxKey("x")})"#, "MaxKey"),
+        ] {
+            let error = parse(source).unwrap_err();
+            assert!(error.contains(expected), "{source} => {error}");
+        }
+    }
+
+    #[test]
+    fn validates_uuid_strings_at_parse_time() {
+        // mongosh requires the canonical 8-4-4-4-12 hex form: dashes at fixed
+        // positions, hex digits elsewhere, upper or lower case.
+        for source in [
+            r#"db.c.find({u: UUID("3b241101e2bb42558caf4136c566a962")})"#,
+            r#"db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a96")})"#,
+            r#"db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a9620")})"#,
+            r#"db.c.find({u: UUID("zb241101-e2bb-4255-8caf-4136c566a962")})"#,
+            r#"db.c.find({u: UUID("3b241101_e2bb_4255_8caf_4136c566a962")})"#,
+        ] {
+            let error = parse(source).unwrap_err();
+            assert!(error.contains("UUID() requires"), "{source} => {error}");
+        }
+
+        // Upper-case hex is accepted and preserved verbatim.
+        let MongoCommand::Find { filter, .. } =
+            parse(r#"db.c.find({u: UUID("3B241101-E2BB-4255-8CAF-4136C566A962")})"#).unwrap()
+        else {
+            panic!("expected a find command");
+        };
+        assert_eq!(filter, r#"{"u":{"$uuid":"3B241101-E2BB-4255-8CAF-4136C566A962"}}"#);
     }
 
     #[test]

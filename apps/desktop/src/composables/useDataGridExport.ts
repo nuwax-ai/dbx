@@ -15,7 +15,7 @@ import { copyToClipboard } from "@/lib/common/clipboard";
 import { clearDataGridClipboardCopy, rememberDataGridClipboardCopy } from "@/lib/dataGrid/dataGridClipboard";
 import { buildDataGridCopyInsertStatement, type DataGridCopyInsertMode, type DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
 import { formatSqlInsert, formatTsv } from "@/lib/export/exportFormats";
-import { showSqlInsertModeDialog, type SqlInsertMode } from "@/lib/export/sqlInsertMode";
+import { showSqlInsertModeDialog, type SqlExportOptions, type SqlInsertMode } from "@/lib/export/sqlInsertMode";
 import { summarizeExportRows } from "@/lib/export/exportDiagnostics";
 import { appendDebugLog, appendNativeProcessMemoryLog, getBrowserMemorySnapshot, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { uuid } from "@/lib/common/utils";
@@ -84,6 +84,8 @@ export interface UseDataGridExportOptions {
   mongoUpdateTarget?: ComputedRef<MongoCopyUpdateTarget | undefined>;
   databaseType: ComputedRef<DatabaseType | undefined>;
   displayValue?: (value: CellValue, columnIndex: number) => string;
+  cellClipboardText?: (value: CellValue, columnIndex: number) => string | undefined;
+  externalCellValue?: (value: CellValue, columnIndex: number) => CellValue;
   identifierQuote?: ComputedRef<string | undefined>;
   connectionId: ComputedRef<string | undefined>;
   database: ComputedRef<string | undefined>;
@@ -355,7 +357,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       const document = documents[rowIndex];
       if (!document || typeof document !== "object" || Array.isArray(document)) return row;
       const source = document as Record<string, unknown>;
-      return columnsToExport.map((column, columnIndex) => (Object.prototype.hasOwnProperty.call(source, column) ? (source[column] as CellValue) : (row[columnIndex] ?? null)));
+      return columnsToExport.map((column) => (Object.prototype.hasOwnProperty.call(source, column) ? (source[column] as CellValue) : null));
     });
   }
 
@@ -364,6 +366,11 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       const document = rowToJsonObject(item);
       return columns.value.map((column) => (document[column] as CellValue) ?? null);
     });
+  }
+
+  function externalizeRows(rows: CellValue[][]): CellValue[][] {
+    if (!options.externalCellValue) return rows;
+    return rows.map((row) => row.map((value, columnIndex) => options.externalCellValue!(value, columnIndex)));
   }
 
   async function resultToExport(
@@ -386,7 +393,14 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       if (result) {
         const columnComments = buildXlsxHeaderOverrides(result.columns, commentsForExportColumns(result.columns), headerMode);
         return {
-          ...applyGlobalDateTimeExportFormat({ columns: result.columns, columnTypes: result.column_types ?? [], rows: preserveMongoExtendedJson ? mongoDocumentRowsForJson(result.columns, result.rows, result.mongo_copy_documents) : result.rows }, formatDateTime && !preserveMongoExtendedJson),
+          ...applyGlobalDateTimeExportFormat(
+            // fullExportResult returns source rows, not the collection grid's
+            // marker-encoded rows. Applying externalCellValue here would
+            // mistake a real BSON string in the reserved namespace for a grid
+            // marker and corrupt the exported value.
+            { columns: result.columns, columnTypes: result.column_types ?? [], rows: preserveMongoExtendedJson ? mongoDocumentRowsForJson(result.columns, result.rows, result.mongo_copy_documents) : result.rows },
+            formatDateTime && !preserveMongoExtendedJson,
+          ),
           columnComments,
           spatialColumns: result.spatial_columns,
           spatialValues: result.spatial_values,
@@ -403,7 +417,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       const columnComments = buildXlsxHeaderOverrides(normalized.columns, normalized.columnComments, headerMode);
       return {
         ...applyGlobalDateTimeExportFormat(
-          { columns: normalized.columns, columnTypes: normalized.columnTypes, rows: preserveMongoExtendedJson ? mongoDocumentRowsForJson(normalized.columns, normalized.rows, normalized.mongoCopyDocuments) : normalized.rows },
+          { columns: normalized.columns, columnTypes: normalized.columnTypes, rows: preserveMongoExtendedJson ? mongoDocumentRowsForJson(normalized.columns, normalized.rows, normalized.mongoCopyDocuments) : externalizeRows(normalized.rows) },
           formatDateTime && !preserveMongoExtendedJson,
         ),
         columnComments,
@@ -421,7 +435,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         {
           columns: columns.value,
           columnTypes: (columnTypes.value ?? []).map((type) => type ?? ""),
-          rows: preserveMongoExtendedJson && databaseType.value === "mongodb" ? mongoLocalRowsForJson(exportItems) : exportItems.map((item) => item.data),
+          rows: preserveMongoExtendedJson && databaseType.value === "mongodb" ? mongoLocalRowsForJson(exportItems) : externalizeRows(exportItems.map((item) => item.data)),
         },
         formatDateTime && !preserveMongoExtendedJson,
       ),
@@ -537,6 +551,11 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     return binaryCellClipboardText(value, columnTypes.value?.[columnIndex], databaseType.value) ?? value;
   }
 
+  function externalCellValue(value: CellValue, columnIndex: number): CellValue {
+    const externalValue = options.externalCellValue?.(value, columnIndex);
+    return externalValue === undefined ? value : externalValue;
+  }
+
   function rowToJsonObject(item: RowItem): Record<string, unknown> {
     if (options.databaseType.value === "mongodb" && item.sourceIndex !== undefined) {
       const original = options.mongoDocuments?.value?.[item.sourceIndex];
@@ -545,7 +564,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     }
     const obj: Record<string, unknown> = {};
     columns.value.forEach((col, i) => {
-      const value = binaryClipboardCellValue(item.data[i], i);
+      const value = externalCellValue(binaryClipboardCellValue(item.data[i], i), i);
       if (typeof value === "string" && columnTypes.value?.[i]?.trim().toLowerCase() === "json") {
         try {
           obj[col] = JSON.parse(value);
@@ -577,7 +596,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     const [resolvedItem] = await resolveVisibleRowValues([item], [sourceIndex]);
     const val = resolvedItem?.data[contextCell.value.col] ?? null;
     // 外部剪贴板呈现文本型 MySQL VARBINARY（NULL 也按空串输出）；内部网格副本仍保留原 hex，保证回粘无损。
-    const rawValue = clipboardCellValue(binaryClipboardCellValue(val, contextCell.value.col));
+    const rawValue = options.cellClipboardText?.(val, sourceIndex) ?? clipboardCellValue(binaryClipboardCellValue(val, contextCell.value.col));
     const copyValue = options.databaseType.value === "oracle" && isTemporalColumnType(options.columnTypes.value?.[contextCell.value.col]) ? (options.displayValue?.(val, sourceIndex) ?? rawValue) : rawValue;
     await copyText(copyValue, { rows: [[val]] });
   }
@@ -716,6 +735,10 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     buildMongoInsert: buildMongoExtractorInsert,
     buildMongoUpdate: buildMongoExtractorUpdate,
     canBuildMongoUpdate: canBuildMongoExtractorUpdate,
+    externalCellValue: (value, columnIndex) => {
+      const externalValue = options.externalCellValue?.(value as CellValue, columnIndex);
+      return externalValue === undefined ? value : externalValue;
+    },
     contextCell,
     contextSelectionIsSynthetic,
   });
@@ -723,7 +746,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   async function copyAll() {
     const rows = (await resolveVisibleRowValues(displayItems.value.filter((item) => !item.isDraft))).map((item) => item.data);
     // formatTsv 引用处理解码后文本中可能出现的制表符/换行；内部副本仍用原始 rows（hex）保证回粘无损。
-    const decodedRows = rows.map((row) => row.map((cell, index) => binaryClipboardCellValue(cell, index)));
+    const decodedRows = rows.map((row) => row.map((cell, index) => externalCellValue(binaryClipboardCellValue(cell, index), index)));
     await copyText(formatTsv(columns.value, decodedRows), { rows, header: columns.value });
   }
 
@@ -1141,7 +1164,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     await exportAllResultsXlsxResult(true);
   }
 
-  async function exportFullTableDataViaBackend(format: "csv" | "xlsx" | "json" | "markdown" | "sql" | "txt", rowIds?: number[], headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode?: SqlInsertMode): Promise<boolean> {
+  async function exportFullTableDataViaBackend(format: "csv" | "xlsx" | "json" | "markdown" | "sql" | "txt", rowIds?: number[], headerMode: XlsxHeaderMode = "name", autoFilter = true, sqlExportOptions?: SqlExportOptions): Promise<boolean> {
     const meta = tableMeta.value;
     // The backend table exporter currently builds two-part table names. External
     // Doris/StarRocks catalogs need the data-tab paginator's three-part SQL.
@@ -1150,8 +1173,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     }
 
     const fmt = FORMAT_META[format];
-    const extension = fmt?.ext ?? format;
-    const filterName = fmt?.label ?? format.toUpperCase();
+    const splitSqlOutput = format === "sql" && sqlExportOptions?.splitMaxMb !== undefined;
+    const extension = splitSqlOutput ? "zip" : (fmt?.ext ?? format);
+    const filterName = splitSqlOutput ? "ZIP" : (fmt?.label ?? format.toUpperCase());
     let outputPath = exportFileName(meta.tableName || "export", extension, { preferFallback: true });
     if (isTauriRuntime()) {
       const { save } = await import("@tauri-apps/plugin-dialog");
@@ -1200,7 +1224,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
           tableName: meta.tableName,
           filePath: outputPath,
           format,
-          ...(format === "sql" && insertMode ? { insertMode } : {}),
+          ...(format === "sql" && sqlExportOptions ? { insertMode: sqlExportOptions.insertMode, splitMaxMb: sqlExportOptions.splitMaxMb } : {}),
           csvQuoteMode: editorSettings.csvQuoteMode,
           columns: columns.value,
           columnTypes: columnTypes.value,
@@ -1386,16 +1410,18 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         },
         true,
       );
-      const insertMode = await showSqlInsertModeDialog();
-      if (insertMode === null) {
+      const selectedSqlExportOptions = (await showSqlInsertModeDialog({ allowSplit: rowIds === undefined && context.value === "table-data" })) as SqlExportOptions | SqlInsertMode | null;
+      if (selectedSqlExportOptions === null) {
         logExportStage("cancelled", { stage: "insert-mode-dialog" });
         return;
       }
-      logExportStage("mode-selected", { insertMode });
+      const sqlExportOptions = typeof selectedSqlExportOptions === "string" ? { insertMode: selectedSqlExportOptions } : selectedSqlExportOptions;
+      const insertMode = sqlExportOptions.insertMode;
+      logExportStage("mode-selected", { insertMode, splitMaxMb: sqlExportOptions.splitMaxMb });
       try {
         // Step 1: table-data context — existing backend table export
         logExportStage("backend-export-start");
-        const handledByBackend = await exportFullTableDataViaBackend("sql", rowIds, "name", true, insertMode);
+        const handledByBackend = await exportFullTableDataViaBackend("sql", rowIds, "name", true, sqlExportOptions);
         logExportStage("backend-export-finished", { handledByBackend });
         if (handledByBackend) {
           logExportStage("done", { path: "backend" });
@@ -1467,8 +1493,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
 
   async function exportCurrentPageSql() {
     await runExclusiveExport(async () => {
-      const insertMode = await showSqlInsertModeDialog();
-      if (insertMode === null) return;
+      const selectedSqlExportOptions = (await showSqlInsertModeDialog()) as SqlExportOptions | SqlInsertMode | null;
+      if (selectedSqlExportOptions === null) return;
+      const insertMode = typeof selectedSqlExportOptions === "string" ? selectedSqlExportOptions : selectedSqlExportOptions.insertMode;
       try {
         const result = await resultToExport(undefined, undefined, false, false);
         const exportData = sqlInsertExportData(result);

@@ -804,6 +804,7 @@ export interface EditorSettings {
   dataGridExtractorOptions: DataGridExtractorOptions;
   dataGridExtractorOptionsMigrationVersion: number;
   resultRunDisplayMode: ResultRunDisplayMode;
+  defaultAutoKeepResults: boolean;
   multiStatementDefaultView: MultiStatementDefaultView;
   dataGridAutoTransposeSingleRow: boolean;
   dataGridCellDetailButtonVisible: boolean;
@@ -887,6 +888,7 @@ export interface ToolbarItems {
   sqlFile: boolean;
   schemaDiff: boolean;
   dataCompare: boolean;
+  checkUpdates: boolean;
   sqlLibrary: boolean;
   sqlFileTree: boolean;
   history: boolean;
@@ -900,6 +902,7 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   sqlFile: true,
   schemaDiff: true,
   dataCompare: true,
+  checkUpdates: true,
   sqlLibrary: true,
   sqlFileTree: true,
   history: true,
@@ -1034,6 +1037,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   dataGridExtractorOptions: normalizeDataGridExtractorOptions(DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS),
   dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
   resultRunDisplayMode: "tabs",
+  defaultAutoKeepResults: false,
   multiStatementDefaultView: "result",
   dataGridAutoTransposeSingleRow: false,
   dataGridCellDetailButtonVisible: true,
@@ -1348,6 +1352,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     sqlFile: items.sqlFile ?? defaults.sqlFile,
     schemaDiff: items.schemaDiff ?? defaults.schemaDiff,
     dataCompare: items.dataCompare ?? defaults.dataCompare,
+    checkUpdates: items.checkUpdates ?? defaults.checkUpdates,
     sqlLibrary: items.sqlLibrary ?? defaults.sqlLibrary,
     sqlFileTree: items.sqlFileTree ?? defaults.sqlFileTree,
     history: items.history ?? defaults.history,
@@ -1488,6 +1493,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     dataGridExtractorOptions,
     dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
     resultRunDisplayMode: normalizeResultRunDisplayMode(settings.resultRunDisplayMode),
+    defaultAutoKeepResults: settings.defaultAutoKeepResults === true,
     multiStatementDefaultView: normalizeMultiStatementDefaultView(settings.multiStatementDefaultView),
     dataGridAutoTransposeSingleRow: settings.dataGridAutoTransposeSingleRow === true,
     dataGridCellDetailButtonVisible: typeof settings.dataGridCellDetailButtonVisible === "boolean" ? settings.dataGridCellDetailButtonVisible : DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible,
@@ -2246,6 +2252,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.dataGridExtractorOptions !== undefined) editorSettings.value.dataGridExtractorOptions = normalizeDataGridExtractorOptions(partial.dataGridExtractorOptions);
     if (partial.dataGridExtractorOptionsMigrationVersion !== undefined) editorSettings.value.dataGridExtractorOptionsMigrationVersion = DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION;
     if (partial.resultRunDisplayMode !== undefined) editorSettings.value.resultRunDisplayMode = normalizeResultRunDisplayMode(partial.resultRunDisplayMode);
+    if (partial.defaultAutoKeepResults !== undefined) editorSettings.value.defaultAutoKeepResults = partial.defaultAutoKeepResults === true;
     if (partial.multiStatementDefaultView !== undefined) editorSettings.value.multiStatementDefaultView = normalizeMultiStatementDefaultView(partial.multiStatementDefaultView);
     if (partial.dataGridAutoTransposeSingleRow !== undefined) editorSettings.value.dataGridAutoTransposeSingleRow = partial.dataGridAutoTransposeSingleRow === true;
     if (partial.dataGridCellDetailButtonVisible !== undefined) editorSettings.value.dataGridCellDetailButtonVisible = typeof partial.dataGridCellDetailButtonVisible === "boolean" ? partial.dataGridCellDetailButtonVisible : DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
