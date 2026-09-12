@@ -109,6 +109,7 @@ pub enum PostgresColumnDefaultState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostgresTablePartitionLocalObjects {
     pub has_primary_key: bool,
+    pub unique_constraints: BTreeSet<String>,
     pub foreign_keys: BTreeSet<String>,
     pub indexes: BTreeSet<String>,
     /// CHECK constraints with a local definition on this partition, as
@@ -3693,6 +3694,9 @@ fn apply_partition_local_object_row(
 ) {
     match object_kind {
         "constraint" if object_type == "p" => entry.has_primary_key = true,
+        "constraint" if object_type == "u" && !object_name.is_empty() => {
+            entry.unique_constraints.insert(object_name);
+        }
         "constraint" if object_type == "f" && !object_name.is_empty() => {
             entry.foreign_keys.insert(object_name);
         }
@@ -4109,7 +4113,7 @@ async fn list_indexes_for_relations_with_sql(
             key_is_expression,
             column_opclasses: key_opclasses,
             key_options,
-            constraint_backed: false,
+            constraint_backed: pg_row_try_bool(row, 13).unwrap_or(false),
         });
     }
     Ok(result)
@@ -4136,7 +4140,8 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
-             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options \
+             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -4192,7 +4197,8 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                 AND a.attnum > 0 \
                ORDER BY pos.n \
              ) AS key_is_expression, \
-             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options \
+             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -4430,7 +4436,7 @@ fn postgres_table_partition_local_objects_for_relations_query_tiers() -> [&'stat
 fn postgres_table_partition_local_objects_for_relations_sql() -> &'static str {
     "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
      FROM pg_catalog.pg_constraint con \
-     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','f') \
+     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
      UNION ALL \
      SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
@@ -4469,7 +4475,7 @@ fn postgres_table_partition_local_objects_for_relations_sql() -> &'static str {
 fn postgres_table_partition_local_objects_for_relations_compat_sql() -> &'static str {
     "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
      FROM pg_catalog.pg_constraint con \
-     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','f') \
+     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
      UNION ALL \
      SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
      FROM pg_catalog.pg_constraint con \
@@ -4857,7 +4863,7 @@ fn postgres_table_partition_local_objects_sql() -> &'static str {
      FROM pg_catalog.pg_constraint con \
      JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-     WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p','f') \
+     WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
      UNION ALL \
      SELECT 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
@@ -7718,7 +7724,8 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
-             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options \
+             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -7773,7 +7780,8 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                 AND a.attnum > 0 \
                ORDER BY pos.n \
              ) AS key_is_expression, \
-             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options \
+             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -7907,7 +7915,7 @@ async fn list_indexes_with_sql(
                 key_is_expression,
                 column_opclasses: key_opclasses,
                 key_options,
-                constraint_backed: false,
+                constraint_backed: pg_row_try_bool(row, 12).unwrap_or(false),
             }
         })
         .collect())
@@ -11700,7 +11708,7 @@ mod tests {
         assert!(info_compat_sql.contains("c.relkind IN ('r','p','f')"));
         assert!(info_compat_sql.contains("LIMIT 1"));
         assert!(local_objects_sql.contains("row_to_json(con)->>'conparentid'"));
-        assert!(local_objects_sql.contains("con.contype IN ('p','f')"));
+        assert!(local_objects_sql.contains("con.contype IN ('p','u','f')"));
         assert!(local_objects_sql.contains("i.inhrelid = idx.oid"));
         assert!(local_objects_sql.contains("con.contype = 'c' AND con.conislocal"));
         assert!(!local_objects_sql.contains("con.coninhcount = 0"));
@@ -13077,6 +13085,8 @@ mod tests {
             postgres_indexes_for_relations_compat_sql(),
         ] {
             assert!(sql.contains("ix.indisunique AND ix.indisvalid"));
+            assert!(sql.contains("AS constraint_backed"));
+            assert!(sql.contains("con.conindid = i.oid"));
         }
     }
 

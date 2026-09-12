@@ -10373,6 +10373,113 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_table_ddl_preserves_named_unique_and_primary_constraints() {
+        let mut id = column("id", "bigint");
+        id.is_nullable = false;
+        id.is_primary_key = true;
+        let indexes = vec![
+            db::IndexInfo {
+                name: "pk_accounts".to_string(),
+                columns: vec!["id".to_string()],
+                is_unique: true,
+                is_primary: true,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: true,
+            },
+            db::IndexInfo {
+                name: "uq_accounts_code".to_string(),
+                columns: vec!["code".to_string()],
+                is_unique: true,
+                is_primary: false,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: true,
+            },
+            db::IndexInfo {
+                name: "idx_accounts_display_name".to_string(),
+                columns: vec!["display_name".to_string()],
+                is_unique: true,
+                is_primary: false,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: false,
+            },
+        ];
+        let constraints = vec![
+            db::ConstraintInfo {
+                name: "pk_accounts".to_string(),
+                constraint_type: "PRIMARY KEY".to_string(),
+                definition: "PRIMARY KEY (id)".to_string(),
+                columns: vec!["id".to_string()],
+                ref_schema: None,
+                ref_table: None,
+                ref_columns: Vec::new(),
+                match_type: None,
+                on_update: None,
+                on_delete: None,
+                deferrable: false,
+                initially_deferred: false,
+                enabled: true,
+                valid: true,
+            },
+            db::ConstraintInfo {
+                name: "uq_accounts_code".to_string(),
+                constraint_type: "UNIQUE".to_string(),
+                definition: "UNIQUE (code) DEFERRABLE INITIALLY DEFERRED".to_string(),
+                columns: vec!["code".to_string()],
+                ref_schema: None,
+                ref_table: None,
+                ref_columns: Vec::new(),
+                match_type: None,
+                on_update: None,
+                on_delete: None,
+                deferrable: true,
+                initially_deferred: true,
+                enabled: true,
+                valid: true,
+            },
+        ];
+
+        let ddl = render_postgres_table_ddl_with_constraints_and_partition_info(
+            "public",
+            "accounts",
+            &[id],
+            &indexes,
+            &[],
+            &constraints,
+            &[],
+            None,
+            &db::postgres::PostgresTablePartitionInfo::default(),
+            &db::postgres::PostgresTablePartitionLocalObjects::default(),
+        );
+
+        assert!(ddl.contains("CONSTRAINT \"pk_accounts\" PRIMARY KEY (id)"), "ddl: {ddl}");
+        assert!(
+            ddl.contains("CONSTRAINT \"uq_accounts_code\" UNIQUE (code) DEFERRABLE INITIALLY DEFERRED"),
+            "ddl: {ddl}"
+        );
+        assert!(!ddl.contains("CREATE UNIQUE INDEX \"pk_accounts\""), "ddl: {ddl}");
+        assert!(!ddl.contains("CREATE UNIQUE INDEX \"uq_accounts_code\""), "ddl: {ddl}");
+        assert!(ddl.contains("CREATE UNIQUE INDEX \"idx_accounts_display_name\""), "ddl: {ddl}");
+    }
+
+    #[test]
     fn postgres_table_ddl_renders_owned_serial_markers_without_external_defaults() {
         for (column_name, data_type, serial_type) in [
             ("small\"id", "smallint", "smallserial"),
@@ -10543,6 +10650,68 @@ mod ddl_tests {
         assert!(ddl.contains("FOR VALUES FROM ('2026-01-01') TO ('2027-01-01') PARTITION BY HASH (payload);"));
         assert!(ddl.contains("CREATE INDEX \"events_payload_idx\""));
         assert!(!ddl.contains("\"payload\" text"));
+    }
+
+    #[test]
+    fn postgres_partition_ddl_preserves_local_unique_without_local_primary_key() {
+        let indexes = vec![db::IndexInfo {
+            name: "events_2026_code_key".to_string(),
+            columns: vec!["code".to_string()],
+            is_unique: true,
+            is_primary: false,
+            filter: None,
+            index_type: Some("btree".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: Vec::new(),
+            column_opclasses: Vec::new(),
+            key_options: Vec::new(),
+            constraint_backed: true,
+        }];
+        let constraints = vec![db::ConstraintInfo {
+            name: "events_2026_code_key".to_string(),
+            constraint_type: "UNIQUE".to_string(),
+            definition: "UNIQUE (code)".to_string(),
+            columns: vec!["code".to_string()],
+            ref_schema: None,
+            ref_table: None,
+            ref_columns: Vec::new(),
+            match_type: None,
+            on_update: None,
+            on_delete: None,
+            deferrable: false,
+            initially_deferred: false,
+            enabled: true,
+            valid: true,
+        }];
+        let partition_info = db::postgres::PostgresTablePartitionInfo {
+            is_partition: true,
+            parent_schema: Some("public".to_string()),
+            parent_table: Some("events".to_string()),
+            bound: Some("DEFAULT".to_string()),
+            ..Default::default()
+        };
+        let partition_local_objects = db::postgres::PostgresTablePartitionLocalObjects {
+            unique_constraints: BTreeSet::from(["events_2026_code_key".to_string()]),
+            indexes: BTreeSet::from(["events_2026_code_key".to_string()]),
+            ..Default::default()
+        };
+
+        let ddl = render_postgres_table_ddl_with_constraints_and_partition_info(
+            "public",
+            "events_2026",
+            &[column("code", "text")],
+            &indexes,
+            &[],
+            &constraints,
+            &[],
+            None,
+            &partition_info,
+            &partition_local_objects,
+        );
+
+        assert!(ddl.contains("CONSTRAINT \"events_2026_code_key\" UNIQUE (code)"), "ddl: {ddl}");
+        assert!(!ddl.contains("CREATE UNIQUE INDEX"), "ddl: {ddl}");
     }
 
     #[test]
@@ -11394,15 +11563,17 @@ pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, schema: &str, table: &s
 /// duplicate every partition's `CREATE TABLE` (once from the parent's DDL,
 /// once from the caller's own loop over that same child relation).
 pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -> Result<String, String> {
-    let (columns, indexes, fkeys, table_comment, partition_info, trigger_definitions, check_constraints) = tokio::try_join!(
-        db::postgres::get_columns(pool, schema, table),
-        db::postgres::list_indexes(pool, schema, table),
-        db::postgres::list_foreign_keys(pool, schema, table),
-        async { db::postgres::get_table_comment(pool, schema, table).await },
-        db::postgres::get_table_partition_info(pool, schema, table),
-        db::postgres::list_trigger_definitions(pool, schema, table),
-        db::postgres::list_check_constraints(pool, schema, table),
-    )?;
+    let (columns, indexes, fkeys, constraints, table_comment, partition_info, trigger_definitions, check_constraints) =
+        tokio::try_join!(
+            db::postgres::get_columns(pool, schema, table),
+            db::postgres::list_indexes(pool, schema, table),
+            db::postgres::list_foreign_keys(pool, schema, table),
+            db::postgres::list_constraints(pool, schema, table),
+            async { db::postgres::get_table_comment(pool, schema, table).await },
+            db::postgres::get_table_partition_info(pool, schema, table),
+            db::postgres::list_trigger_definitions(pool, schema, table),
+            db::postgres::list_check_constraints(pool, schema, table),
+        )?;
     let partition_local_objects = if partition_info.is_partition {
         db::postgres::get_table_partition_local_objects(pool, schema, table).await?
     } else {
@@ -11410,12 +11581,13 @@ pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -
     };
 
     Ok(append_postgres_trigger_definitions(
-        render_postgres_table_ddl_with_partition_info(
+        render_postgres_table_ddl_with_constraints_and_partition_info(
             schema,
             table,
             &columns,
             &indexes,
             &fkeys,
+            &constraints,
             &check_constraints,
             table_comment.as_deref(),
             &partition_info,
@@ -12170,6 +12342,32 @@ fn render_postgres_table_ddl_with_partition_info(
     partition_info: &db::postgres::PostgresTablePartitionInfo,
     partition_local_objects: &db::postgres::PostgresTablePartitionLocalObjects,
 ) -> String {
+    render_postgres_table_ddl_with_constraints_and_partition_info(
+        schema,
+        table,
+        columns,
+        indexes,
+        fkeys,
+        &[],
+        check_constraints,
+        table_comment,
+        partition_info,
+        partition_local_objects,
+    )
+}
+
+fn render_postgres_table_ddl_with_constraints_and_partition_info(
+    schema: &str,
+    table: &str,
+    columns: &[db::ColumnInfo],
+    indexes: &[db::IndexInfo],
+    fkeys: &[db::ForeignKeyInfo],
+    constraints: &[db::ConstraintInfo],
+    check_constraints: &[(String, String)],
+    table_comment: Option<&str>,
+    partition_info: &db::postgres::PostgresTablePartitionInfo,
+    partition_local_objects: &db::postgres::PostgresTablePartitionLocalObjects,
+) -> String {
     let table_name = format!("{}.{}", pg_ident(schema), pg_ident(table));
     let partition_parent = partition_info
         .is_partition
@@ -12216,14 +12414,38 @@ fn render_postgres_table_ddl_with_partition_info(
             .collect::<Vec<_>>()
     };
 
-    let pks: Vec<&str> = if !is_partition || partition_local_objects.has_primary_key {
-        columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect()
-    } else {
-        Vec::new()
-    };
-    if !pks.is_empty() {
-        definition_lines
-            .push(format!("  PRIMARY KEY ({})", pks.iter().map(|key| pg_ident(key)).collect::<Vec<_>>().join(", ")));
+    let primary_constraints = constraints
+        .iter()
+        .filter(|constraint| constraint.constraint_type == "PRIMARY KEY" && !constraint.definition.trim().is_empty())
+        .collect::<Vec<_>>();
+    let unique_constraints = constraints
+        .iter()
+        .filter(|constraint| constraint.constraint_type == "UNIQUE" && !constraint.definition.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !is_partition || partition_local_objects.has_primary_key {
+        if primary_constraints.is_empty() {
+            let pks: Vec<&str> = columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect();
+            if !pks.is_empty() {
+                definition_lines.push(format!(
+                    "  PRIMARY KEY ({})",
+                    pks.iter().map(|key| pg_ident(key)).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        } else {
+            for constraint in &primary_constraints {
+                definition_lines.push(format!(
+                    "  CONSTRAINT {} {}",
+                    pg_ident(&constraint.name),
+                    constraint.definition.trim()
+                ));
+            }
+        }
+    }
+    for constraint in unique_constraints {
+        if is_partition && !partition_local_objects.unique_constraints.contains(&constraint.name) {
+            continue;
+        }
+        definition_lines.push(format!("  CONSTRAINT {} {}", pg_ident(&constraint.name), constraint.definition.trim()));
     }
     for fk_group in group_foreign_keys_by_name(fkeys) {
         let Some(first_fk) = fk_group.first() else {
@@ -12343,7 +12565,7 @@ fn render_postgres_table_ddl_with_partition_info(
     }
 
     for idx in indexes {
-        if idx.is_primary {
+        if idx.is_primary || idx.constraint_backed {
             continue;
         }
         if is_partition && !partition_local_objects.indexes.contains(&idx.name) {
