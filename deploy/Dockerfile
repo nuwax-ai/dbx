@@ -27,7 +27,7 @@ RUN dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config perl python3-pip gcc-aarch64-linux-gnu \
     libfontconfig-dev:arm64 libfreetype-dev:arm64 \
-    && pip3 install --break-system-packages -i ${PIP_INDEX_URL} ziglang \
+    && pip3 install --break-system-packages --timeout 120 -i ${PIP_INDEX_URL} ziglang \
     && cargo install cargo-zigbuild \
     && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
@@ -48,6 +48,7 @@ COPY crates/dbx-core/Cargo.toml crates/dbx-core/
 COPY crates/dbx-web/Cargo.toml crates/dbx-web/
 COPY crates/dbx-mcp/Cargo.toml crates/dbx-mcp/
 COPY crates/dbx-cli/Cargo.toml crates/dbx-cli/
+COPY crates/dbx-sqlite-worker/Cargo.toml crates/dbx-sqlite-worker/
 COPY src-tauri/Cargo.toml src-tauri/
 # Copy every vendored crate: root Cargo.toml [patch.crates-io] points at
 # vendor/{ctor,rumqttc,dirs-sys,pageant,wry}; omitting any breaks the offline build.
@@ -56,6 +57,7 @@ RUN mkdir -p crates/dbx-core/src && echo '' > crates/dbx-core/src/lib.rs \
     && mkdir -p crates/dbx-web/src && echo 'fn main() {}' > crates/dbx-web/src/main.rs \
     && mkdir -p crates/dbx-mcp/src && echo '' > crates/dbx-mcp/src/lib.rs && echo 'fn main() {}' > crates/dbx-mcp/src/main.rs \
     && mkdir -p crates/dbx-cli/src && echo 'fn main() {}' > crates/dbx-cli/src/main.rs \
+    && mkdir -p crates/dbx-sqlite-worker/src && echo 'fn main() {}' > crates/dbx-sqlite-worker/src/main.rs \
     && mkdir -p src-tauri/src && echo 'fn main() {}' > src-tauri/src/main.rs && echo 'pub fn run() {}' > src-tauri/src/lib.rs
 
 COPY src-tauri/build.rs src-tauri/
