@@ -27,10 +27,18 @@ RUN dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config perl python3-pip gcc-aarch64-linux-gnu \
     libfontconfig-dev:arm64 libfreetype-dev:arm64 \
-    && pip3 install --break-system-packages --timeout 120 -i ${PIP_INDEX_URL} ziglang \
-    && cargo install cargo-zigbuild \
-    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
+# ziglang wheel ~95MB：国内镜像偶发连接整段死掉（>120s 零数据），pip 单次
+# 失败不重试不续传——外层循环换新 TCP 连接重试；独立层隔离，pip 失败
+# 重试不连累 apt / cargo install 重跑
+RUN attempts=5; \
+    for i in $(seq 1 $attempts); do \
+      pip3 install --break-system-packages --timeout 120 -i ${PIP_INDEX_URL} ziglang && break; \
+      if [ "$i" -eq "$attempts" ]; then echo "ziglang install failed after $attempts attempts" >&2; exit 1; fi; \
+      echo "pip attempt $i failed, retrying with a fresh connection..."; sleep 3; \
+    done
+RUN cargo install cargo-zigbuild \
+    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
 # nuwax fork: 补装 amd64 交叉的 fontconfig/freetype dev 库（独立层，不动上游层——
 # arm64 构建缓存保留）。上游只装 :arm64 覆盖 "amd64 runner 交叉 arm64"；在 arm64
