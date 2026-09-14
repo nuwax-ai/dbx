@@ -492,9 +492,8 @@ pub fn effective_delimited_config(
     })
 }
 
-/// Undo the `="..."` force-text wrapper that CSV export writes around temporal
-/// cells (see `temporal_format::wrap_csv_force_text`). Without this, exporting a
-/// table with a datetime column and importing the file straight back stores the
+/// Undo the `="..."` force-text wrapper that older DBX versions wrote around
+/// temporal CSV cells. Without this, importing an older DBX export stores the
 /// literal `="2026-06-24 02:00:07"` instead of the timestamp, which every
 /// temporal column type then rejects.
 ///
@@ -537,7 +536,7 @@ pub fn csv_value(value: &str) -> serde_json::Value {
 const IMPORT_ENCODING_READ_CHUNK_BYTES: usize = 16 * 1024;
 
 // Decodes incrementally and rejects malformed input instead of silently inserting replacement characters.
-struct StrictTranscodingReader<R> {
+pub(crate) struct StrictTranscodingReader<R> {
     reader: R,
     decoder: encoding_rs::Decoder,
     encoding: TableImportTextEncoding,
@@ -702,7 +701,7 @@ fn auto_detect_text_encoding_from_bytes(bytes: &[u8]) -> Result<(TableImportText
     Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string())
 }
 
-fn resolve_text_encoding_from_bytes(
+pub(crate) fn resolve_text_encoding_from_bytes(
     bytes: &[u8],
     requested: Option<TableImportTextEncoding>,
 ) -> Result<(TableImportTextEncoding, usize), String> {
@@ -803,7 +802,7 @@ fn auto_detect_text_encoding_from_file_with_progress(
     Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string())
 }
 
-fn resolve_text_encoding_from_file_with_progress(
+pub(crate) fn resolve_text_encoding_from_file_with_progress(
     path: &str,
     requested: Option<TableImportTextEncoding>,
     on_progress: impl FnMut(u64),
@@ -836,6 +835,16 @@ fn resolve_and_validate_text_encoding_from_file(
         (requested, bom_len)
     };
     Ok((encoding, bom_len))
+}
+
+pub(crate) fn open_transcoded_text_file(
+    path: &str,
+    encoding: Option<TableImportTextEncoding>,
+) -> Result<(StrictTranscodingReader<File>, TableImportTextEncoding), String> {
+    let (encoding, bom_len) = resolve_text_encoding_from_file_with_progress(path, encoding, |_| {})?;
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(bom_len as u64)).map_err(|error| error.to_string())?;
+    Ok((StrictTranscodingReader::new(file, encoding)?, encoding))
 }
 
 fn open_delimited_csv_reader_with_progress(

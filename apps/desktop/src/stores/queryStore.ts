@@ -4,8 +4,8 @@ import { isRedisMonitorCommand, startRedisMonitor } from "@/lib/redis/redisMonit
 import { uuid } from "@/lib/common/utils";
 import { computed, markRaw, nextTick, onScopeDispose, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { BatchSqlExecution, ConnectionConfig, DatabaseType, IndexInfo, NacosConfigEditorViewport, ObjectBrowserFilter, ObjectBrowserViewport, QueryResult, QueryResultSourceColumnRef, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
 import { sanitizeTabPageUiState } from "@/lib/tabs/tabUiState";
+import type { BatchSqlExecution, ConnectionConfig, DatabaseType, IndexInfo, NacosConfigEditorViewport, ObjectBrowserFilter, ObjectBrowserViewport, QueryResult, QueryResultSourceColumnRef, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
 import { orderPinnedFirst } from "@/lib/app/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, sqlServerExplainResult, type BuildExplainSqlResult, type ExplainPlanDatabaseType } from "@/lib/diagram/explainPlan";
@@ -58,7 +58,8 @@ import { appendLargeValueCells, canUseTableDataLargeValuePreview, remapLargeValu
 import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { agentProtocolQueryResultMaxRows, capQueryResultTotal, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
-import { elasticsearchRestRequestRanges, executableStatementRanges, splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
+import { elasticsearchRestRequestRanges, executableStatementRanges, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility } from "@/lib/sql/sqlStatementRanges";
+import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, sqlServerUseDatabaseFromStatement } from "@/lib/sql/sqlCompletionLookupTarget";
 import { classifySqlRisk } from "@/lib/sql/sqlRisk";
 import { externalSqlFileDisplayTitles, normalizeExternalSqlPath } from "@/lib/sql/sqlFileOpen";
@@ -74,6 +75,8 @@ import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { batchSqlRecoverySql, batchSqlRecoveryState, mergeBatchQueryResults, offsetBatchQueryResultIndexes, prepareBatchSqlRecovery, type BatchSqlRecoveryAction } from "@/lib/query/batchSqlRecovery";
 import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryResultArchive } from "@/lib/query/queryResultArchive";
 import * as api from "@/lib/backend/api";
+import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
+import { snapshotPluginWorkbenchContext } from "@/lib/plugins/pluginData";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
@@ -91,7 +94,7 @@ import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeS
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import { disposeAllSqlServerActivityTraces, disposeSqlServerActivityTrace } from "@/lib/sqlserver/sqlServerActivityTraceRuntime";
 import type { SavedSqlFile } from "@/types/database";
-import i18n from "@/i18n";
+import i18n, { currentLocale } from "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import type { SqlExecutionTargetContext } from "@/lib/database/sqlExecutionTargetRegistry";
 import type { DriverProfileWorkspaceScope } from "@/lib/database/driverProfileExtensions";
@@ -314,8 +317,8 @@ function preservedResultIndex(results: QueryResult[], currentIndex: number | und
   return currentIndex;
 }
 
-function annotateQueryResultSources(results: QueryResult[], sql: string, database: string | undefined, databaseType?: DatabaseType, sourceOffset?: number): { results: QueryResult[]; sqlServerUseDatabase?: string } {
-  const statements = splitSqlStatementRanges(sql, databaseType);
+function annotateQueryResultSources(results: QueryResult[], sql: string, database: string | undefined, databaseType?: DatabaseType, sourceOffset?: number, parameterOptions?: SqlParameterOptions): { results: QueryResult[]; sqlServerUseDatabase?: string } {
+  const statements = splitSqlStatementRanges(sql, databaseType, parameterOptions);
   let statementIndex = 0;
   let sourceDatabase = database;
   let sqlServerUseDatabase: string | undefined;
@@ -354,8 +357,8 @@ function clearLiveBatchSqlExecution(tab: QueryTab, executionId: string) {
   if (liveBatchSqlExecutions.get(tab)?.executionId === executionId) liveBatchSqlExecutions.delete(tab);
 }
 
-function createBatchSqlExecution(executionId: string, editorSql: string, submittedSql: string, databaseType: DatabaseType | undefined, sourceOffset: number | undefined, executionTarget: MultiDbExecutionTarget): BatchSqlExecution | undefined {
-  const statements = databaseType === "mongodb" ? splitMongoCommandRanges(submittedSql).map(({ from, to, text }) => ({ from, to, sql: text })) : splitSqlStatementRanges(submittedSql, databaseType);
+function createBatchSqlExecution(executionId: string, editorSql: string, submittedSql: string, databaseType: DatabaseType | undefined, sourceOffset: number | undefined, executionTarget: MultiDbExecutionTarget, parameterOptions?: SqlParameterOptions): BatchSqlExecution | undefined {
+  const statements = databaseType === "mongodb" ? splitMongoCommandRanges(submittedSql).map(({ from, to, text }) => ({ from, to, sql: text })) : splitSqlStatementRanges(submittedSql, databaseType, parameterOptions);
   if (statements.length === 0) return undefined;
   if (statements.length > 1 && databaseType && NON_STREAMING_BATCH_DATABASE_TYPES.has(databaseType)) return undefined;
   const offset = sourceOffset ?? 0;
@@ -3145,6 +3148,100 @@ export const useQueryStore = defineStore("query", () => {
     tab.nacosTargetKeyword = undefined;
   }
 
+  function openPluginWorkbench(pluginId: string, contributionId: string, options: { title?: string; connectionId?: string; database?: string; context?: Record<string, unknown>; forceNew?: boolean } = {}) {
+    if (!options.forceNew) {
+      const existing = tabs.value.find((tab) => tab.mode === "plugin-workbench" && tab.pluginWorkbench?.pluginId === pluginId && tab.pluginWorkbench?.contributionId === contributionId && tab.connectionId === (options.connectionId || ""));
+      if (existing) {
+        if (options.context) existing.pluginWorkbench = { ...existing.pluginWorkbench!, context: snapshotPluginWorkbenchContext(options.context) };
+        switchTab(existing.id);
+        return existing.id;
+      }
+    }
+
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: options.title || contributionId,
+      connectionId: options.connectionId || "",
+      database: options.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "plugin-workbench",
+      pluginWorkbench: {
+        pluginId,
+        contributionId,
+        context: options.context ? snapshotPluginWorkbenchContext(options.context) : undefined,
+      },
+    };
+    return registerOpenTab(tab);
+  }
+
+  function openPluginFilesystem(pluginId: string, providerId: string, options: { title?: string; connectionId?: string; rootUri?: string; currentUri?: string; forceNew?: boolean } = {}) {
+    if (!options.forceNew) {
+      const existing = tabs.value.find((tab) => tab.mode === "plugin-filesystem" && tab.pluginFilesystem?.pluginId === pluginId && tab.pluginFilesystem?.providerId === providerId && tab.connectionId === (options.connectionId || ""));
+      if (existing) {
+        if (options.currentUri) existing.pluginFilesystem = { ...existing.pluginFilesystem!, currentUri: options.currentUri };
+        switchTab(existing.id);
+        return existing.id;
+      }
+    }
+
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: options.title || providerId,
+      connectionId: options.connectionId || "",
+      database: "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "plugin-filesystem",
+      pluginFilesystem: {
+        pluginId,
+        providerId,
+        rootUri: options.rootUri,
+        currentUri: options.currentUri,
+      },
+    };
+    return registerOpenTab(tab);
+  }
+
+  async function openPluginConnection(connectionId: string) {
+    const connectionStore = useConnectionStore();
+    const connection = connectionStore.getConfig(connectionId);
+    if (!connection || connection.db_type !== "plugin") throw new Error("Plugin connection config not found");
+    const pluginId = connection.plugin_id;
+    const providerId = connection.plugin_connection_provider;
+    if (!pluginId || !providerId) throw new Error("Plugin connection binding is incomplete");
+    const registry = createFrontendPluginRegistry(await api.listPlugins(), currentLocale());
+    const provider = registry.listConnectionProviders().find((entry) => entry.plugin.manifest.id === pluginId && entry.contribution.id === providerId);
+    if (!provider) throw new Error(`Plugin connection provider '${pluginId}/${providerId}' is unavailable`);
+    const workbench = provider.contribution.workbench ? registry.findWorkbench(pluginId, provider.contribution.workbench) : undefined;
+    await connectionStore.ensureConnected(connectionId);
+    if (workbench) {
+      return openPluginWorkbench(pluginId, workbench.contribution.id, {
+        title: connection.name,
+        connectionId,
+        context: {
+          connectionId,
+          providerId,
+          connectionType: connection.plugin_connection_type,
+        },
+      });
+    }
+    const filesystemProviderId = provider.contribution.filesystem_provider;
+    const filesystem = filesystemProviderId ? registry.listFilesystemProviders().find((entry) => entry.plugin.manifest.id === pluginId && entry.contribution.id === filesystemProviderId) : undefined;
+    if (!filesystem) throw new Error(`Plugin connection provider '${pluginId}/${providerId}' does not declare a workbench or filesystem provider`);
+    return openPluginFilesystem(pluginId, filesystem.contribution.id, {
+      title: connection.name,
+      connectionId,
+      rootUri: filesystem.contribution.root_uri,
+    });
+  }
+
   function applyTableStructureInitialTab(tab: QueryTab, initialTab?: TableInfoTab, initialTarget?: TableStructureEditorTarget) {
     if (!initialTab && !initialTarget?.name) return;
     if (initialTab) tab.structureInitialTab = initialTab;
@@ -4165,10 +4262,14 @@ export const useQueryStore = defineStore("query", () => {
     if (tab.oracleTxnPossiblyDirty !== undefined) tab.oracleTxnPossiblyDirty = false;
   }
 
-  function rollbackTabTransaction(tab: QueryTab, options?: { resetAutoCommit?: boolean }) {
+  function rollbackTabTransaction(tab: QueryTab, options?: { resetAutoCommit?: boolean; resetAutoCommitDbType?: string }) {
     if (tab.txnSessionId) void rollbackTransaction(tab.id);
     if (options?.resetAutoCommit) {
-      const dbType = useConnectionStore().getConfig(tab.connectionId)?.db_type;
+      // Callers switching a tab to another connection pass the target db type
+      // explicitly: the tab still carries the previous connectionId at reset
+      // time, and unbound file/saved-SQL tabs have none at all (which would
+      // force auto-commit even when the default mode is manual, #8863).
+      const dbType = options.resetAutoCommitDbType ?? useConnectionStore().getConfig(tab.connectionId)?.db_type;
       tab.autoCommit = defaultAutoCommitForDbTypeWithSetting(dbType);
     }
     clearOracleTxnPossiblyDirty(tab);
@@ -4512,7 +4613,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateConnection(id: string, connectionId: string, database = "", options: UpdateExecutionTargetOptions = {}) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.connectionId === connectionId) return;
-    rollbackTabTransaction(tab, { resetAutoCommit: true });
+    rollbackTabTransaction(tab, { resetAutoCommit: true, resetAutoCommitDbType: useConnectionStore().getConfig(connectionId)?.db_type });
     void closeResultSession(tab);
     void closeClientConnectionSession(tab);
     tab.connectionId = connectionId;
@@ -5773,19 +5874,31 @@ export const useQueryStore = defineStore("query", () => {
       const executionCatalog = resumedExecutionTarget ? resumedExecutionTarget.catalog : targetContext ? (targetContext.scope === "catalog" ? targetContext.catalog : undefined) : (executionTarget?.catalog ?? (tab.mode === "data" ? tab.tableMeta?.catalog : tab.catalog));
       const contextDatabase = databaseTargetContext?.database;
       const targetDatabase = resumedExecutionTarget ? resumedExecutionTarget.database : targetContext?.scope === "connection" ? "" : (contextDatabase ?? executionTarget?.database ?? tab.database);
+      if (effectiveDbType === "opengauss") {
+        await connStore.ensureDatabaseCompatibilityMode(executionConnectionId, targetDatabase || conn?.database);
+      }
       const targetSchema = resumedExecutionTarget ? resumedExecutionTarget.schema : targetContext?.scope === "connection" ? undefined : (databaseTargetContext?.schema ?? executionTarget?.schema ?? tab.schema);
       const executionDatabase = dataTabExecutionDatabase(conn, targetDatabase, executionCatalog);
+      const sqlStatementParameterOptions = sqlStatementParameterOptionsForCompatibility(effectiveDbType, effectiveDbType === "opengauss" ? connStore.databaseCompatibilityMode(executionConnectionId, targetDatabase || conn?.database) : undefined);
       const useAgentCursor = usesAgentCursorForQuery(conn?.db_type, conn?.driver_profile);
       const queryTimeoutSecs = queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs);
       if (!batchResume) {
         const statementExecution =
           tab.mode === "query"
-            ? createBatchSqlExecution(executionId, tab.sql, sql, effectiveDbType, options?.sourceOffset, {
-                connectionId: executionConnectionId,
-                catalog: executionCatalog,
-                database: targetDatabase,
-                schema: targetSchema,
-              })
+            ? createBatchSqlExecution(
+                executionId,
+                tab.sql,
+                sql,
+                effectiveDbType,
+                options?.sourceOffset,
+                {
+                  connectionId: executionConnectionId,
+                  catalog: executionCatalog,
+                  database: targetDatabase,
+                  schema: targetSchema,
+                },
+                sqlStatementParameterOptions,
+              )
             : undefined;
         tab.batchSqlExecution = statementExecution && (tab.autoCommit !== false || statementExecution.total === 1) ? statementExecution : undefined;
         if (tab.batchSqlExecution) liveBatchSqlExecutions.set(tab, tab.batchSqlExecution);
@@ -6432,7 +6545,11 @@ export const useQueryStore = defineStore("query", () => {
       }
 
       const executionSchema = connectionQueryExecutionSchema(conn, targetDatabase, targetSchema, tab.mode === "data");
-      const frontendTimeoutSecs = frontendQueryTimeoutSecsForSql(sqlToExecute, effectiveDbType, queryTimeoutSecs);
+      // Jumping to a non-zero offset without a live cursor session: the plan
+      // could not rewrite the SQL for these engines, so a plain execution
+      // would return the first page again (#8993).
+      const isOffsetJumpPage = typeof pageOffset === "number" && pageOffset > 0 && !options?.pagination?.sessionId;
+      const frontendTimeoutSecs = frontendQueryTimeoutSecsForSql(sqlToExecute, effectiveDbType, queryTimeoutSecs, sqlStatementParameterOptions);
       const sourceLabelDatabase = targetDatabase || conn?.database;
       const executionClientSessionId = options?.pagination?.clientSessionId ?? (tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined);
       const currentBeforeDispatch = findExecutionTab(id);
@@ -6482,6 +6599,35 @@ export const useQueryStore = defineStore("query", () => {
           clientSession: Boolean(executionClientSessionId),
         });
         executionDispatched = true;
+        if (useAgentResultSession && tab.mode === "query" && typeof pageOffset === "number" && pageOffset > 0 && !options?.pagination?.sessionId && !(tab.batchSqlExecution && tab.batchSqlExecution.total > 1)) {
+          return (async () => {
+            let sessionId: string | undefined;
+            let skipped = 0;
+            while (true) {
+              const pageResults = await api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, {
+                ...executionOptions,
+                resultSessionId: sessionId,
+              });
+              const page = pageResults[0];
+              if (!page) return pageResults;
+              if (skipped + page.rows.length > pageOffset) {
+                const start = pageOffset - skipped;
+                const limit = typeof pageLimit === "number" ? pageLimit : page.rows.length - start;
+                return [{ ...page, rows: page.rows.slice(start, start + limit) }];
+              }
+              skipped += page.rows.length;
+              if (!page.has_more || !page.session_id) {
+                if (page.has_more) {
+                  // The cursor session ended before the requested offset;
+                  // returning the short page would show the wrong rows.
+                  throw new Error("Result session ended before the requested page offset");
+                }
+                return [{ ...page, rows: [] }];
+              }
+              sessionId = page.session_id;
+            }
+          })();
+        }
         return tab.batchSqlExecution && tab.batchSqlExecution.total > 1
           ? api.executeMultiWithProgress(
               executionConnectionId,
@@ -6533,8 +6679,12 @@ export const useQueryStore = defineStore("query", () => {
           executionPromise = (async () => {
             const txnSessionId = tab.txnSessionId;
             if (!txnSessionId) throw new Error("Manual transaction session was not initialized");
+            // Offset jumps inside a manual transaction keep the legacy
+            // single-shot call: the session-consume loop only runs in the
+            // auto-commit path, and opening a cursor session here would
+            // strand it after returning the first page.
             const executeInTransaction = (sessionId: string) =>
-              useAgentResultSession
+              useAgentResultSession && !isOffsetJumpPage
                 ? api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, pageLimit, options?.pagination?.sessionId, classificationSql)
                 : api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, undefined, undefined, classificationSql);
             try {
@@ -6558,7 +6708,14 @@ export const useQueryStore = defineStore("query", () => {
       } else {
         executionPromise = executeWithoutManualTransaction();
       }
-      const annotatedResults = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType, options?.sourceOffset);
+      const annotatedResults = annotateQueryResultSources(
+        markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))),
+        queryBaseSql,
+        sourceLabelDatabase,
+        effectiveDbType,
+        options?.sourceOffset,
+        sqlStatementParameterOptions,
+      );
       const results = offsetBatchQueryResultIndexes(annotatedResults.results, batchResume?.startStatementIndex ?? 0);
       reconcileBatchSqlResults(tab, executionId, results);
       // Oracle-only sticky state aggregation. Only the initial manual execution
@@ -8088,6 +8245,9 @@ export const useQueryStore = defineStore("query", () => {
     openMqttAdmin,
     openNacosAdmin,
     clearNacosNavigationTarget,
+    openPluginWorkbench,
+    openPluginFilesystem,
+    openPluginConnection,
     openTableStructure,
     linkSavedSql,
     linkExternalSqlPath,

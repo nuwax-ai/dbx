@@ -1071,11 +1071,10 @@ async fn try_export_native_table_stream(
                 &cancelled,
                 cancel_token.clone(),
                 |row| {
-                    let formatted = crate::temporal_format::format_temporal_export_row_for_csv_cow(
+                    let formatted = crate::temporal_format::format_temporal_export_row_cow(
                         row,
                         column_types,
                         request.date_time_format.as_deref(),
-                        request.format.eq_ignore_ascii_case("csv"),
                     );
                     write_table_text_row(&mut file, true, formatted.as_ref(), &mut row_buffer, request.csv_quote_mode)?;
                     rows_exported += 1;
@@ -1681,11 +1680,10 @@ async fn export_table_data_core_inner(
                 if row_count == 0 {
                     break;
                 }
-                let formatted_rows = crate::temporal_format::format_temporal_export_rows_for_csv_cow(
+                let formatted_rows = crate::temporal_format::format_temporal_export_rows_cow(
                     &result.rows,
                     &column_types,
                     request.date_time_format.as_deref(),
-                    request.format.eq_ignore_ascii_case("csv"),
                 );
 
                 if is_first_batch {
@@ -2287,8 +2285,8 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
 
-        let plugin = InstalledPlugin {
-            manifest: PluginManifest {
+        let plugin = InstalledPlugin::new(
+            PluginManifest {
                 id: "jdbc".to_string(),
                 name: "JDBC".to_string(),
                 version: "test".to_string(),
@@ -2301,9 +2299,12 @@ mod tests {
                     kind: "external".to_string(),
                     database_type: Some("jdbc".to_string()),
                 }],
+                contributions: Vec::new(),
+                ..PluginManifest::default()
             },
-            path: dir.clone(),
-        };
+            dir.clone(),
+            env!("CARGO_PKG_VERSION"),
+        );
         let session = Arc::new(
             PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
                 .await

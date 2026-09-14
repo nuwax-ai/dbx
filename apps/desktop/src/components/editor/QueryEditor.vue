@@ -15,7 +15,7 @@ let lastHandledCompressRequestId = 0;
 
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
-import { AlignLeft, Camera, CaseLower, CaseSensitive, CaseUpper, ClipboardPaste, Code2, Download, Eye, FileCode, MessageSquareText, Minimize2, Pencil, PencilRuler, Play, Copy, List, Scissors, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
+import { AlignLeft, Camera, CaseLower, CaseSensitive, CaseUpper, ClipboardPaste, Code2, Download, Eye, FileCode, Highlighter, MessageSquareText, Minimize2, Pencil, PencilRuler, Play, Copy, List, Scissors, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { Completion, CompletionContext } from "@codemirror/autocomplete";
 import { Transaction, StateEffect } from "@codemirror/state";
@@ -132,6 +132,7 @@ import {
 } from "@/lib/editor/queryEditorTableDrop";
 import { isPointOverElementRoot } from "@/lib/editor/tableReferenceDragFeedback";
 import type { SqlHighlighter } from "@/lib/sql/sqlHighlighter";
+import { copySqlAsRichText } from "@/lib/sql/sqlRichText";
 import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, editorDiagnosticColors, editorThemeAppearanceFor, loadEditorTheme, editorFontTheme, shellLineCommentTheme, sqlCompletionTheme, sqlSemanticHighlightTheme } from "@/lib/editor/editorThemes";
 import { createStatementGutterMarkerDom, shouldShowStatementGutter } from "@/lib/editor/codemirrorStatementGutter";
 import { createQueryEditorSqlShortcutDomHandler, isCharacterProducingShortcut } from "@/lib/editor/queryEditorSqlShortcut";
@@ -177,6 +178,7 @@ import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
 import { queryContextObjectActions, queryContextObjectRoute, queryTableCandidateAtSqlPosition, queryTableNavigationTargetAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
+import { oracleDatabaseLinkCompletionContext, oracleDatabaseLinkCompletionItems } from "@/lib/sql/oracleDatabaseLinkCompletion";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { isMacOS } from "@/lib/backend/platform";
 import {
@@ -282,6 +284,7 @@ const viewportEmitTask = createDeferredEditorTask(() => {
 let viewportRestoreFrame: number | null = null;
 let latestViewport: { scrollTop: number; scrollLeft: number } | undefined = props.initialViewport;
 let lastEmittedViewport: { scrollTop: number; scrollLeft: number } | undefined = props.initialViewport;
+let tabSwitchStateCaptured = false;
 const executionViewportOwnership = createQueryEditorExecutionViewportOwnership();
 let latestSelection: { anchor: number; head: number } | undefined = props.initialSelection;
 let contextMenuDoc: Text | null = null;
@@ -291,7 +294,11 @@ const settingsStore = useSettingsStore();
 
 function sqlStatementParameterOptions() {
   const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, props.databaseType, settingsStore.editorSettings.sqlVariableSubstitutionEnabled);
-  return { databaseType: props.databaseType, enabledSyntaxes: enabledSqlParameterSyntaxes(toggles) };
+  return {
+    databaseType: props.databaseType,
+    compatibilityMode: props.databaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(props.connectionId, props.database) : undefined,
+    enabledSyntaxes: enabledSqlParameterSyntaxes(toggles),
+  };
 }
 const { isDark, themePalette, activeCustomUiColors } = useTheme();
 const { t } = useI18n();
@@ -680,6 +687,7 @@ const EDITOR_SCROLLBAR_POINTER_GUTTER_PX = 18;
 const EDITOR_SELECTION_DRAG_THRESHOLD_PX = 6;
 const tableNavigationHoverClass = "query-editor--table-navigation-hover";
 const DBX_VIM_SAVE_EVENT = "dbx-vim-save";
+const BEFORE_TAB_SWITCH_EVENT = "dbx:before-tab-switch";
 
 function editorThemeAppearance() {
   return editorThemeAppearanceFor(isDark.value ? "dark" : "light", themePalette.value, themePalette.value === "custom" ? activeCustomUiColors.value : undefined);
@@ -1611,6 +1619,18 @@ async function copySelectedSqlFromContextMenu() {
   }
 }
 
+// 富文本复制：写入 text/html + text/plain，粘贴到邮件/Word/IM 时保留语法高亮。
+async function copySelectedSqlAsRichTextFromContextMenu() {
+  if (!canCopySelectedSql.value) return;
+  try {
+    await copySqlAsRichText(selectedSql.value);
+    toast(t("grid.copied"));
+    focusEditor();
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
 async function cutSelectedSqlFromContextMenu() {
   if (!canCopySelectedSql.value) return;
   const currentView = view.value;
@@ -2040,6 +2060,12 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
       disabled: !canCopySelectedSql.value,
       icon: Copy,
       shortcut: "Mod+C",
+    },
+    {
+      label: t("editor.contextMenu.copySelectionAsRichText"),
+      action: copySelectedSqlAsRichTextFromContextMenu,
+      disabled: !canCopySelectedSql.value,
+      icon: Highlighter,
     },
     {
       label: t("editor.contextMenu.screenshotSelection"),
@@ -3451,7 +3477,7 @@ async function refreshSemanticDiagnostics(options: { preserveOutsideRanges?: boo
   if (props.databaseType !== "sqlserver") {
     executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, currentView.state.doc, props.databaseType, sqlStatementParameterOptions());
   }
-  const diagnosticRanges = sqlSemanticDiagnosticRangesForViewport(sql, visibleRanges, props.databaseType, props.databaseType === "sqlserver" ? undefined : executableStatementRangeCache?.ranges);
+  const diagnosticRanges = sqlSemanticDiagnosticRangesForViewport(sql, visibleRanges, props.databaseType, props.databaseType === "sqlserver" ? undefined : executableStatementRangeCache?.ranges, sqlStatementParameterOptions());
   if (diagnosticRanges.length === 0) {
     if (!options.preserveOutsideRanges) setSemanticDiagnostics([]);
     return;
@@ -4617,6 +4643,7 @@ async function provideSqlCompletions(context: CompletionContext) {
   if (props.databaseType === "victoriametrics") return null;
   const hasDatabase = props.database != null;
   const sequenceLiteralContext = getPostgresSequenceLiteralCompletionContext(fullDoc, position, props.databaseType);
+  const databaseLinkContext = oracleDatabaseLinkCompletionContext(fullDoc, position, props.databaseType);
 
   const epoch = ++completionEpoch;
 
@@ -4645,12 +4672,12 @@ async function provideSqlCompletions(context: CompletionContext) {
 
       // require-prefix: only compute local facts (no positionalEligible).
       if (mode === "require-prefix") {
-        const ctx = sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
+        const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
         const prevChar = fullDoc[position - 1] ?? "";
         const facts: SqlCompletionTriggerFacts = {
           origin,
           hasIdentifierPrefix: ctx.prefix.length > 0,
-          qualifierTriggered: prevChar === "." && ("from" in ctx ? ctx.schema != null : ctx.qualifier != null),
+          qualifierTriggered: !!databaseLinkContext || (prevChar === "." && ("schema" in ctx ? ctx.schema != null : "qualifier" in ctx && ctx.qualifier != null)),
           useDatabasePrefix,
         };
         if (!shouldAllowSqlCompletionTrigger(mode, facts)) return null;
@@ -4658,13 +4685,13 @@ async function provideSqlCompletions(context: CompletionContext) {
 
       // positional: compute positionalEligible (lazy).
       if (mode === "positional") {
-        const ctx = sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
+        const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
         const prevChar = fullDoc[position - 1] ?? "";
         const positionalEligible = shouldAutoOpenSqlCompletion(fullDoc, position, sqlCompletionDialectOptions());
         const facts: SqlCompletionTriggerFacts = {
           origin,
           hasIdentifierPrefix: ctx.prefix.length > 0,
-          qualifierTriggered: prevChar === "." && ("from" in ctx ? ctx.schema != null : ctx.qualifier != null),
+          qualifierTriggered: !!databaseLinkContext || (prevChar === "." && ("schema" in ctx ? ctx.schema != null : "qualifier" in ctx && ctx.qualifier != null)),
           useDatabasePrefix,
           positionalEligible,
         };
@@ -4698,6 +4725,27 @@ async function provideSqlCompletions(context: CompletionContext) {
       });
       const items = buildSqlServerUseDatabaseCompletionItems(databaseNames, useDatabaseCompletion);
       return buildCompletionResult(items, useDatabaseCompletion.from, undefined, useDatabaseCompletion.prefix);
+    }
+
+    if (databaseLinkContext) {
+      if (!hasDatabase) return null;
+      const links = await connectionStore.listOracleDatabaseLinks(props.connectionId, props.database!);
+      if (epoch !== completionEpoch) return null;
+      return {
+        from: databaseLinkContext.from,
+        to: databaseLinkContext.to,
+        options: oracleDatabaseLinkCompletionItems(links, databaseLinkContext.prefix).map((item) => ({
+          ...item,
+          apply(editor: EditorViewType, _completion: unknown, from: number, to: number) {
+            markCompletionAccepted({ label: item.label, type: "text", boost: 0 });
+            // Keep the entire link suffix intact and use the normal completion
+            // transaction so accepting a link does not immediately reopen the menu.
+            if (codeMirrorInsertCompletionText) editor.dispatch(codeMirrorInsertCompletionText(editor.state, item.apply, from, to));
+            else editor.dispatch({ changes: { from, to, insert: item.apply }, selection: { anchor: from + item.apply.length } });
+          },
+        })),
+        validFor: /^[A-Za-z0-9_$#.]*$/,
+      };
     }
 
     if (sequenceLiteralContext) {
@@ -4910,6 +4958,7 @@ function flushImeComposition() {
  */
 function shouldTriggerSqlCompletionForPosition(fullDoc: string, position: number): boolean {
   const sequenceLiteralContext = getPostgresSequenceLiteralCompletionContext(fullDoc, position, props.databaseType);
+  const databaseLinkContext = oracleDatabaseLinkCompletionContext(fullDoc, position, props.databaseType);
   if (isSqlCompletionSuppressedContext(fullDoc, position, { databaseType: props.databaseType, editorState: view.value?.state }) && !sequenceLiteralContext) return false;
   const mode = settingsStore.editorSettings.completionTriggerMode;
   if (mode === "manual") return false;
@@ -4922,25 +4971,25 @@ function shouldTriggerSqlCompletionForPosition(fullDoc: string, position: number
   const useDatabasePrefix = useDatabaseCompletion?.prefix ?? null;
 
   if (mode === "require-prefix") {
-    const ctx = sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
+    const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
     const prevChar = fullDoc[position - 1] ?? "";
     const facts: SqlCompletionTriggerFacts = {
       origin: "typing",
       hasIdentifierPrefix: ctx.prefix.length > 0,
-      qualifierTriggered: prevChar === "." && ("from" in ctx ? ctx.schema != null : ctx.qualifier != null),
+      qualifierTriggered: !!databaseLinkContext || (prevChar === "." && ("schema" in ctx ? ctx.schema != null : "qualifier" in ctx && ctx.qualifier != null)),
       useDatabasePrefix,
     };
     return shouldAllowSqlCompletionTrigger(mode, facts);
   }
 
   // positional
-  const ctx = sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
+  const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
   const prevChar = fullDoc[position - 1] ?? "";
   const positionalEligible = shouldAutoOpenSqlCompletion(fullDoc, position, sqlCompletionDialectOptions());
   const facts: SqlCompletionTriggerFacts = {
     origin: "typing",
     hasIdentifierPrefix: ctx.prefix.length > 0,
-    qualifierTriggered: prevChar === "." && ("from" in ctx ? ctx.schema != null : ctx.qualifier != null),
+    qualifierTriggered: !!databaseLinkContext || (prevChar === "." && ("schema" in ctx ? ctx.schema != null : "qualifier" in ctx && ctx.qualifier != null)),
     useDatabasePrefix,
     positionalEligible,
   };
@@ -5289,9 +5338,31 @@ function shouldLoadCompletionObjects(completionContext: ReturnType<typeof getSql
   return routineContext && !isReferencedTableQualifier(completionContext);
 }
 
+/**
+ * Databases whose qualified routine completion treats the first qualifier as a
+ * package (Oracle) or as a package-or-schema in A compatibility mode
+ * (openGauss). The backend re-validates: non-package parents fall through to
+ * the ordinary routine search, so routing is safe even when the compatibility
+ * map is not yet warm. openGauss keeps the package-aware routing while the
+ * mode is unknown (cold start, so A-mode completion works immediately after
+ * connect) and once the mode is known to be A; a known B/PG mode skips the
+ * extra package-style queries entirely.
+ */
+function usesPackageAwareRoutineCompletion(): boolean {
+  if (props.databaseType === "oracle") return true;
+  if (props.databaseType !== "opengauss") return false;
+  const mode = connectionStore.databaseCompatibilityMode(props.connectionId, props.database)?.trim().toUpperCase();
+  return mode === undefined || mode === "A";
+}
+
 function oracleRoutineCompletionTargets(completionContext: ReturnType<typeof getSqlCompletionContext>): RoutineCompletionTarget[] {
   const parts = (completionContext.qualifierParts?.length ? completionContext.qualifierParts : completionContext.qualifier?.split("."))?.filter(Boolean) ?? [];
-  if (parts.length === 0) return [{ schema: props.schema, globalSearch: true }];
+  if (parts.length === 0) {
+    // Oracle resolves unqualified routines across all schemas (owner semantics).
+    // openGauss keeps the PG search_path scope for the unqualified case.
+    if (props.databaseType === "oracle") return [{ schema: props.schema, globalSearch: true }];
+    return [{ schema: props.schema }];
+  }
   if (parts.length === 1) {
     return [{ schema: props.schema, parentName: parts[0] }, { schema: parts[0] }];
   }
@@ -5308,14 +5379,14 @@ function routineCompletionTargetForContext(completionContext: ReturnType<typeof 
 }
 
 function routineCompletionScopeForContext(completionContext: ReturnType<typeof getSqlCompletionContext>, scope: CompletionMetadataScope): CompletionMetadataScope {
-  if (props.databaseType === "oracle") return scope;
+  if (usesPackageAwareRoutineCompletion()) return scope;
   const target = routineCompletionTargetForContext(completionContext, scope);
   return { database: target.database, schema: target.schema };
 }
 
 function lookupLocalCompletionObjectsForContext(completionContext: ReturnType<typeof getSqlCompletionContext>, scope: CompletionMetadataScope): SqlCompletionObject[] {
   if (!props.connectionId || props.database == null) return [];
-  if (props.databaseType === "oracle") {
+  if (usesPackageAwareRoutineCompletion()) {
     return connectionStore.lookupLocalCompletionObjects(props.connectionId, scope.database, completionContext.prefix, MAX_COMPLETION_TABLES);
   }
   const target = routineCompletionTargetForContext(completionContext, scope);
@@ -5325,7 +5396,7 @@ function lookupLocalCompletionObjectsForContext(completionContext: ReturnType<ty
 async function listCompletionObjectsForContext(completionContext: ReturnType<typeof getSqlCompletionContext>, scope: CompletionMetadataScope): Promise<SqlCompletionObject[]> {
   if (!props.connectionId || props.database == null) return [];
   const objectKinds = completionObjectKindsForContext(completionContext);
-  if (props.databaseType !== "oracle") {
+  if (!usesPackageAwareRoutineCompletion()) {
     const target = routineCompletionTargetForContext(completionContext, scope);
     return connectionStore.listCompletionObjects(props.connectionId, target.database, target.mask, MAX_COMPLETION_TABLES, target.schema, undefined, false, scope.schema, objectKinds);
   }
@@ -6077,6 +6148,7 @@ onMounted(async () => {
     queryEditorLineCommentToken(props.databaseType) === "//" ? shellLineCommentHighlightPlugin : [],
   ];
   const MAX_SQL_SEMANTIC_HIGHLIGHT_WINDOWS = 32;
+  const MAX_FULL_DOCUMENT_SQL_SEMANTIC_HIGHLIGHT_LENGTH = 128_000;
   const SQL_SEMANTIC_HIGHLIGHT_DEBOUNCE_MS = 100;
   const refreshSqlSemanticHighlightEffect = StateEffect.define<null>();
   buildSqlSemanticHighlightExtension = () => [
@@ -6088,6 +6160,7 @@ onMounted(async () => {
           if (this.currentView.dom.isConnected) this.currentView.dispatch({ effects: refreshSqlSemanticHighlightEffect.of(null) });
         }, SQL_SEMANTIC_HIGHLIGHT_DEBOUNCE_MS);
         private cachedDoc: import("@codemirror/state").Text | null = null;
+        private prewarmedDoc: import("@codemirror/state").Text | null = null;
         private cachedSql = "";
         private cachedDialectId = "";
         private cachedDatabaseType: DatabaseType | undefined;
@@ -6098,6 +6171,7 @@ onMounted(async () => {
         }> = [];
 
         constructor(private currentView: import("@codemirror/view").EditorView) {
+          this.decorations = Decoration.none;
           this.decorations = this.buildDecorations(currentView);
         }
 
@@ -6143,13 +6217,15 @@ onMounted(async () => {
           }
 
           const sql = this.cachedSql;
+          const shouldPrewarmFullDocument = this.cachedWindows.length === 0 && this.prewarmedDoc !== doc && sql.length <= MAX_FULL_DOCUMENT_SQL_SEMANTIC_HIGHLIGHT_LENGTH;
           const windows: Array<{
             from: number;
             to: number;
             spans: Array<{ start: number; end: number }>;
           }> = [];
           const pendingWindows: Array<{ from: number; to: number }> = [];
-          for (const visibleRange of currentView.visibleRanges) {
+          const rangesToHighlight = shouldPrewarmFullDocument ? [{ from: 0, to: sql.length }] : currentView.visibleRanges;
+          for (const visibleRange of rangesToHighlight) {
             const cached = this.cachedWindows.find((candidate) => candidate.from <= visibleRange.from && candidate.to >= visibleRange.to);
             if (cached) {
               if (!windows.includes(cached)) windows.push(cached);
@@ -6169,8 +6245,19 @@ onMounted(async () => {
           }
 
           if (pendingWindows.length > 0) {
-            const tree = ensureSyntaxTree(currentView.state, Math.max(...pendingWindows.map((window) => window.to)), 25);
-            if (!tree) return Decoration.set([]);
+            const requestedTo = Math.max(...pendingWindows.map((window) => window.to));
+            const tree = ensureSyntaxTree(currentView.state, requestedTo, requestedTo === sql.length ? 250 : 25);
+            if (!tree) {
+              // The Lezer parse has not reached the pending windows yet (long
+              // documents). Keep the decorations that are still valid and let
+              // the deferred refresh rebuild them once parsing catches up —
+              // returning an empty set here wiped table-name colors after
+              // scrolling stopped or when a freshly mounted editor (tab
+              // switch) had no later viewport change to trigger a rebuild.
+              this.scheduleRefresh(currentView);
+              return this.decorations;
+            }
+            if (shouldPrewarmFullDocument) this.prewarmedDoc = doc;
             for (const window of pendingWindows) {
               const entry = {
                 ...window,
@@ -6790,6 +6877,7 @@ onMounted(async () => {
     contextMenuPointerCleanup = null;
   };
 
+  restoreEditorSelection(props.initialSelection, !props.initialViewport);
   restoreEditorViewport();
   syncContextMenuState(view.value);
   emit("previewChangesAvailable", !!previewContextSql.value);
@@ -6874,8 +6962,10 @@ function activateTabDocument(prevTabId: string | undefined, tabId: string | unde
   const currentView = view.value;
   if (!currentView) return;
   // Flush the outgoing document before props and restored scroll positions
-  // become the new tab's state. The event carries its original owner.
-  flushEditorViewport();
+  // become the new tab's state. The event carries its original owner. A
+  // before-tab-switch capture already flushed this editor while it was still
+  // visible, so avoid reading the reset scroll position during the transition.
+  if (!tabSwitchStateCaptured) flushEditorViewport();
   viewportOwnerTabId = tabId;
   latestViewport = props.initialViewport ?? { scrollTop: 0, scrollLeft: 0 };
   lastEmittedViewport = undefined;
@@ -6896,7 +6986,7 @@ function activateTabDocument(prevTabId: string | undefined, tabId: string | unde
     // document keeps whatever scroll offset the dispatch left behind (#8374).
     // A brand-new tab has no saved state, so reset it instead of falling back
     // to the previous tab's latest position (#8378).
-    restoreEditorSelection(props.initialSelection ?? { anchor: 0, head: 0 });
+    restoreEditorSelection(props.initialSelection ?? { anchor: 0, head: 0 }, !props.initialViewport);
     restoreEditorViewport(props.initialViewport ?? { scrollTop: 0, scrollLeft: 0 });
     clearScheduledPreviewContextRefresh();
     syncContextMenuState(currentView);
@@ -6921,7 +7011,7 @@ function activateTabDocument(prevTabId: string | undefined, tabId: string | unde
   }
   searchPanelRef.value?.scheduleDocumentSearchUpdate();
   invalidateSemanticDiagnosticsForDocumentChange();
-  restoreEditorSelection();
+  restoreEditorSelection(undefined, !props.initialViewport);
   restoreEditorViewport();
   clearScheduledPreviewContextRefresh();
   syncContextMenuState(currentView);
@@ -6944,6 +7034,31 @@ watch([() => props.tabId, () => props.modelValue], ([tabId, val], [prevTabId]) =
     scheduleSemanticDiagnostics();
   }
 });
+
+watch(
+  () => props.initialViewport,
+  (viewport, previousViewport) => {
+    if (!view.value || !viewport || previousViewport) return;
+    // Saved SQL content can hydrate after the editor has already mounted. In
+    // that case the initial prop was undefined and the mount-time restore had
+    // nothing to apply.
+    latestViewport = { ...viewport };
+    lastEmittedViewport = { ...viewport };
+    restoreEditorViewport(viewport);
+  },
+  { deep: true },
+);
+
+watch(
+  () => props.initialSelection,
+  (selection, previousSelection) => {
+    if (!view.value || !selection || previousSelection) return;
+    // Keep the cursor and viewport in sync when a saved SQL tab hydrates after
+    // the editor component has already been mounted.
+    restoreEditorSelection(selection, !props.initialViewport);
+  },
+  { deep: true },
+);
 
 watch(
   () => props.formatRequestId,
@@ -7044,6 +7159,23 @@ watch([() => props.databaseType, () => props.dialect, () => props.syntaxDialect,
     effects: [sqlLanguageComp.reconfigure(buildSqlLanguageExtension()), sqlSemanticHighlightComp.reconfigure(buildSqlSemanticHighlightExtension()), sqlSignatureComp.reconfigure(buildSqlSignatureExtension())],
   });
 });
+
+// openGauss compatibility mode is loaded asynchronously from the backend into a
+// dedicated store map (not the sidebar tree). A restored tab may open before the
+// map is warm; when the mode arrives, re-derive statement boundaries and
+// diagnostics so package DDL is parsed with the correct PL/SQL rules.
+watch(
+  () => (props.databaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(props.connectionId, props.database) : undefined),
+  (now, before) => {
+    if (now === before) return;
+    executableStatementRangeCache = null;
+    if (props.databaseType !== "opengauss") return;
+    if (!view.value) return;
+    refreshCompletionCache();
+    setSemanticDiagnostics([]);
+    scheduleSemanticDiagnostics(0);
+  },
+);
 
 watch(
   () => props.forceWordWrap,
@@ -7181,9 +7313,16 @@ watch(
 function pauseQueryEditorBackgroundWork() {
   finishBatchColumnSelectionDrag(false);
   cancelBatchColumnSelectionRefresh();
-  flushEditorViewport();
-  flushEditorSelection();
-  emit("editorStateFlushed");
+  const stateWasCapturedBeforeTabSwitch = tabSwitchStateCaptured;
+  tabSwitchStateCaptured = false;
+  // A KeepAlive-evicted editor can be unmounted after it was already
+  // deactivated. Its DOM scroll position has been reset by then, so flushing
+  // that inactive view would overwrite the saved viewport with zero.
+  if (editorIsActive && !stateWasCapturedBeforeTabSwitch) {
+    flushEditorViewport();
+    flushEditorSelection();
+    emit("editorStateFlushed");
+  }
   clearTableNavigationHover();
   clearPendingCompletionEnter();
   clearPendingCompletionTab();
@@ -7196,12 +7335,23 @@ function pauseQueryEditorBackgroundWork() {
   unregisterTableReferenceDropListener();
 }
 
+function captureEditorStateBeforeTabSwitch(event: Event) {
+  const fromTabId = (event as CustomEvent<{ fromTabId?: string }>).detail?.fromTabId;
+  if (!view.value || !fromTabId || fromTabId !== props.tabId) return;
+  // Capture while the outgoing editor is still visible. Once KeepAlive starts
+  // deactivating the surface, WebKit can report a reset scrollTop of zero.
+  flushEditorViewport();
+  flushEditorSelection();
+  emit("editorStateFlushed");
+  tabSwitchStateCaptured = true;
+}
+
 function resumeQueryEditorBackgroundWork() {
   editorIsActive = true;
   registerTableReferenceDropListener();
   scheduleSemanticDiagnostics();
   if (view.value) schedulePreviewContextRefresh(view.value);
-  restoreEditorSelection();
+  restoreEditorSelection(undefined, !props.initialViewport);
   restoreEditorFocus();
   restoreEditorViewport();
 }
@@ -7209,6 +7359,11 @@ function resumeQueryEditorBackgroundWork() {
 onActivated(resumeQueryEditorBackgroundWork);
 
 onDeactivated(pauseQueryEditorBackgroundWork);
+
+onMounted(() => {
+  if (typeof window === "undefined") return;
+  window.addEventListener(BEFORE_TAB_SWITCH_EVENT, captureEditorStateBeforeTabSwitch);
+});
 
 onBeforeUnmount(() => {
   pauseQueryEditorBackgroundWork();
@@ -7222,6 +7377,7 @@ onBeforeUnmount(() => {
   view.value?.scrollDOM.removeEventListener("scroll", scheduleEditorViewportEmit);
   window.removeEventListener("keyup", clearTableNavigationHoverOnModifierRelease);
   window.removeEventListener("blur", clearTableNavigationHover);
+  window.removeEventListener(BEFORE_TAB_SWITCH_EVENT, captureEditorStateBeforeTabSwitch);
   contextMenuPointerCleanup?.();
   postCompositionKeyGuardCleanup?.();
   postCompositionKeyGuardCleanup = null;
@@ -7265,10 +7421,10 @@ function flushEditorSelection() {
   if (latestSelection) emitEditorSelection(latestSelection);
 }
 
-function restoreEditorSelection(selection = props.initialSelection ?? latestSelection) {
+function restoreEditorSelection(selection = props.initialSelection ?? latestSelection, scrollIntoView = false) {
   const normalizedSelection = normalizedEditorSelection(selection, props.modelValue.length);
   if (!view.value || !normalizedSelection) return;
-  view.value.dispatch({ selection: normalizedSelection });
+  view.value.dispatch({ selection: normalizedSelection, scrollIntoView });
 }
 
 function restoreEditorFocus() {
@@ -7321,7 +7477,7 @@ function restoreEditorViewport(viewport = props.initialViewport ?? latestViewpor
     const restoreNextFrame = () => {
       restoreScroll();
       attempts += 1;
-      if (attempts >= 8) {
+      if (attempts >= 32) {
         viewportRestoreFrame = null;
         return;
       }
@@ -7450,6 +7606,7 @@ defineExpose({
 
 [data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar) {
   width: 5px;
+  height: 5px;
 }
 
 [data-query-editor-root] :deep(.cm-scroller::-webkit-scrollbar-track) {
