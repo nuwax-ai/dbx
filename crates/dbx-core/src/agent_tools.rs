@@ -926,6 +926,16 @@ async fn execute_execute_query(
     )
     .await?;
 
+    // DDL 执行后清除 dbx-web 的 schema 元数据缓存（SQLite schema_cache 表），
+    // 使 dbx 界面下次浏览表时重新读 schema。失败仅 warn——缓存最多 24h 自然过期。
+    if risk == crate::sql_risk::SqlRisk::Ddl {
+        if let Err(e) =
+            state.storage.delete_schema_cache_prefix(&format!("metadata:{}:{}:", connection_id, database)).await
+        {
+            log::warn!("failed to invalidate schema cache after DDL: connection_id={connection_id}, database={database}, error={e}");
+        }
+    }
+
     format_query_result_as_text(&result, limit, cell_window)
 }
 
