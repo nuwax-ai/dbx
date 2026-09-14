@@ -33,7 +33,7 @@ pub async fn ensure_local_pg_connection(storage: &Storage) -> Result<(), String>
 
 /// 核心逻辑（env 已解析；测试直调，避开进程级 env 与并行测试竞态）。
 pub async fn ensure_local_pg_with(storage: &Storage, user: &str, database: Option<&str>) -> Result<(), String> {
-    let desired = factory_config(user, database);
+    let desired = factory_config(user, database)?;
 
     let mut configs = storage.load_connections().await?;
     match configs.iter().position(|c| c.id == LOCAL_PG_ID) {
@@ -53,14 +53,18 @@ pub async fn ensure_local_pg_with(storage: &Storage, user: &str, database: Optio
 
 /// 出厂形态：socket host + 空密码（save_password 默认 true + 空密码 =
 /// `persist_connection_in_tx` 播种空 secret，连接时无凭据，trust 直连）。
-fn factory_config(user: &str, database: Option<&str>) -> ConnectionConfig {
-    serde_json::from_str(&format!(
-        r#"{{"id":"{LOCAL_PG_ID}","name":"Local PostgreSQL","db_type":"postgres","host":"{LOCAL_PG_SOCKET_DIR}","port":5432,"username":"{user}","password":"","database":{}}}"#,
-        database
-            .map(|d| format!("\"{d}\""))
-            .unwrap_or_else(|| "null".into()),
-    ))
-    .expect("factory local-pg config json")
+fn factory_config(user: &str, database: Option<&str>) -> Result<ConnectionConfig, String> {
+    serde_json::from_value(serde_json::json!({
+        "id": LOCAL_PG_ID,
+        "name": "Local PostgreSQL",
+        "db_type": "postgres",
+        "host": LOCAL_PG_SOCKET_DIR,
+        "port": 5432,
+        "username": user,
+        "password": "",
+        "database": database,
+    }))
+    .map_err(|error| format!("Failed to build local-pg connection config: {error}"))
 }
 
 /// 形态判定含用户名/库名——容器重建换 `POSTGRES_USER/POSTGRES_DB`（dbx.db 在
@@ -89,6 +93,33 @@ mod tests {
 
     async fn open_storage(data_dir: &std::path::Path) -> Storage {
         Storage::open(&data_dir.join("dbx.db")).await.expect("open storage")
+    }
+
+    #[tokio::test]
+    async fn preserves_special_characters_in_user_and_database() {
+        let dir = temp_data_dir("special-characters");
+        let storage = open_storage(&dir).await;
+        let user = "app\"\\\n用户";
+        let database = "db\"\\\t数据库";
+
+        ensure_local_pg_with(&storage, user, Some(database)).await.unwrap();
+
+        let configs = storage.load_connections().await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].username, user);
+        assert_eq!(configs[0].database.as_deref(), Some(database));
+        assert_eq!(configs[0].host, LOCAL_PG_SOCKET_DIR);
+        assert_eq!(configs[0].password, "");
+    }
+
+    #[test]
+    fn factory_config_without_database_keeps_defaults() {
+        let config = factory_config("app", None).unwrap();
+        assert_eq!(config.id, LOCAL_PG_ID);
+        assert_eq!(config.database, None);
+        assert_eq!(config.port, 5432);
+        assert!(config.save_password);
+        assert_eq!(config.password, "");
     }
 
     #[tokio::test]
