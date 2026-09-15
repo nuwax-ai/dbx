@@ -71,6 +71,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
+  LocalSshKey,
   TunnelProfile,
   TransactionLog,
   ExternalSqlFileVersion,
@@ -197,6 +198,11 @@ export interface AgentOfflineExportResult {
   driverCount: number;
   jreCount: number;
   bytes: number;
+}
+
+export interface AgentOfflineImportResult {
+  count: number;
+  jreCount: number;
 }
 
 export type JavaRuntimeMode = "managed" | "system" | "custom";
@@ -982,6 +988,10 @@ export async function listSshConfigHosts(): Promise<SshConfigHostEntry[]> {
   return invoke("list_ssh_config_hosts");
 }
 
+export async function listLocalSshKeys(): Promise<LocalSshKey[]> {
+  return invoke("list_local_ssh_keys");
+}
+
 export async function pendingOpenSqlFiles(): Promise<string[]> {
   return invoke("pending_open_sql_files");
 }
@@ -996,6 +1006,10 @@ export async function pendingOpenConnectionLinks(): Promise<string[]> {
 
 export async function pendingOpenAiConfigLinks(): Promise<string[]> {
   return invoke("pending_open_ai_config_links");
+}
+
+export async function pendingOpenPluginInstallLinks(): Promise<string[]> {
+  return invoke("pending_open_plugin_install_links");
 }
 
 export interface ExternalSqlFileSnapshot {
@@ -2289,6 +2303,10 @@ export async function installPluginPackage(pathOrFile: string | File, allowUnsig
   return invoke("install_plugin_package", { path: pathOrFile, allowUnsigned });
 }
 
+export async function installPluginPackageFromUrl(url: string, allowUnsigned = false): Promise<PluginInstallResult> {
+  return invoke("install_plugin_package_from_url", { url, allowUnsigned });
+}
+
 export async function rollbackPlugin(pluginId: string): Promise<PluginRollbackResult> {
   return invoke("rollback_plugin", { pluginId });
 }
@@ -2498,7 +2516,7 @@ export async function invalidateAgentRegistryCache(): Promise<void> {
   return invoke("invalidate_agent_registry_cache");
 }
 
-export async function importAgentsFromZip(path: string | File, operationId?: string): Promise<number> {
+export async function importAgentsFromZip(path: string | File, operationId?: string): Promise<AgentOfflineImportResult> {
   if (typeof path !== "string") {
     throw new Error("Desktop offline package import requires a local file path");
   }
@@ -5038,7 +5056,7 @@ export async function releaseTableImportSource(_sourceRef: string): Promise<bool
 
 export type MongoImportFormat = "csv" | "json" | "ndjson";
 export type MongoImportTypeMode = "string" | "auto" | "extendedJson";
-export type MongoImportInferredType = "boolean" | "integer" | "decimal" | "date" | "object" | "array" | "string";
+export type MongoImportInferredType = "boolean" | "integer" | "decimal" | "date" | "objectId" | "object" | "array" | "mixed" | "string";
 export type MongoImportStatus = "running" | "done" | "error" | "cancelled";
 export type MongoImportPhase = "preparing" | "parsing" | "writing" | "done";
 export type MongoExportFormat = "csv" | "ndjson";
@@ -5063,6 +5081,7 @@ export interface MongoImportParseOptions {
   typeMode?: MongoImportTypeMode | null;
   recognizeObjectIdHex?: boolean | null;
   skipErrorRows?: boolean | null;
+  columnTypes?: Partial<Record<string, MongoImportInferredType>> | null;
 }
 
 export interface MongoImportPreviewRequest {
@@ -5327,7 +5346,7 @@ export interface QueryResultExportRequest {
   databaseType: DatabaseType;
   useAgentCursor: boolean;
   filePath: string;
-  format: "csv" | "xlsx" | "txt" | "sql";
+  format: "csv" | "xlsx" | "json" | "txt" | "sql";
   insertMode?: SqlInsertMode;
   csvQuoteMode?: CsvQuoteMode;
   includeSqlSheet?: boolean;

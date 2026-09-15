@@ -88,6 +88,7 @@ export const removePluginRepository = forward("removePluginRepository");
 export const fetchPluginMarketplaceCatalogs = forward("fetchPluginMarketplaceCatalogs");
 export const installMarketplacePlugin = forward("installMarketplacePlugin");
 export const installPluginPackage = forward("installPluginPackage");
+export const installPluginPackageFromUrl = forward("installPluginPackageFromUrl");
 export const rollbackPlugin = forward("rollbackPlugin");
 export const uninstallPlugin = forward("uninstallPlugin");
 export const activatePlugin = forward("activatePlugin");
@@ -406,6 +407,7 @@ export const setAiGlobalCustomInstructions = forward("setAiGlobalCustomInstructi
 // System
 export const listSystemFonts = forward("listSystemFonts");
 export const listSshConfigHosts = forward("listSshConfigHosts");
+export const listLocalSshKeys = forward("listLocalSshKeys");
 
 // SQL File Execution
 export const previewSqlFile = forward("previewSqlFile");
@@ -418,6 +420,7 @@ export const pendingOpenSqlFiles = forward("pendingOpenSqlFiles");
 export const pendingOpenDbFiles = forward("pendingOpenDbFiles");
 export const pendingOpenConnectionLinks = forward("pendingOpenConnectionLinks");
 export const pendingOpenAiConfigLinks = forward("pendingOpenAiConfigLinks");
+export const pendingOpenPluginInstallLinks = forward("pendingOpenPluginInstallLinks");
 export const readExternalSqlFile = forward("readExternalSqlFile");
 export const readExternalSqlFileSnapshot = forward("readExternalSqlFileSnapshot");
 export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
@@ -1031,6 +1034,8 @@ export type {
   TableImportProgress,
   MongoImportFormat,
   MongoImportTypeMode,
+  MongoImportInferredType,
+  MongoImportColumn,
   MongoImportIssue,
   MongoImportParseOptions,
   MongoImportPreviewRequest,

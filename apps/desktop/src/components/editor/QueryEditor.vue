@@ -1118,6 +1118,17 @@ function focusStatementRange(range: { from: number; to: number } | null) {
   currentView.focus();
 }
 
+function focusErrorPosition(offset: number) {
+  const currentView = view.value;
+  if (!currentView || !editorViewModule) return;
+  const errorPos = Math.max(0, Math.min(offset, currentView.state.doc.length));
+  currentView.dispatch({
+    selection: { anchor: errorPos },
+    effects: [editorViewModule.EditorView.scrollIntoView(errorPos, { y: "center" })],
+  });
+  currentView.focus();
+}
+
 function onPickerActiveIndexChange(index: number) {
   pickerActiveIndex.value = index;
   const candidate = pickerCandidates.value[index];
@@ -3121,6 +3132,7 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
         objectType: sqlObjectNavigationSourceKind(table),
       };
       let sqlContent: string | undefined;
+      const formatDialect = props.formatDialect ?? sqlFormatDialectForDbType(props.databaseType);
       let metadataLoadFailed = false;
 
       // The persisted display DDL is canonical across the full-page and hover
@@ -3135,7 +3147,6 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
           // (the same one the sidebar/object-source viewers use). Tables keep
           // the aligned column layout from reformatHoverDdl.
           const isViewObject = objectMetadataRequest.objectType === "VIEW" || objectMetadataRequest.objectType === "MATERIALIZED_VIEW";
-          const formatDialect = props.formatDialect ?? sqlFormatDialectForDbType(props.databaseType);
           const formatted = isViewObject ? await formatSqlForDisplay(rawDdl, formatDialect, settingsStore.editorSettings.sqlFormatter) : reformatHoverDdl(rawDdl, quoteQualifiedName(hoverQualifiedName));
           sqlContent = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, formatDialect);
         }
@@ -3170,6 +3181,7 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
         }
         if (fullColumns.length > 0) {
           sqlContent = buildHoverTableSql(quoteQualifiedName(hoverQualifiedName), fullColumns, fullIndexes, tableComment);
+          if (!settingsStore.editorSettings.generateSqlQuoteIdentifiers) sqlContent = omitDdlIdentifierQuotes(sqlContent, formatDialect);
           metadataLoadFailed = false;
         }
       }
@@ -7552,6 +7564,7 @@ defineExpose({
   captureExecutionSnapshot,
   pasteClipboardAsSqlInCondition,
   focusStatementRange,
+  focusErrorPosition,
   previewStatementRange,
   refreshCompletionCache,
 });

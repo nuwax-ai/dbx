@@ -46,6 +46,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
+  LocalSshKey,
   TunnelProfile,
 } from "@/types/database";
 import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
@@ -68,6 +69,7 @@ import type {
   DriverStoreUsage,
   DriverRuntimeSummary,
   UpgradeAllAgentDriversResult,
+  AgentOfflineImportResult,
   AgentUpdateBlocker,
   AgentOfflineExportPreview,
   AgentOfflineExportResult,
@@ -531,6 +533,11 @@ export async function listSshConfigHosts(): Promise<SshConfigHostEntry[]> {
   return get("/api/ssh/config-hosts");
 }
 
+export async function listLocalSshKeys(): Promise<LocalSshKey[]> {
+  console.warn("listLocalSshKeys: local SSH key discovery is not available in the web backend");
+  return [];
+}
+
 export async function listPlugins(): Promise<InstalledPlugin[]> {
   return get("/api/plugins");
 }
@@ -580,6 +587,22 @@ export async function installPluginPackage(pathOrFile: string | File, allowUnsig
   const formData = new FormData();
   formData.append("file", blob, fileName);
   const response = await fetch(apiUrl(`/api/plugins/install?allow_unsigned=${allowUnsigned}`), { method: "POST", body: formData });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export async function installPluginPackageFromUrl(url: string, allowUnsigned = false): Promise<PluginInstallResult> {
+  let blob: Blob;
+  let fileName: string;
+  try {
+    fileName = new URL(url).pathname.split("/").pop() || "plugin.dbxp";
+  } catch {
+    fileName = "plugin.dbxp";
+  }
+  blob = await (await fetch(url)).blob();
+  const formData = new FormData();
+  formData.append("file", blob, fileName);
+  const response = await fetch(apiUrl(`/api/plugins/install?allow_unsigned=${allowUnsigned}&from_url=true`), { method: "POST", body: formData });
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
@@ -839,7 +862,7 @@ export async function invalidateAgentRegistryCache(): Promise<void> {
   await post("/api/agents/invalidate-registry-cache", {});
 }
 
-export async function importAgentsFromZip(fileOrPath: string | File, operationId?: string): Promise<number> {
+export async function importAgentsFromZip(fileOrPath: string | File, operationId?: string): Promise<AgentOfflineImportResult> {
   if (typeof fileOrPath === "string") {
     throw new Error("Offline package import in web mode requires a File object, not a file path");
   }
@@ -851,8 +874,8 @@ export async function importAgentsFromZip(fileOrPath: string | File, operationId
     body: formData,
   });
   if (!res.ok) throw await backendResponseError(res);
-  const result: { count: number } = await res.json();
-  return result.count;
+  const result: AgentOfflineImportResult = await res.json();
+  return { count: result.count, jreCount: result.jreCount ?? 0 };
 }
 
 export async function previewAgentOfflineExport(): Promise<AgentOfflineExportPreview> {
@@ -2466,6 +2489,10 @@ export async function pendingOpenConnectionLinks(): Promise<string[]> {
 }
 
 export async function pendingOpenAiConfigLinks(): Promise<string[]> {
+  return [];
+}
+
+export async function pendingOpenPluginInstallLinks(): Promise<string[]> {
   return [];
 }
 
