@@ -40,6 +40,7 @@ const COLLECTION_METHOD_SHAPES: Record<string, MongoMethodShape> = {
   findOne: { expects: "an optional filter, an optional projection, and optional options", roles: ["filter", "projection", "options"] },
   count: { expects: "an optional filter", roles: ["filter"] },
   countDocuments: { expects: "an optional filter", roles: ["filter"] },
+  estimatedDocumentCount: { expects: "no arguments", roles: [] },
   distinct: { expects: "a field name and an optional filter", roles: ["field", "filter"] },
   insert: { expects: "one document or an array of documents", roles: ["document"] },
   insertOne: { expects: "one document", roles: ["document"] },
@@ -47,6 +48,7 @@ const COLLECTION_METHOD_SHAPES: Record<string, MongoMethodShape> = {
   update: { expects: "a filter, an update, and optional options", roles: ["filter", "update", "options"] },
   updateOne: { expects: "a filter, an update, and optional options", roles: ["filter", "update", "options"] },
   updateMany: { expects: "a filter, an update, and optional options", roles: ["filter", "update", "options"] },
+  replaceOne: { expects: "a filter, a replacement document, and optional options", roles: ["filter", "replacement", "options"] },
   deleteOne: { expects: "a filter", roles: ["filter"] },
   deleteMany: { expects: "a filter", roles: ["filter"] },
   findOneAndUpdate: { expects: "a filter, an update, and optional options", roles: ["filter", "update", "options"] },
@@ -69,11 +71,13 @@ const SUPPORTED_COLLECTION_METHODS = [
   "aggregate",
   "count",
   "countDocuments",
+  "estimatedDocumentCount",
   "distinct",
   "insertOne",
   "insertMany",
   "updateOne",
   "updateMany",
+  "replaceOne",
   "deleteOne",
   "deleteMany",
   "findOneAndUpdate",
@@ -90,8 +94,6 @@ const SUPPORTED_COLLECTION_METHODS = [
 /** Database-level methods with a supported equivalent worth pointing at. */
 const DATABASE_METHOD_HINTS: Record<string, string> = {
   getSiblingDB: "switch databases with `use <database>` and then run the command against db.<collection>",
-  stats: "use db.runCommand({ dbStats: 1 })",
-  serverStatus: "use db.runCommand({ serverStatus: 1 })",
   adminCommand: "use db.runCommand({ ... })",
   getCollectionNames: "collections are listed in the sidebar",
   createCollection: 'collections are created on first insert, or use db.runCommand({ create: "name" })',
@@ -99,11 +101,13 @@ const DATABASE_METHOD_HINTS: Record<string, string> = {
 
 const DATABASE_METHOD_SHAPES: Record<string, MongoMethodShape> = {
   version: { expects: "no arguments", roles: [] },
+  stats: { expects: "no arguments", roles: [] },
+  serverStatus: { expects: "no arguments", roles: [] },
   createUser: { expects: "a user document and optional write concern", roles: ["user", "writeConcern"] },
   runCommand: { expects: "one command document", roles: ["command"] },
 };
 
-const SUPPORTED_DATABASE_METHODS = ["version", "createUser", "runCommand", "getCollection"];
+const SUPPORTED_DATABASE_METHODS = ["version", "stats", "serverStatus", "createUser", "runCommand", "getCollection"];
 
 const SUPPORTED_VALUE_CONSTRUCTORS = ["ObjectId", "ISODate", "new Date", "NumberLong", "NumberInt", "NumberDecimal", "UUID", "BinData", "Timestamp", "MinKey", "MaxKey"];
 
@@ -155,6 +159,11 @@ function diagnoseMongoCommand(source: string): string | null {
 
   const tail = source.slice(closeIndex + 1).trim();
   if (tail) return `Unexpected text after ${method}(...): "${tail.length > 40 ? `${tail.slice(0, 40)}…` : tail}".`;
+  if (method === "replaceOne" && args[1]) {
+    const replacement = parseMongoObjectArgument(args[1]);
+    const operator = replacement ? Object.keys(JSON.parse(replacement) as Record<string, unknown>).find((key) => key.startsWith("$")) : undefined;
+    if (operator) return `replaceOne() replaces the whole document, so it must not contain update operators such as ${operator}; use updateOne() to modify fields.`;
+  }
   return `${method}() expects ${shapeSpec.expects}.`;
 }
 
@@ -254,7 +263,7 @@ export interface MongoDistinctCommand {
   filter?: string;
 }
 
-type MongoWriteKind = "runCommand" | "insert" | "update" | "delete" | "createIndex" | "createUser" | "dropIndex" | "dropIndexes" | "dropCollection" | "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete";
+type MongoWriteKind = "runCommand" | "insert" | "update" | "replace" | "delete" | "createIndex" | "createUser" | "dropIndex" | "dropIndexes" | "dropCollection" | "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete";
 
 export type MongoCommand =
   | ({ kind: "find" } & MongoFindCommand)
@@ -271,6 +280,7 @@ export type MongoCommand =
   | ({ kind: "runCommand" } & MongoRunCommand)
   | { kind: "insert"; collection: string; docsJson: string }
   | { kind: "update"; collection: string; filter: string; update: string; options?: string; many: boolean }
+  | { kind: "replace"; collection: string; filter: string; replacement: string; options?: string }
   | { kind: "delete"; collection: string; filter: string; many: boolean }
   | { kind: "createIndex"; collection: string; keys: string; options?: string }
   | { kind: "dropIndex"; collection: string; index: string }
@@ -524,7 +534,23 @@ export function applyMongoFindSort(input: string, column: string, direction: "as
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
-  return parseCollectionCountCommand(source, "countDocuments") ?? parseCollectionCountCommand(source, "count") ?? parseFindCountCommand(source);
+  return parseCollectionCountCommand(source, "countDocuments") ?? parseCollectionCountCommand(source, "count") ?? parseEstimatedDocumentCountCommand(source) ?? parseFindCountCommand(source);
+}
+
+/**
+ * estimatedDocumentCount() takes no filter and is metadata-backed, which is exactly
+ * the legacy count() fast path the driver already uses for a filterless count.
+ */
+function parseEstimatedDocumentCountCommand(source: string): MongoCountDocumentsCommand | null {
+  const target = parseCollectionMethodTarget(source, "estimatedDocumentCount");
+  if (!target) return null;
+
+  const openIndex = source.indexOf("(", target.methodCallIndex);
+  const closeIndex = findMatchingParen(source, openIndex);
+  if (closeIndex < 0 || source.slice(closeIndex + 1).trim()) return null;
+  if (source.slice(openIndex + 1, closeIndex).trim()) return null;
+
+  return { collection: target.collection, filter: "{}", mode: "legacy" };
 }
 
 function parseCollectionCountCommand(source: string, method: "countDocuments" | "count"): MongoCountDocumentsCommand | null {
@@ -674,8 +700,16 @@ export function parseMongoCreateUserCommand(input: string): MongoCreateUserComma
   };
 }
 
+/** The shell's shorthand for the matching runCommand, so they share its execution path. */
+const DATABASE_STATUS_COMMANDS: Record<string, string> = { stats: "dbStats", serverStatus: "serverStatus" };
+
 export function parseMongoRunCommand(input: string): MongoRunCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
+  for (const [method, command] of Object.entries(DATABASE_STATUS_COMMANDS)) {
+    if (new RegExp(`^db\\s*\\.\\s*${method}\\s*\\(\\s*\\)$`, "i").test(source)) {
+      return { commandJson: JSON.stringify({ [command]: 1 }) };
+    }
+  }
   const match = /^db\s*\.\s*runCommand\s*\(/i.exec(source);
   if (!match) return null;
   const openIndex = source.indexOf("(", match.index);
@@ -716,6 +750,20 @@ export function parseMongoWriteCommand(input: string): MongoWriteCommand | null 
     if (!docs) return null;
     const value = JSON.parse(docs);
     return value !== null && typeof value === "object" ? { kind: "insert", collection: insert.collection, docsJson: docs } : null;
+  }
+
+  const replaceOne = parseCollectionMethodTarget(source, "replaceOne");
+  if (replaceOne) {
+    const args = parseMethodArgs(source, replaceOne.methodCallIndex);
+    if (!args || args.length < 2 || args.length > 3) return null;
+    const filter = normalizeJsonArgument(args[0]);
+    const replacement = parseMongoObjectArgument(args[1]);
+    if (!filter || !replacement) return null;
+    // A replacement is a whole document; `{$set: ...}` here means updateOne() was intended.
+    if (Object.keys(JSON.parse(replacement) as Record<string, unknown>).some((key) => key.startsWith("$"))) return null;
+    const options = args[2]?.trim() ? normalizeJsonArgument(args[2]) : undefined;
+    if (args[2]?.trim() && !options) return null;
+    return { kind: "replace", collection: replaceOne.collection, filter, replacement, ...(options ? { options } : {}) };
   }
 
   for (const method of ["updateOne", "updateMany"] as const) {
@@ -1490,6 +1538,7 @@ function isNonEmptyRecord(value: unknown): value is Record<string, unknown> {
 function mongoWriteFilter(command: MongoWriteCommand): string | null {
   switch (command.kind) {
     case "update":
+    case "replace":
     case "delete":
     case "findOneAndUpdate":
     case "findOneAndReplace":

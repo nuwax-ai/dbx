@@ -672,6 +672,45 @@ test("parseMongoWriteCommand accepts unquoted insert and update commands", () =>
   });
 });
 
+test("parseMongoWriteCommand reads replaceOne as a filtered replace", () => {
+  assert.deepEqual(parseMongoWriteCommand('db.orders.replaceOne({_id: ObjectId("507f1f77bcf86cd799439011")}, {name: "new", tags: []}, {upsert: true})'), {
+    kind: "replace",
+    collection: "orders",
+    filter: '{"_id": {"$oid":"507f1f77bcf86cd799439011"}}',
+    replacement: '{"name": "new", "tags": []}',
+    options: '{"upsert": true}',
+  });
+  assert.deepEqual(parseMongoWriteCommand('db["my-coll"].replaceOne({a: 1}, {b: 2});'), {
+    kind: "replace",
+    collection: "my-coll",
+    filter: '{"a": 1}',
+    replacement: '{"b": 2}',
+  });
+
+  for (const source of ["db.orders.replaceOne({a: 1})", "db.orders.replaceOne({a: 1}, {b: 2}, {upsert: true}, 4)", "db.orders.replaceOne({a: 1}, [{b: 2}])", "db.orders.replaceOne({a: 1}, {$set: {b: 2}})"]) {
+    assert.equal(parseMongoWriteCommand(source), null, source);
+  }
+  assert.match(describeMongoCommandParseFailure("db.orders.replaceOne({a: 1}, {$set: {b: 2}})"), /must not contain update operators such as \$set; use updateOne\(\)/);
+});
+
+test("evaluateMongoWriteSafety guards an unbounded replaceOne like an update", () => {
+  const bounded = parseMongoWriteCommand("db.orders.replaceOne({a: 1}, {b: 2})")!;
+  const unbounded = parseMongoWriteCommand("db.orders.replaceOne({}, {b: 2})")!;
+  const policy = { allowWrites: true, allowDangerous: false } as Parameters<typeof evaluateMongoWriteSafety>[1];
+  assert.equal(evaluateMongoWriteSafety(bounded, policy).allowed, true);
+  assert.equal(evaluateMongoWriteSafety(unbounded, policy).allowed, false);
+  assert.equal(evaluateMongoWriteSafety(bounded, { ...policy, allowWrites: false }).allowed, false);
+});
+
+test("normalizeRustMongoCommand passes a replace command through unchanged", () => {
+  assert.deepEqual(normalizeRustMongoCommand({ kind: "replace", collection: "orders", filter: '{"a":1}', replacement: '{"b":2}', options: null }), {
+    kind: "replace",
+    collection: "orders",
+    filter: '{"a":1}',
+    replacement: '{"b":2}',
+  });
+});
+
 test("parseMongoWriteCommand unwraps EJSON.deserialize values", () => {
   assert.deepEqual(parseMongoWriteCommand('db.products.updateOne({_id: ObjectId("507f1f77bcf86cd799439011")}, {$set: {price: EJSON.deserialize({"$numberDecimal":"12.34"}), payload: EJSON.deserialize({"$binary":{"base64":"AQI=","subType":"00"}})}})'), {
     kind: "update",
@@ -1161,6 +1200,35 @@ test("parseMongoAggregateCommand rejects non-array pipelines and invalid options
   assert.equal(parseMongoAggregateCommand("db.products.aggregate([], {}, true)"), null);
 });
 
+test("parseMongoCountDocumentsCommand reads estimatedDocumentCount as a metadata-backed count", () => {
+  // The driver already takes the metadata fast path for a filterless legacy count().
+  const expected = { collection: "orders", filter: "{}", mode: "legacy" };
+  for (const source of ["db.orders.estimatedDocumentCount()", 'db["orders"].estimatedDocumentCount()', "db.getCollection('orders').estimatedDocumentCount();"]) {
+    assert.deepEqual(parseMongoCountDocumentsCommand(source), expected, source);
+  }
+
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.estimatedDocumentCount({a: 1})"), null);
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.estimatedDocumentCount().limit(5)"), null);
+  // count() and countDocuments() keep their own modes.
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.countDocuments({})")?.mode, "accurate");
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.count()")?.mode, "legacy");
+});
+
+test("parseMongoRunCommand reads db.stats() and db.serverStatus() as run commands", () => {
+  assert.deepEqual(parseMongoRunCommand("db.stats()"), { commandJson: '{"dbStats":1}' });
+  assert.deepEqual(parseMongoRunCommand("db . serverStatus ( ) ;"), { commandJson: '{"serverStatus":1}' });
+  assert.deepEqual(parseMongoRunCommand("DB.STATS()"), { commandJson: '{"dbStats":1}' });
+
+  for (const source of ["db.stats(1)", "db.serverStatus({})"]) {
+    assert.equal(parseMongoRunCommand(source), null, source);
+    assert.match(describeMongoCommandParseFailure(source), /takes no arguments|expects no arguments/, source);
+  }
+
+  // db.collection.stats() is still collection stats, not a run command.
+  assert.equal(parseMongoRunCommand("db.orders.stats()"), null);
+  assert.equal(parseMongoCommand("db.orders.stats()")?.command.kind, "collectionStats");
+});
+
 test("describeMongoCommandParseFailure names an unsupported value constructor and where it is", () => {
   const message = describeMongoCommandParseFailure('db.reports.updateOne({a: 1}, {$set: {t: Foo("x")}}, {upsert: true})');
   assert.match(message, /Unsupported value Foo\(\.\.\.\) in the update argument of updateOne\(\)/);
@@ -1181,13 +1249,13 @@ test("describeMongoCommandParseFailure explains the argument shape a known metho
 });
 
 test("describeMongoCommandParseFailure names unsupported methods and points at alternatives", () => {
-  const replaceOne = describeMongoCommandParseFailure("db.c.replaceOne({a: 1}, {b: 2})");
-  assert.match(replaceOne, /^Collection method replaceOne\(\) is not supported\. Supported collection methods: find, findOne/);
+  const bulkWrite = describeMongoCommandParseFailure("db.c.bulkWrite([{insertOne: {document: {a: 1}}}])");
+  assert.match(bulkWrite, /^Collection method bulkWrite\(\) is not supported\. Supported collection methods: find, findOne/);
   // Bracket and getCollection targets are recognised too.
   assert.match(describeMongoCommandParseFailure('db["my-coll"].renameCollection("x")'), /renameCollection\(\) is not supported/);
   assert.match(describeMongoCommandParseFailure('db.getCollection("my-coll").watch()'), /watch\(\) is not supported/);
 
-  assert.match(describeMongoCommandParseFailure("db.stats()"), /db\.stats\(\) is not supported; use db\.runCommand\(\{ dbStats: 1 \}\)/);
+  assert.match(describeMongoCommandParseFailure('db.createCollection("c")'), /db\.createCollection\(\) is not supported; collections are created on first insert/);
   assert.match(describeMongoCommandParseFailure('db.getSiblingDB("other").c.find({})'), /use <database>/);
   assert.match(describeMongoCommandParseFailure("db.adminCommand({ping: 1})"), /use db\.runCommand/);
   assert.match(describeMongoCommandParseFailure("show collections"), /listed in the sidebar/);
