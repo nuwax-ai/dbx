@@ -38,6 +38,7 @@ import {
   Table2,
   Play,
   Square,
+  Sparkles,
   Star,
   Trash2,
   Terminal,
@@ -62,6 +63,9 @@ import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
+import { useUserSkillStore } from "@/stores/userSkillStore";
+import { buildSelectedSkillChips, capSkillsToCharLimit, removeSkillIds, userSkillSourceOfId } from "@/lib/ai/userSkillSelection";
+import { ACTIVE_SKILLS_TOTAL_MAX, type ReadUserSkill, type ReadUserSkillFailure, type UserSkillFailureReason, type UserSkillRootSettings } from "@/types/userSkills";
 import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionTreeSelect from "@/components/connection/ConnectionTreeSelect.vue";
@@ -72,6 +76,7 @@ import { useNavigationTargets } from "@/composables/useNavigationTargets";
 import {
   buildAiContext,
   resolveAiDatabaseTarget,
+  resolveAiMentionDatabase,
   resolveAiNamespaceSelection,
   resolveDefaultAiSchema,
   aiDatabaseTypeForConnection,
@@ -79,8 +84,10 @@ import {
   runAgentStream,
   isVectorDbType,
   isValidActionForMode,
+  isAutoActionSelection,
   defaultActionForMode,
   type AiAction,
+  type AiActionSelection,
   type AiAssistantMode,
   type AiCsvFileContext,
   type AiTextAttachmentEncoding,
@@ -149,7 +156,7 @@ import { buildAiAgentStepItems, formatToolDurationMs, toolCallStepKey, upsertAge
 import { createAiShikiCodeHighlighter, type AiCodeHighlighter } from "@/lib/ai/aiCodeHighlighter";
 import { createAiMessageRenderer } from "@/lib/ai/aiMessageRender";
 import { formatAiInlineMarkdown, handleAiMarkdownLinkClick } from "@/lib/ai/aiMarkdown";
-import { aiCancelStream, saveAiConversation, saveAiRun, saveAiRunState, loadAiConversations, loadAiRuns, deleteAiConversation, listSchemas, listTables, type AiConversation, type AiRun, type AiRunStatus } from "@/lib/backend/api";
+import { aiStream, aiCancelStream, saveAiConversation, saveAiRun, saveAiRunState, loadAiConversations, loadAiRuns, deleteAiConversation, listSchemas, listTables, readUserSkills, type AiConversation, type AiRun, type AiRunStatus } from "@/lib/backend/api";
 import type { AiMessage } from "@/lib/backend/api";
 import type { AiConfigItem, AiEffortCapability, AiEffortOption, AiEffortSelection } from "@/types/ai";
 import type { ConnectionConfig, QueryTab, SavedSqlFile, TableInfo } from "@/types/database";
@@ -167,6 +174,7 @@ import { handleAiTableReferenceDropEvent } from "@/lib/ai/aiTableReferenceDrop";
 import { DBX_TABLE_REFERENCE_DROP_EVENT, clearActiveTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
 import { canSubmitAiPrompt, isAiPromptImeCompositionEvent, shouldSubmitAiPromptOnKeydown } from "@/lib/ai/aiPromptKeyboard";
 import { isActionableWriteProposalMessage, isActionableWriteSqlProposal, looksLikeActionProposal, looksLikeWriteSqlProposal, shouldGrantWriteSqlOnShortAffirmative } from "@/lib/ai/aiProposalDetect";
+import { classifyIntentByLlm, routeIntentByRules, type AiIntentRouteInput } from "@/lib/ai/aiIntentRouter";
 import { visibleToActualIndex } from "@/lib/ai/aiMessageEdit";
 import { shouldShowReasoningCharCount, reasoningCharCountClass } from "@/lib/ai/aiReasoningPresentation";
 import { saveTextFile } from "@/lib/export/saveTextFile";
@@ -175,6 +183,7 @@ import { buildAiConversationExport, type AiConversationExportFormat } from "@/li
 import { buildAiConversationSearchIndex, filterAiConversationSearchIndex } from "@/lib/ai/aiConversationSearch";
 import AiAttachmentCard from "@/components/editor/AiAttachmentCard.vue";
 import { resolveAiMessageCopyText } from "@/lib/ai/aiMessageCopy";
+import { buildPluginAiRequest, pluginContextFromMessages, pluginContextText, streamPluginAiConversation, type AiPluginContext, type AiPluginConversationRequest } from "@/lib/ai/aiPluginConversation";
 
 const { t } = useI18n();
 const AiChartRenderer = defineAsyncComponent({
@@ -240,6 +249,7 @@ type AiReferenceMessageMention = Extract<AiMessageMention, { kind: "table" | "sq
 type AiAttachmentMessageMention = Extract<AiMessageMention, { kind: "csvFile" | "file" | "image" }>;
 
 interface ChatMessage {
+  pluginContext?: AiPluginContext;
   role: "user" | "assistant";
   content: string;
   /** Connection that produced this assistant response; ephemeral export metadata. */
@@ -262,6 +272,13 @@ interface ChatMessage {
   kind?: "contextSummary" | "writeSqlConfirmation" | "productionWriteBlocked";
   /** Per-message token stats from the last agent run; ephemeral, not persisted. */
   tokens?: { input: number; output: number };
+  /**
+   * Set on the user message that was sent while the picker stood on `auto`,
+   * together with the concrete action the router resolved (#9118). Ephemeral
+   * (like `tokens`): it only drives the "Auto · <action>" chip.
+   */
+  routedFrom?: "auto";
+  routedAction?: AiAction;
 }
 
 const props = defineProps<{
@@ -280,13 +297,21 @@ const emit = defineEmits<{
   openExplainPlan: [sql: string];
   toggleMaximize: [];
   close: [];
+  openSettings: [];
 }>();
 
 const prompt = ref("");
 const messages = ref<ChatMessage[]>([]);
+const draftPluginContext = ref<AiPluginContext>();
+const pluginContext = computed(() => pluginContextFromMessages(messages.value) ?? draftPluginContext.value);
 const isGenerating = ref(false);
 const scrollRef = ref<InstanceType<typeof ScrollArea> | null>(null);
-const activeAction = ref<AiAction>("general");
+// Stays a concrete action until the AI config loads: whether new conversations
+// land on the `auto` entry is decided by the Settings > AI toggle (see
+// `resolveDefaultActionSelection`).
+const activeAction = ref<AiActionSelection>("general");
+/** True while the Auto slow path (intent classifier) is in flight for the visible conversation. */
+const routingInFlight = ref(false);
 const assistantMode = ref<AiAssistantMode>("ask");
 // The selection is loaded asynchronously. Apply it once when this panel mounts,
 // but do not let later setting changes alter an active conversation.
@@ -299,6 +324,9 @@ watch(
   (loaded) => {
     if (loaded && !defaultModeInitialized) {
       assistantMode.value = settings.defaultAiMode;
+      // Same apply-once rule as the mode: later setting changes must not
+      // disturb an active conversation.
+      activeAction.value = resolveDefaultActionSelection(settings.defaultAiMode);
       defaultModeInitialized = true;
     }
   },
@@ -347,14 +375,14 @@ const unreadConversations = reactive(new Set<string>());
  *  occupies it. Persisted via `AiConversation.queuedInput` and restored after a
  *  restart. The mode/action are in-memory only (they default to the current
  *  view after a restart). */
-type QueuedConversationInput = { text: string; mode: AiAssistantMode; action: AiAction };
+type QueuedConversationInput = { text: string; mode: AiAssistantMode; action: AiActionSelection };
 const queuedInputs = reactive(new Map<string, QueuedConversationInput>());
 
 /** Auto-send/retry work waiting to enter the normal send pipeline. More than
  * one background run can settle in the same event turn; this must be FIFO, not
  * a single "next send" slot, or the later completion silently drops the first
  * conversation's queued input. */
-type PendingAutoSend = { conversationId: string; text: string; messages: ChatMessage[]; mode: AiAssistantMode; action: AiAction };
+type PendingAutoSend = { conversationId: string; text: string; messages: ChatMessage[]; mode: AiAssistantMode; action: AiActionSelection; pluginContext?: AiPluginContext };
 const pendingAutoSends: PendingAutoSend[] = [];
 
 /** Highest event `seq` the user has read per conversation (parent PRD §8). Set
@@ -478,6 +506,81 @@ watch(
   },
 );
 
+// User skills (read-only SKILL.md files). Selection is panel-session
+// scope like activeTemplateIds above: closing the panel or restarting clears it,
+// conversation switches keep it (prd.md:30).
+const userSkillStore = useUserSkillStore();
+const selectedSkillIds = ref<string[]>([]);
+const showSkillSelector = ref(false);
+const skillFailures = ref<ReadUserSkillFailure[]>([]);
+// Chips derive from the selection truth, not from the catalog: a skill that
+// vanished from discovery must keep a removable chip (prd.md:37) instead of
+// silently becoming an id the user can no longer drop.
+const selectedSkillChips = computed(() => buildSelectedSkillChips(selectedSkillIds.value, (id) => userSkillStore.metaFor(id)));
+// Selector retry-on-open mirrors the template selector above.
+watch(showSkillSelector, (open) => {
+  if (open) void userSkillStore.refresh(skillRootSettings());
+});
+watch(
+  () => [settings.desktopSettings?.custom_ai_skill_root_enabled, settings.desktopSettings?.custom_ai_skill_root] as const,
+  () => {
+    if (showSkillSelector.value) void userSkillStore.refresh(skillRootSettings());
+  },
+);
+
+function skillRootSettings(): UserSkillRootSettings {
+  return {
+    customRootEnabled: settings.desktopSettings?.custom_ai_skill_root_enabled === true,
+    customRoot: settings.desktopSettings?.custom_ai_skill_root?.trim() || null,
+  };
+}
+
+function toggleSkillSelected(id: string) {
+  skillFailures.value = [];
+  selectedSkillIds.value = selectedSkillIds.value.includes(id) ? selectedSkillIds.value.filter((skillId) => skillId !== id) : [...selectedSkillIds.value, id];
+}
+
+function removeSelectedSkill(id: string) {
+  selectedSkillIds.value = removeSkillIds(selectedSkillIds.value, [id]);
+  skillFailures.value = [];
+}
+
+/** Banner Remove: drops every failed skill from the selection, so the next send is not blocked by a stale id. */
+function removeFailedSkills() {
+  selectedSkillIds.value = removeSkillIds(
+    selectedSkillIds.value,
+    skillFailures.value.map((failure) => failure.id),
+  );
+  skillFailures.value = [];
+}
+
+function refreshSkills() {
+  void userSkillStore.refresh(skillRootSettings());
+}
+
+const skillFailureReasonKeys: Record<UserSkillFailureReason, string> = {
+  not_found: "ai.skillsReasonNotFound",
+  root_unavailable: "ai.skillsReasonRootUnavailable",
+  oversized: "ai.skillsReasonOversized",
+  not_utf8: "ai.skillsReasonNotUtf8",
+  invalid_frontmatter: "ai.skillsReasonInvalidFrontmatter",
+  unreadable: "ai.skillsReasonUnreadable",
+};
+
+function skillFailureReasonKey(reason: UserSkillFailureReason): string {
+  return skillFailureReasonKeys[reason];
+}
+
+function openSkillRootSettings() {
+  skillFailures.value = [];
+  emit("openSettings");
+}
+
+function selectedSkillsAgentStep(skills: ReadUserSkill[]): AiAgentStepItem {
+  const details = skills.map((skill) => `${skill.name} (${t(userSkillSourceOfId(skill.id) === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault")})`).join(" · ");
+  return { key: "selected-skills", labelKey: "ai.agentSteps.skillsLoaded", tone: "success", toolName: skills.map((skill) => skill.name).join(", "), toolResult: details };
+}
+
 // Retry store load on selector open if prior init failed (e.g. backend not yet ready at mount)
 watch(showTemplateSelector, (open) => {
   // Retry load on selector open if prior init failed, then apply pending
@@ -494,7 +597,7 @@ watch(showTemplateSelector, (open) => {
 // inferred dialect) so resolution matches the dialect the AI pipeline and
 // prompt selection actually use — the same axis aiDatabaseTypeForConnection
 // established for schema selection.
-const templateDbType = computed(() => (props.connection ? aiDatabaseTypeForConnection(props.connection) : undefined));
+const templateDbType = computed(() => (!pluginContext.value && props.connection ? aiDatabaseTypeForConnection(props.connection) : undefined));
 const aiTemplateNamespaceKey = computed(() => `${props.connection?.id ?? ""}::${props.tab?.database ?? ""}::${props.tab?.schema ?? ""}`);
 let autoTemplatesInitialized = false;
 function applyResolvedTemplateIds(ids: string[]) {
@@ -749,7 +852,7 @@ function submitEdit(visibleIndex: number) {
   if (!content && !editingMentions.value.length && !editingCsvAttachments.value.length && !editingImageAttachments.value.length) return;
   const actualIndex = visibleToActualIndex(messages.value, visibleIndex);
   if (actualIndex < 0) return;
-  if (!props.connection || !props.tab) return;
+  if (!pluginContext.value && (!props.connection || !props.tab)) return;
   if (!activeFullConfig.value) {
     toast(t("ai.noConfig"));
     return;
@@ -759,6 +862,7 @@ function submitEdit(visibleIndex: number) {
     toast(imageAttachmentSupportErrorMessage(imageError), 5000);
     return;
   }
+  draftPluginContext.value = pluginContext.value;
   messages.value = messages.value.slice(0, actualIndex);
   editingMessageIndex.value = null;
   editingContent.value = "";
@@ -1081,8 +1185,8 @@ const canSubmitPrompt = computed(() =>
     prompt: prompt.value,
     contextItemCount: selectedMentions.value.length + selectedSqlFileMentions.value.length + selectedCsvAttachments.value.length + selectedImageAttachments.value.length,
     isAttachmentProcessing: isAttachmentProcessing.value,
-    hasTab: !!props.tab,
-    hasConnection: !!props.connection,
+    hasTab: !!pluginContext.value || !!props.tab,
+    hasConnection: !!pluginContext.value || !!props.connection,
   }),
 );
 let browserAttachmentDragDepth = 0;
@@ -1096,23 +1200,42 @@ const commandOpen = ref(false);
 const commandSelectedIndex = ref(0);
 const commandStart = ref(0);
 
-const filteredCommands = computed(() => {
+/**
+ * `/skill` is a selector shortcut, not an action: it rides a separate command
+ * source and never touches `activeAction` or the mode+action picker (prd.md:31).
+ */
+type AiSlashEntry = { type: "action"; button: AiActionButton } | { type: "skills" };
+
+const filteredCommands = computed<AiSlashEntry[]>(() => {
   const query = prompt.value.slice(commandStart.value + 1).toLowerCase();
-  return actionButtons.value.filter((cmd) => cmd.action.toLowerCase().includes(query) || t(cmd.key).toLowerCase().includes(query));
+  const entries: AiSlashEntry[] = [...actionButtons.value.map((button): AiSlashEntry => ({ type: "action", button })), { type: "skills" }];
+  return entries.filter((entry) => {
+    const haystack = entry.type === "action" ? `${entry.button.action} ${t(entry.button.key)}` : `skill ${t("ai.skillsEntry")}`;
+    return haystack.toLowerCase().includes(query);
+  });
 });
 
 const AI_SQL_FILE_MENTION_CANDIDATE_LIMIT = 50;
 const AI_SQL_FILE_CONTEXT_MAX_CHARS = 12_000;
 
 interface AiActionButton {
-  action: AiAction;
+  action: AiActionSelection;
   icon: Component;
   /** i18n key for the menu label. */
   key: string;
 }
 
+/**
+ * The `auto` entry (#9118) heads both lists: it keeps every explicit action
+ * available while giving users one entry that routes the request to whichever
+ * action fits (see `resolveAutoAction`). It is UI-only — `ASK_ACTIONS` /
+ * `AGENT_ACTIONS` stay free of it.
+ */
+const autoActionButton: AiActionButton = { action: "auto", icon: Sparkles, key: "ai.actions.auto" };
+
 /** Ask-mode actions: SQL-producing, never auto-run. */
 const askActionButtons: AiActionButton[] = [
+  autoActionButton,
   { action: "general", icon: MessageSquarePlus, key: "ai.actions.general" },
   { action: "generate", icon: Wand2, key: "ai.actions.generate" },
   { action: "explain", icon: HelpCircle, key: "ai.actions.explain" },
@@ -1124,6 +1247,7 @@ const askActionButtons: AiActionButton[] = [
 
 /** Agent-mode actions: task-oriented, drive tool use and real results. */
 const agentActionButtons: AiActionButton[] = [
+  autoActionButton,
   { action: "general", icon: MessageSquarePlus, key: "ai.actions.general" },
   { action: "query", icon: Search, key: "ai.actions.query" },
   { action: "exploreSchema", icon: Table2, key: "ai.actions.exploreSchema" },
@@ -1142,8 +1266,18 @@ function resolveDefaultAction(mode: AiAssistantMode): AiAction {
   return defaultActionForMode(mode);
 }
 
+// The Settings > AI toggle lets new conversations land on the `auto` picker
+// entry (#9118); routing still resolves to a concrete action before any
+// request. Vector DBs keep the concrete `generate` action because their action
+// menu is hidden entirely.
+function resolveDefaultActionSelection(mode: AiAssistantMode): AiActionSelection {
+  if (settings.defaultAutoRouting && !(props.connection && isVectorDbType(props.connection.db_type))) return "auto";
+  return resolveDefaultAction(mode);
+}
+
 // Switching mode is a deliberate context change: land on that mode's default action so the
-// menu and behavior match the new intent. The shared `general` action is the default.
+// menu and behavior match the new intent. That default is the mode's concrete action, or
+// `auto` when Settings > AI enables it (#9118).
 //
 // `triggerAction` may set the action itself after programmatically switching mode (e.g. "Fix
 // with AI" invoked from Agent mode); `suppressModeActionReset` tells this watch to skip the
@@ -1154,7 +1288,7 @@ watch(assistantMode, (mode) => {
     suppressModeActionReset = false;
     return;
   }
-  activeAction.value = resolveDefaultAction(mode);
+  activeAction.value = resolveDefaultActionSelection(mode);
 });
 
 watch(
@@ -1169,13 +1303,71 @@ watch(
   { immediate: true },
 );
 
-function selectAction(action: AiAction) {
+function selectAction(action: AiActionSelection) {
   activeAction.value = action;
   if (action === "fix" && props.tab?.result) {
     if (isQueryExecutionErrorResult(props.tab.result)) {
       const errVal = props.tab.result.rows[0]?.[0];
       if (errVal != null) prompt.value = String(errVal);
     }
+  }
+}
+
+/** Menu label of a concrete action, mapped through either mode's button list. */
+function actionLabelFor(action: AiAction | null | undefined): string {
+  if (!action) return "";
+  const button = [...actionButtons.value, ...askActionButtons, ...agentActionButtons].find((item) => item.action === action);
+  return button ? t(button.key) : action;
+}
+
+/** The action the router resolved for an `auto` message, if any (drives the chip). */
+function routedActionOf(message: ChatMessage): AiAction | null {
+  return message.routedFrom === "auto" && message.routedAction ? message.routedAction : null;
+}
+
+/**
+ * The "Auto · <action>" chip switches the picker to the action that was routed
+ * for that message, so the user can keep iterating explicitly. The routed action
+ * is always valid in the mode it was routed in; when the panel now stands in the
+ * other mode, switch there first (the `suppressModeActionReset` handshake keeps
+ * the mode-switch watch from overwriting the action we just set).
+ */
+function switchToRoutedAction(action: AiAction | null | undefined) {
+  if (!action) return;
+  if (!isValidActionForMode(action, assistantMode.value)) {
+    suppressModeActionReset = true;
+    assistantMode.value = isValidActionForMode(action, "ask") ? "ask" : "agent";
+  }
+  activeAction.value = action;
+}
+
+/** Mirrors `buildAiContext`'s `lastError`: only a real failed execution counts. */
+function tabHasLastError(): boolean {
+  const result = props.tab?.result;
+  return !!result && isQueryExecutionErrorResult(result) && result.rows[0]?.[0] != null;
+}
+
+/**
+ * Resolve the `auto` picker entry into one concrete action (#9118), before any
+ * request is assembled: the rule layer answers instantly, and only a rule miss
+ * pays for a single tiny classifier completion (bounded by
+ * `INTENT_CLASSIFY_TIMEOUT_MS`). The classifier never throws and falls back to
+ * the mode default, so an unavailable/slow model cannot fail the send.
+ *
+ * `showProgress` is only true for the conversation actually on screen — a
+ * background auto-send must not flash "识别中" over an unrelated chat.
+ */
+async function resolveAutoAction(text: string, mode: AiAssistantMode, showProgress: boolean): Promise<AiAction> {
+  const input: AiIntentRouteInput = { text, mode, hasCurrentSql: !!props.tab?.sql.trim(), hasLastError: tabHasLastError() };
+  const byRules = routeIntentByRules(input);
+  if (byRules) return byRules;
+  const config = activeFullConfig.value;
+  if (!config) return resolveDefaultAction(mode);
+  if (showProgress) routingInFlight.value = true;
+  try {
+    return await classifyIntentByLlm(input, { config });
+  } finally {
+    if (showProgress) routingInFlight.value = false;
   }
 }
 
@@ -1207,7 +1399,7 @@ function messagesForAgentHistory(historyMessages: ChatMessage[]): AiMessage[] {
 
 const chatTitle = computed(() => {
   const first = messages.value.find((m) => m.role === "user" && m.kind !== "contextSummary");
-  return first ? messageTitle(first).slice(0, 30) : t("ai.newChat");
+  return pluginContext.value?.title || (first ? messageTitle(first).slice(0, 30) : t("ai.newChat"));
 });
 
 const promptMentionChips = computed<AiPromptMentionChip[]>(() => [...selectedMentions.value.map((mention) => ({ ...mention, kind: "table" as const })), ...selectedSqlFileMentions.value]);
@@ -1257,7 +1449,7 @@ function messageTitle(message: ChatMessage): string {
  * still generating or when no such message exists.
  */
 const proposalConfirmMessage = computed<ChatMessage | null>(() => {
-  if (isGenerating.value) return null;
+  if (pluginContext.value || isGenerating.value) return null;
   for (let i = messages.value.length - 1; i >= 0; i--) {
     const msg = messages.value[i];
     if (msg.kind === "contextSummary") continue;
@@ -1341,7 +1533,8 @@ function sendProposalReply(positive: boolean) {
   send();
 }
 
-const activePlaceholder = computed(() => `${t(`ai.placeholders.${activeAction.value}`)} ${t("ai.tableMentionPlaceholderHint")}`);
+// `auto` has no per-action placeholder of its own, so it reuses the general one.
+const activePlaceholder = computed(() => (pluginContext.value ? t("ai.pluginFollowUp") : `${t(`ai.placeholders.${isAutoActionSelection(activeAction.value) ? "general" : activeAction.value}`)} ${t("ai.tableMentionPlaceholderHint")}`));
 const aiCodeAppearance = computed(() => (isDark.value ? "dark" : "light"));
 
 const codeSnapshotOpen = ref(false);
@@ -1367,14 +1560,14 @@ const modeActionTriggerLabel = computed(() => {
 });
 
 function switchModeActionTab(mode: "ask" | "agent") {
-  activeAction.value = resolveDefaultAction(mode);
+  activeAction.value = resolveDefaultActionSelection(mode);
   if (assistantMode.value !== mode) {
     // Set the mode after the action so the tab label and picker stay aligned.
     assistantMode.value = mode;
   }
 }
 
-function selectModeActionItem(action: AiAction) {
+function selectModeActionItem(action: AiActionSelection) {
   // Vector databases only support generation; keep this constraint at the selection boundary.
   if (!showActionButtons.value) return;
   selectAction(action);
@@ -1422,7 +1615,25 @@ const selectedDatabaseValues = computed(() => new Set(selectedDatabases.value));
 const selectedDatabaseLabel = computed(() => {
   if (!props.connection) return t("editor.selectDatabase");
   const labels = dbSelectOptions.value.filter((option) => selectedDatabaseValues.value.has(option.database)).map((option) => option.label);
-  return labels.length ? labels.join(", ") : t("editor.selectDatabase");
+  if (labels.length) return labels.join(", ");
+  // The options list loads asynchronously (on popover open or connection
+  // switch), so before it arrives the selection is still valid — fall back to
+  // the raw database names instead of the "select database" placeholder,
+  // which made the button look unselected while the dropdown showed a check.
+  // Format with the same helper as the option labels so the text stays
+  // identical once the options load (e.g. Redis "db0", localized defaults).
+  const raw = [...selectedDatabaseValues.value];
+  if (raw.length) {
+    return raw
+      .map((database) =>
+        formatDatabaseLabel(props.connection, database, {
+          defaultDatabase: t("editor.defaultDatabase"),
+          noDatabase: t("editor.noDatabase"),
+        }),
+      )
+      .join(", ");
+  }
+  return t("editor.selectDatabase");
 });
 
 function syncSelectedDatabases() {
@@ -1974,10 +2185,15 @@ function normalizeMentionQuery(query: string): { schemaPrefix: string; tableFilt
   };
 }
 
-async function loadMentionCandidates(query: string) {
-  if (!props.connection || !props.tab?.connectionId || !props.tab.database) return;
+function mentionTargetDatabase(): string {
+  return props.tab && props.connection ? resolveAiMentionDatabase(props.tab, props.connection, selectedDatabases.value) : "";
+}
 
-  const key = mentionCacheKey(props.tab.connectionId, props.tab.database, query);
+async function loadMentionCandidates(query: string) {
+  const mentionDatabase = mentionTargetDatabase();
+  if (pluginContext.value || !props.connection || !props.tab?.connectionId || !mentionDatabase) return;
+
+  const key = mentionCacheKey(props.tab.connectionId, mentionDatabase, query);
   if (mentionCache.value[key]) {
     mentionCandidates.value = mentionCache.value[key];
     return;
@@ -1994,11 +2210,11 @@ async function loadMentionCandidates(query: string) {
     await connectionStore.ensureConnected(props.tab.connectionId);
     let tableCandidates: AiMentionCandidate[] = [];
     if (isSchemaAware(props.connection.db_type)) {
-      const schemas = mentionSchemaOrder(await listSchemas(props.tab.connectionId, props.tab.database));
+      const schemas = mentionSchemaOrder(await listSchemas(props.tab.connectionId, mentionDatabase));
       const filteredSchemas = schemaPrefix ? schemas.filter((schema) => schema.toLowerCase().includes(schemaPrefix.toLowerCase())) : schemas;
       const results = await Promise.all(
         filteredSchemas.slice(0, AI_TABLE_MENTION_SCHEMA_LIMIT).map(async (schema) => {
-          const tables = await listTables(props.tab!.connectionId, props.tab!.database, schema, tableFilter || undefined, AI_TABLE_MENTION_CANDIDATE_LIMIT);
+          const tables = await listTables(props.tab!.connectionId, mentionDatabase, schema, tableFilter || undefined, AI_TABLE_MENTION_CANDIDATE_LIMIT);
           return filterAiTableMentionCandidates(
             tables.map((table) => mentionCandidateFromTable(table, schema)),
             tableFilter,
@@ -2008,7 +2224,7 @@ async function loadMentionCandidates(query: string) {
       );
       tableCandidates = filterAiTableMentionCandidates(results.flat(), "", AI_TABLE_MENTION_CANDIDATE_LIMIT);
     } else {
-      const database = props.connection.db_type === "sqlite" ? normalizeSqliteNamespace(props.tab.database || props.connection.database, props.connection) : props.tab.database;
+      const database = props.connection.db_type === "sqlite" ? normalizeSqliteNamespace(mentionDatabase || props.connection.database, props.connection) : mentionDatabase;
       const schema = database || props.connection.database || "main";
       const tables = await listTables(props.tab.connectionId, database, schema, tableFilter || undefined, AI_TABLE_MENTION_CANDIDATE_LIMIT);
       tableCandidates = filterAiTableMentionCandidates(
@@ -2242,7 +2458,7 @@ function imageAttachmentSupportErrorMessage(error: "provider" | "format"): strin
 
 function selectedMessageMentions(tableMentions: AiTableMention[], sqlFileMentions: AiSqlFileMention[], csvAttachments: AiCsvFileContext[] = [], imageAttachments: AiImageAttachment[] = []): AiMessageMention[] {
   const connectionId = props.tab?.connectionId || props.connection?.id || "";
-  const database = props.tab?.database || props.connection?.database || "";
+  const database = mentionTargetDatabase() || props.connection?.database || "";
   return [
     ...tableMentions.map((mention) => ({
       kind: "table" as const,
@@ -2343,7 +2559,7 @@ function refreshMentionState() {
   commandOpen.value = false;
 
   const mention = activeMentionAtCursor();
-  if (!mention || !props.connection || !props.tab?.database) {
+  if (!mention || !props.connection || !mentionTargetDatabase()) {
     mentionOpen.value = false;
     return;
   }
@@ -2355,17 +2571,27 @@ function refreshMentionState() {
   }, 120);
 }
 
+watch(selectedDatabases, () => {
+  if (mentionOpen.value) refreshMentionState();
+});
+
 function onPromptKeyup(event: KeyboardEvent) {
   if (["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(event.key)) return;
   refreshMentionState();
 }
 
-function selectCommand(command: AiActionButton) {
+function selectCommand(command: AiSlashEntry) {
   const before = prompt.value.slice(0, commandStart.value);
   const after = prompt.value.slice(promptTextareaRef.value?.selectionStart ?? prompt.value.length);
   prompt.value = `${before}${after}`.replace(/\s{2,}/g, " ").trim();
   commandOpen.value = false;
-  activeAction.value = command.action;
+  if (command.type === "skills") {
+    skillFailures.value = [];
+    showSkillSelector.value = true;
+    nextTick(() => promptTextareaRef.value?.focus());
+    return;
+  }
+  activeAction.value = command.button.action;
   nextTick(() => {
     const textarea = promptTextareaRef.value;
     if (textarea) {
@@ -2772,6 +2998,7 @@ function onTauriFileDrop(event: Event) {
 }
 
 function onTableReferenceDropEvent(event: Event) {
+  if (pluginContext.value) return;
   handleAiTableReferenceDropEvent(event, {
     context: {
       connectionId: props.tab?.connectionId || props.connection?.id,
@@ -2806,19 +3033,25 @@ async function send() {
 
   // Snapshot the target connection/database before any async work so that
   // suspension points during context loading cannot cause a TOCTOU target switch.
-  const connection = props.connection;
-  const tab = props.tab;
-  if (!connection || !tab) {
+  const runPluginContext = auto ? (pluginContextFromMessages(auto.messages) ?? auto.pluginContext) : pluginContext.value;
+  const connection = runPluginContext ? undefined : props.connection;
+  const tab = runPluginContext ? undefined : props.tab;
+  const runSourceName = runPluginContext?.pluginName ?? connection?.name ?? "";
+  if (!runPluginContext && (!connection || !tab)) {
     clearPendingWriteGrant();
     return;
   }
   // Capture the selection before context loading or queued run scheduling can
   // yield to another conversation. Dameng's top-level selector is a schema.
-  const runDatabases = resolveAiNamespaceSelection(tab, connection).kind === "database" ? [...selectedDatabases.value] : [];
+  const runDatabases = connection && tab && resolveAiNamespaceSelection(tab, connection).kind === "database" ? [...selectedDatabases.value] : [];
   const activeConfig = activeFullConfig.value;
   if (!activeConfig) {
     clearPendingWriteGrant();
     toast(t("ai.noConfig"));
+    return;
+  }
+  if (runPluginContext && activeConfig.provider.endsWith("-cli")) {
+    toast(t("ai.pluginHttpModelOnly"));
     return;
   }
   const imageError = imageAttachmentSupportError(activeConfig.provider, auto ? [] : selectedImageAttachments.value.map((attachment) => attachment.mediaType));
@@ -2876,10 +3109,10 @@ async function send() {
       status: "preparing",
       messages: runMessages,
       assistantMessageIndex: -1,
-      connectionId: connection.id,
-      connectionName: connection.name,
-      database: tab.database || "",
-      schema: resolveAiDatabaseTarget(tab, connection).schema,
+      connectionId: connection?.id ?? "",
+      connectionName: runSourceName,
+      database: tab?.database || "",
+      schema: connection && tab ? resolveAiDatabaseTarget(tab, connection).schema : undefined,
       createdAt: resumingConfirmedWrite ? resumableRun!.createdAt : runCreatedAt,
       updatedAt: runCreatedAt,
       // Carry the proposal snapshot across a confirmed-write resume so a queued
@@ -2904,6 +3137,38 @@ async function send() {
   }
   const generationCanContinue = () => (detachedRun ? !detachedRun.cancelRequested : aiGenerationGuard.isCurrent(myGeneration));
   const runIsVisible = () => !detachedRun || (assistantViewMounted && conversationId.value === runConversationId);
+  // Selected skills are read and validated through the backend registry right
+  // before the request pipeline starts (after the generation guard: no awaits
+  // above this point). On any failure no AI request is sent: the failure banner
+  // appears above the composer while the draft and selection stay untouched
+  // (prd send-time loading contract).
+  let sendSkillSnapshot: ReadUserSkill[] | undefined;
+  if (selectedSkillIds.value.length > 0) {
+    skillFailures.value = [];
+    const skillRead = await readUserSkills([...selectedSkillIds.value], skillRootSettings());
+    if (skillRead.failures.length > 0) {
+      skillFailures.value = skillRead.failures;
+      clearPendingWriteGrant();
+      if (generationCanContinue()) {
+        if (detachedRun) finishDesktopAiRun(detachedRun, "failed");
+        if (runIsVisible()) {
+          isGenerating.value = false;
+          stopStatusTimer();
+          generationStatus.value = createGenerationStatus(Date.now());
+        }
+      }
+      resolveDetachedRunSettled();
+      return;
+    }
+    // Skill bodies are only known here, so the combined budget is enforced on
+    // the read snapshots: overflowing skills are skipped for this send while
+    // the selection itself stays untouched.
+    const cappedSkills = capSkillsToCharLimit(skillRead.skills, ACTIVE_SKILLS_TOTAL_MAX);
+    if (cappedSkills.length < skillRead.skills.length) {
+      toast(t("ai.skillsTotalTrimmed", { max: ACTIVE_SKILLS_TOTAL_MAX }), 4000);
+    }
+    sendSkillSnapshot = cappedSkills;
+  }
   if (!(await promptTemplateStore.ensureLoaded())) {
     clearPendingWriteGrant();
     if (generationCanContinue()) {
@@ -2941,7 +3206,8 @@ async function send() {
   // cannot change the instructions for an already-submitted request.
   const customPromptContext: CustomPromptContext = {
     globalInstructions: promptTemplateStore.globalInstructions,
-    activeTemplates: [...activeTemplates.value],
+    activeTemplates: runPluginContext ? [] : [...activeTemplates.value],
+    ...(sendSkillSnapshot?.length ? { selectedSkills: sendSkillSnapshot } : {}),
   };
   // Remember what was actually sent for this db_type so panels opened later can
   // restore it when no explicit per-db_type defaults are configured. This runs
@@ -2951,8 +3217,8 @@ async function send() {
     settings.recordLastUsedTemplates(templateDbType.value, [...activeTemplateIds.value]);
   }
 
-  const selectedTableMentions = auto ? [] : [...selectedMentions.value];
-  const selectedSqlFiles = auto ? [] : [...selectedSqlFileMentions.value];
+  const selectedTableMentions = auto || runPluginContext ? [] : [...selectedMentions.value];
+  const selectedSqlFiles = auto || runPluginContext ? [] : [...selectedSqlFileMentions.value];
   const csvAttachments = auto ? [] : [...selectedCsvAttachments.value];
   const imageAttachments = auto ? [] : [...selectedImageAttachments.value];
   const mentionedTables = [...selectedTableMentions, ...parseAiTableMentions(text)];
@@ -2962,7 +3228,15 @@ async function send() {
     userText: text,
   });
 
-  runMessages.push({ role: "user", content: text, mentions: selectedMessageMentions(selectedTableMentions, selectedSqlFiles, csvAttachments, imageAttachments), csvAttachments, imageAttachments });
+  const userMessage: ChatMessage = {
+    role: "user",
+    content: text,
+    ...(runPluginContext && !pluginContextFromMessages(runMessages) ? { pluginContext: runPluginContext } : {}),
+    mentions: selectedMessageMentions(selectedTableMentions, selectedSqlFiles, csvAttachments, imageAttachments),
+    csvAttachments,
+    imageAttachments,
+  };
+  runMessages.push(userMessage);
   if (!auto) {
     // Save to prompt history (deduplicate consecutive duplicates)
     if (text && promptHistory.value[0] !== text) {
@@ -2979,12 +3253,49 @@ async function send() {
   }
   if (autoSendVisible) scrollToBottom({ force: true });
 
-  const requestedAction = auto ? auto.action : activeAction.value;
-  const requestedMode = auto ? auto.mode : assistantMode.value;
+  const requestedSelection: AiActionSelection = auto ? auto.action : activeAction.value;
+  const requestedMode: AiAssistantMode = runPluginContext ? "ask" : auto ? auto.mode : assistantMode.value;
+  // A confirmed-write turn (the ✅ reply, or the segment that resumes an
+  // `awaiting_write_confirmation` run) is a continuation of the pending proposal,
+  // not a new user request: its reply text is component copy, so the Auto router
+  // must not classify it. Keeping the mode default there preserves the pre-Auto
+  // confirmation behavior (`taskContract.action` = the picker's default) instead
+  // of letting a guess describe the wrong task to the backend.
+  const confirmationContinuation = allowWriteSqlForNextRun || resumingConfirmedWrite;
+  // The "auto" picker entry is resolved HERE, before any request is assembled:
+  // `taskContract.action` must be a concrete action (the backend interpolates it
+  // into its system prompt and uses it for final-answer contract validation), and
+  // `aiSkillForAction` throws on unknown actions. Explicit selections skip the
+  // router entirely, so their behavior is unchanged (#9118).
+  let requestedAction: AiAction;
+  if (runPluginContext) {
+    // A plugin conversation carries its own data snapshot: the Auto router must
+    // not classify the prompt, and the task contract stays host-owned.
+    requestedAction = "general";
+  } else if (!isAutoActionSelection(requestedSelection)) {
+    requestedAction = requestedSelection;
+  } else if (confirmationContinuation) {
+    // Nothing was routed here, so no "Auto · …" chip either (the proposal card
+    // already explains what this turn does).
+    requestedAction = resolveDefaultAction(requestedMode);
+  } else {
+    requestedAction = await resolveAutoAction(text, requestedMode, runIsVisible());
+    // Keep the outcome on the message so the "Auto · <action>" chip can explain
+    // (and re-select) what the router chose.
+    userMessage.routedFrom = "auto";
+    userMessage.routedAction = requestedAction;
+  }
+  // Superseded while the classifier ran (stop/clear/switch): nothing has been
+  // sent to the backend yet, so bail the same way the template-load wait does.
+  if (!generationCanContinue()) {
+    clearPendingWriteGrant();
+    resolveDetachedRunSettled();
+    return;
+  }
   // Detect user-typed short confirmation (e.g. "可以"/"go ahead") as an alternative
   // path to the proposal ✅ button. Delegates to the shared pure function so the
   // component and its unit tests share the same gating logic.
-  if (!allowWriteSqlForNextRun) {
+  if (!runPluginContext && connection && tab && !allowWriteSqlForNextRun) {
     allowWriteSqlForNextRun = shouldGrantWriteSqlOnShortAffirmative({
       mode: requestedMode,
       alreadyGranted: false,
@@ -3018,7 +3329,7 @@ async function send() {
   // Verify the connection/database/schema haven't changed since the user confirmed
   // the write operation. If the user switched connections or namespaces between
   // confirmation and execution, the grant is void.
-  if (allowWriteSqlForNextRun && confirmedWriteSqlText) {
+  if (connection && tab && allowWriteSqlForNextRun && confirmedWriteSqlText) {
     const target = resolveAiDatabaseTarget(tab, connection);
     if (confirmedConnectionId !== connection.id || confirmedDatabase !== target.database || confirmedSchema !== target.schema) {
       allowWriteSqlForNextRun = false;
@@ -3067,8 +3378,11 @@ async function send() {
       return;
     }
   }
-  runMessages.push({ role: "assistant", content: "", sourceConnectionName: connection.name });
+  runMessages.push({ role: "assistant", content: "", sourceConnectionName: runSourceName });
   const assistantIdx = runMessages.length - 1;
+  if (requestedMode === "agent" && sendSkillSnapshot?.length) {
+    runMessages[assistantIdx].agentSteps = [selectedSkillsAgentStep(sendSkillSnapshot)];
+  }
   const sessionId = uuid();
   if (runIsVisible()) {
     currentAssistantMessageIndex = assistantIdx;
@@ -3100,150 +3414,163 @@ async function send() {
     // must not be undone by this snapshot either.
     if (!detachedRun.discardOnFinish) void runSnapshotScheduler.save(detachedRun);
   } else {
-    void persistConversationSnapshot(runConversationId, runMessages, connection.name, tab.database || "", runCreatedAt);
+    void persistConversationSnapshot(runConversationId, runMessages, runSourceName, tab?.database || "", runCreatedAt);
   }
   try {
-    const sqlFiles = await loadReferencedSqlFiles(selectedSqlFiles);
-    // Superseded while awaiting loadReferencedSqlFiles() above — bail before
-    // paying for buildAiContext() too; it can do real backend/schema work that
-    // would be entirely wasted on an already-abandoned request.
-    if (!generationCanContinue()) return;
-    const requestDatabase = runDatabases[0] ?? tab.database;
-    const context = await buildAiContext(
-      {
-        ...tab,
-        database: requestDatabase,
-        schema: runDatabases.length > 1 || requestDatabase !== tab.database ? undefined : tab.schema,
-      },
-      connection,
-      {
-        mentionedTables,
-        sqlFiles,
-        csvFiles: csvAttachments,
-      },
-    );
-    context.selectedDatabases = runDatabases;
-    // Superseded while awaiting buildAiContext() above — must bail before ever
-    // calling runAgentStream(), not just before writing its results. Without
-    // this recheck, a clear/switch/unmount that fires during context
-    // preparation invalidates the generation but the request still gets sent to
-    // the backend and starts executing tools/SQL; the best-effort cancel RPC
-    // fired by abandonInFlightRequest() is a no-op here since no session has
-    // been registered with the backend yet (registration happens inside
-    // runAgentStream() itself).
-    if (!generationCanContinue()) return;
-    // The stream is about to reach the backend — transition the status line from
-    // `preparing` to `waiting_model` so it reads "等待模型响应" while no events have
-    // arrived yet (slow CLI first token included).
-    if (runIsVisible()) generationStatus.value = { ...generationStatus.value, phase: "waiting_model" };
     const history: AiMessage[] = messagesForAgentHistory(runMessages.slice(0, -2));
-    await runAgentStream(
-      {
-        config: activeConfig,
-        action: requestedAction,
-        mode: requestedMode,
-        instruction: modelInstruction,
-        taskContractUserRequest: text,
-        context,
-        inlineImages: imageAttachments.map(({ mediaType, data }) => ({ mediaType, data })),
-        allowWriteSql,
-        confirmedWriteSql,
-        confirmedConnectionId: confirmedTargetConnId,
-        confirmedDatabase: confirmedTargetDb,
-        confirmedSchema: confirmedTargetSchema,
-      },
-      history,
-      (event: AgentEvent) => {
-        // Superseded by a clear/switch/new-chat (or a newer send()) — the backend
-        // stream may still be running, but this generation no longer owns any
-        // shared state to write into.
-        if (!generationCanContinue()) return;
-        agentEvents.push(event);
-        // Every desktop agent event takes the next seq for its run (parent PRD
-        // §8: strictly increasing from 1, across all sessions). Mark the
-        // conversation unread when a new event arrives beyond the user's read
-        // baseline while they are looking elsewhere.
+    const onEvent = (event: AgentEvent) => {
+      // Superseded by a clear/switch/new-chat (or a newer send()) — the backend
+      // stream may still be running, but this generation no longer owns any
+      // shared state to write into.
+      if (!generationCanContinue()) return;
+      agentEvents.push(event);
+      // Every desktop agent event takes the next seq for its run (parent PRD
+      // §8: strictly increasing from 1, across all sessions). Mark the
+      // conversation unread when a new event arrives beyond the user's read
+      // baseline while they are looking elsewhere.
+      if (detachedRun) {
+        const seq = bumpDesktopAiRunSeq(detachedRun);
+        if (!runIsVisible() && seq > (conversationReadSeq.get(runConversationId) ?? 0)) unreadConversations.add(runConversationId);
+      }
+      // Feed every agent event into the generation-status state machine (Issue
+      // #6743 feature 1). `applyStatusEvent` refreshes lastEventAt, tracks the
+      // active tool / turn, and derives the phase purely from the event stream.
+      if (runIsVisible()) generationStatus.value = applyStatusEvent(generationStatus.value, event, Date.now());
+      // Terminal event (agent_end / error) hides the status line immediately —
+      // the backend promise may still be settling (CLI teardown / SSE close), so
+      // stop the ticker now instead of letting it idle through that gap. The
+      // non-terminal `response_complete` (phase=finalizing) hides the line the
+      // same way, but the listener stays alive for the real agent_end/error.
+      if (runIsVisible() && (generationStatus.value.phase === "finished" || generationStatus.value.phase === "finalizing")) {
+        stopStatusTimer();
+      }
+      if (event.type === "text_delta" && event.delta) {
+        if (detachedDeltaBuffer) detachedDeltaBuffer.appendText(assistantIdx, event.delta);
+        else appendAssistantDelta(assistantIdx, event.delta);
+      }
+      if (event.type === "write_sql_confirmation_required") {
+        writeConfirmationRequired = true;
         if (detachedRun) {
-          const seq = bumpDesktopAiRunSeq(detachedRun);
-          if (!runIsVisible() && seq > (conversationReadSeq.get(runConversationId) ?? 0)) unreadConversations.add(runConversationId);
+          updateDesktopAiRun(detachedRun, {
+            pendingConfirmation: {
+              sql: event.sql,
+              connectionId: detachedRun.connectionId,
+              database: detachedRun.database,
+              schema: detachedRun.schema,
+            },
+          });
         }
-        // Feed every agent event into the generation-status state machine (Issue
-        // #6743 feature 1). `applyStatusEvent` refreshes lastEventAt, tracks the
-        // active tool / turn, and derives the phase purely from the event stream.
-        if (runIsVisible()) generationStatus.value = applyStatusEvent(generationStatus.value, event, Date.now());
-        // Terminal event (agent_end / error) hides the status line immediately —
-        // the backend promise may still be settling (CLI teardown / SSE close), so
-        // stop the ticker now instead of letting it idle through that gap. The
-        // non-terminal `response_complete` (phase=finalizing) hides the line the
-        // same way, but the listener stays alive for the real agent_end/error.
-        if (runIsVisible() && (generationStatus.value.phase === "finished" || generationStatus.value.phase === "finalizing")) {
-          stopStatusTimer();
+        if (detachedDeltaBuffer) detachedDeltaBuffer.replaceText(assistantIdx, writeSqlConfirmationText(event.sql));
+        else replaceAssistantText(assistantIdx, writeSqlConfirmationText(event.sql));
+        const msg = runMessages[assistantIdx];
+        if (msg) msg.kind = "writeSqlConfirmation";
+      }
+      if (event.type === "production_write_blocked") {
+        if (detachedDeltaBuffer) detachedDeltaBuffer.replaceText(assistantIdx, productionWriteBlockedText(event.sql));
+        else replaceAssistantText(assistantIdx, productionWriteBlockedText(event.sql));
+        const msg = runMessages[assistantIdx];
+        if (msg) msg.kind = "productionWriteBlocked";
+      }
+      if (event.type === "reasoning_delta" && event.delta) {
+        if (detachedDeltaBuffer) detachedDeltaBuffer.appendReasoning(assistantIdx, event.delta);
+        else appendAssistantReasoning(assistantIdx, event.delta);
+      }
+      if (event.type === "agent_end") {
+        // End the card's "思考过程" spinner at the terminal event rather than
+        // waiting for send()'s finally (which can lag behind CLI teardown).
+        const msg = runMessages[assistantIdx];
+        if (msg) msg.isThinking = false;
+        if (event.input_tokens || event.output_tokens) {
+          if (msg) msg.tokens = { input: event.input_tokens ?? 0, output: event.output_tokens ?? 0 };
         }
-        if (event.type === "text_delta" && event.delta) {
-          if (detachedDeltaBuffer) detachedDeltaBuffer.appendText(assistantIdx, event.delta);
-          else appendAssistantDelta(assistantIdx, event.delta);
+      }
+      if (event.type === "context_compacted") {
+        const msg = runMessages[assistantIdx];
+        if (msg) {
+          if (!msg.agentSteps) msg.agentSteps = [];
+          const step = agentEventToStep(event, agentEvents.length - 1, Date.now());
+          if (step) upsertAgentStep(msg.agentSteps, step);
         }
-        if (event.type === "write_sql_confirmation_required") {
-          writeConfirmationRequired = true;
-          if (detachedRun) {
-            updateDesktopAiRun(detachedRun, {
-              pendingConfirmation: {
-                sql: event.sql,
-                connectionId: detachedRun.connectionId,
-                database: detachedRun.database,
-                schema: detachedRun.schema,
-              },
-            });
-          }
-          if (detachedDeltaBuffer) detachedDeltaBuffer.replaceText(assistantIdx, writeSqlConfirmationText(event.sql));
-          else replaceAssistantText(assistantIdx, writeSqlConfirmationText(event.sql));
-          const msg = runMessages[assistantIdx];
-          if (msg) msg.kind = "writeSqlConfirmation";
+        const compaction = { summary: event.summary, compactedMessages: event.compacted_messages };
+        if (detachedRun) detachedCompaction = compaction;
+        else pendingCompaction.value = compaction;
+      }
+      // Real-time agent step rendering
+      if (event.type === "tool_call_start" || event.type === "tool_call_end") {
+        const msg = runMessages[assistantIdx];
+        if (msg) {
+          if (!msg.agentSteps) msg.agentSteps = [];
+          const step = agentEventToStep(event, agentEvents.length - 1, Date.now());
+          if (step) upsertAgentStep(msg.agentSteps, step);
         }
-        if (event.type === "production_write_blocked") {
-          if (detachedDeltaBuffer) detachedDeltaBuffer.replaceText(assistantIdx, productionWriteBlockedText(event.sql));
-          else replaceAssistantText(assistantIdx, productionWriteBlockedText(event.sql));
-          const msg = runMessages[assistantIdx];
-          if (msg) msg.kind = "productionWriteBlocked";
-        }
-        if (event.type === "reasoning_delta" && event.delta) {
-          if (detachedDeltaBuffer) detachedDeltaBuffer.appendReasoning(assistantIdx, event.delta);
-          else appendAssistantReasoning(assistantIdx, event.delta);
-        }
-        if (event.type === "agent_end") {
-          // End the card's "思考过程" spinner at the terminal event rather than
-          // waiting for send()'s finally (which can lag behind CLI teardown).
-          const msg = runMessages[assistantIdx];
-          if (msg) msg.isThinking = false;
-          if (event.input_tokens || event.output_tokens) {
-            if (msg) msg.tokens = { input: event.input_tokens ?? 0, output: event.output_tokens ?? 0 };
-          }
-        }
-        if (event.type === "context_compacted") {
-          const msg = runMessages[assistantIdx];
-          if (msg) {
-            if (!msg.agentSteps) msg.agentSteps = [];
-            const step = agentEventToStep(event, agentEvents.length - 1, Date.now());
-            if (step) upsertAgentStep(msg.agentSteps, step);
-          }
-          const compaction = { summary: event.summary, compactedMessages: event.compacted_messages };
-          if (detachedRun) detachedCompaction = compaction;
-          else pendingCompaction.value = compaction;
-        }
-        // Real-time agent step rendering
-        if (event.type === "tool_call_start" || event.type === "tool_call_end") {
-          const msg = runMessages[assistantIdx];
-          if (msg) {
-            if (!msg.agentSteps) msg.agentSteps = [];
-            const step = agentEventToStep(event, agentEvents.length - 1, Date.now());
-            if (step) upsertAgentStep(msg.agentSteps, step);
-          }
-        }
-        if (runIsVisible()) scrollToBottom();
-      },
-      sessionId,
-      customPromptContext,
-    );
+      }
+      if (runIsVisible()) scrollToBottom();
+    };
+    if (runPluginContext) {
+      if (!generationCanContinue()) return;
+      if (runIsVisible()) generationStatus.value = { ...generationStatus.value, phase: "waiting_model" };
+      const request = buildPluginAiRequest(
+        activeConfig,
+        runPluginContext,
+        [...history, { role: "user", content: [text, ...csvAttachments.map((file) => `${file.name}\n${file.content}`)].join("\n\n"), images: imageAttachments.map(({ mediaType, data }) => ({ mediaType, data })) }],
+        [customPromptContext.globalInstructions || "", ...(customPromptContext.activeTemplates || []).map((template) => template.content)],
+      );
+      await streamPluginAiConversation(aiStream, sessionId, request, onEvent);
+    } else if (connection && tab) {
+      const sqlFiles = await loadReferencedSqlFiles(selectedSqlFiles);
+      // Superseded while awaiting loadReferencedSqlFiles() above — bail before
+      // paying for buildAiContext() too; it can do real backend/schema work that
+      // would be entirely wasted on an already-abandoned request.
+      if (!generationCanContinue()) return;
+      const requestDatabase = runDatabases[0] ?? tab.database;
+      const context = await buildAiContext(
+        {
+          ...tab,
+          database: requestDatabase,
+          schema: runDatabases.length > 1 || requestDatabase !== tab.database ? undefined : tab.schema,
+        },
+        connection,
+        {
+          mentionedTables,
+          sqlFiles,
+          csvFiles: csvAttachments,
+        },
+      );
+      context.selectedDatabases = runDatabases;
+      // Superseded while awaiting buildAiContext() above — must bail before ever
+      // calling runAgentStream(), not just before writing its results. Without
+      // this recheck, a clear/switch/unmount that fires during context
+      // preparation invalidates the generation but the request still gets sent to
+      // the backend and starts executing tools/SQL; the best-effort cancel RPC
+      // fired by abandonInFlightRequest() is a no-op here since no session has
+      // been registered with the backend yet (registration happens inside
+      // runAgentStream() itself).
+      if (!generationCanContinue()) return;
+      // The stream is about to reach the backend — transition the status line from
+      // `preparing` to `waiting_model` so it reads "等待模型响应" while no events have
+      // arrived yet (slow CLI first token included).
+      if (runIsVisible()) generationStatus.value = { ...generationStatus.value, phase: "waiting_model" };
+      await runAgentStream(
+        {
+          config: activeConfig,
+          action: requestedAction,
+          mode: requestedMode,
+          instruction: modelInstruction,
+          taskContractUserRequest: text,
+          context,
+          inlineImages: imageAttachments.map(({ mediaType, data }) => ({ mediaType, data })),
+          allowWriteSql,
+          confirmedWriteSql,
+          confirmedConnectionId: confirmedTargetConnId,
+          confirmedDatabase: confirmedTargetDb,
+          confirmedSchema: confirmedTargetSchema,
+        },
+        history,
+        onEvent,
+        sessionId,
+        customPromptContext,
+      );
+    }
   } catch (e: unknown) {
     // A superseded generation's error (including one caused by an
     // abandonInFlightRequest()-triggered cancellation) must not overwrite a
@@ -3287,8 +3614,9 @@ async function send() {
         statusNow.value = Date.now();
       }
       // Render agent tool call steps from agent events (fallback when no real-time steps)
-      if (msg && agentEvents.length > 0 && !msg.agentSteps?.length) {
-        const steps: AiAgentStepItem[] = [];
+      const hasRuntimeSteps = msg?.agentSteps?.some((step) => step.key !== "selected-skills") ?? false;
+      if (msg && agentEvents.length > 0 && !hasRuntimeSteps) {
+        const steps: AiAgentStepItem[] = [...(msg.agentSteps ?? [])];
         agentEvents.forEach((e, index) => {
           const step = agentEventToStep(e, index, Date.now());
           if (step) upsertAgentStep(steps, step);
@@ -3296,7 +3624,7 @@ async function send() {
         if (steps.length) msg.agentSteps = steps;
       }
       // Fallback: use aiAgentPlan for backward compatibility
-      if (msg && !msg.agentSteps?.length) {
+      if (msg && !hasRuntimeSteps && connection && tab) {
         const agentPlan = buildAiAgentPlan({
           mode: requestedMode,
           action: requestedAction,
@@ -3305,7 +3633,7 @@ async function send() {
           connection: connection,
           database: tab.database,
         });
-        if (msg && requestedMode === "agent") msg.agentSteps = buildAiAgentStepItems(agentPlan);
+        if (msg && requestedMode === "agent") msg.agentSteps = [...(msg.agentSteps ?? []), ...buildAiAgentStepItems(agentPlan)];
         if (agentPlan.handoffSql) emit("requestAutoExecuteSql", agentPlan.handoffSql);
       }
       if (runIsVisible()) {
@@ -3386,7 +3714,7 @@ async function send() {
           });
         }
       } else if (!detachedRun) {
-        void persistConversationSnapshot(runConversationId, runMessages, connection.name, tab.database || "", runCreatedAt);
+        void persistConversationSnapshot(runConversationId, runMessages, runSourceName, tab?.database || "", runCreatedAt);
       }
       if (runIsVisible()) scrollToBottom();
       // Wake any stop request waiting for this pipeline's real terminal state.
@@ -3399,8 +3727,8 @@ async function send() {
  *  in the background when the conversation is not the visible one. The queued
  *  input is consumed by the send pipeline once it actually starts, so a failed
  *  early bail (no config, superseded) does not silently drop it. */
-function scheduleAutoSend(convId: string, queued: QueuedConversationInput, messages: ChatMessage[]) {
-  pendingAutoSends.push({ conversationId: convId, text: queued.text, messages, mode: queued.mode, action: queued.action });
+function scheduleAutoSend(convId: string, queued: QueuedConversationInput, messages: ChatMessage[], context = pluginContextFromMessages(messages)) {
+  pendingAutoSends.push({ conversationId: convId, text: queued.text, messages, mode: queued.mode, action: queued.action, pluginContext: context });
   void send();
 }
 
@@ -3622,6 +3950,11 @@ function resetPendingRequestState() {
   stopStatusTimer();
   generationStatus.value = createGenerationStatus(Date.now());
   statusNow.value = Date.now();
+  // Abandon-path cleanup for the Auto router indicator too (#9118): the classifier
+  // promise clears this in its own `finally` (normal path), but a clear/switch/
+  // unmount must drop it synchronously, or "识别中" stays on screen in the next
+  // conversation until that bounded call settles.
+  routingInFlight.value = false;
 }
 
 // `alreadyCancelledSessionId`: the session id a caller (cancelStream()) has
@@ -3773,11 +4106,11 @@ async function exportConversationAs(format: AiConversationExportFormat) {
       }
     }
     const result = buildAiConversationExport({
-      connectionName: props.connection?.name,
+      connectionName: pluginContext.value?.pluginName ?? props.connection?.name,
       dateLabel: new Date().toLocaleString(),
       messages: visibleMessages.value.map((msg) => ({
         role: msg.role,
-        content: msg.content,
+        content: msg.pluginContext ? `${msg.content}\n\n${pluginContextText(msg.pluginContext)}` : msg.content,
         kind: msg.kind,
         failed: msg.failed === true || (runFailed && msg === failedTurnAssistant),
       })),
@@ -3817,6 +4150,9 @@ function clearMessages() {
   // the transcript, so returning to this conversation shows what changed.
   if (conversationId.value) conversationReadMessageCount.set(conversationId.value, visibleMessages.value.length);
   messages.value = [];
+  draftPluginContext.value = undefined;
+  clearContextReferences();
+  clearPendingWriteGrant();
   cancelEdit();
   clearAttachmentDraftState();
   conversationId.value = "";
@@ -3848,7 +4184,8 @@ function buildConversationSnapshot(targetConversationId: string, targetMessages:
   const existingConversation = conversations.value.find((conversation) => conversation.id === targetConversationId);
   return {
     id: targetConversationId,
-    title: renamedConversationTitles.get(targetConversationId) || existingConversation?.title || (first ? messageTitle(first).slice(0, 50) : "Untitled"),
+    title: first?.pluginContext?.title || renamedConversationTitles.get(targetConversationId) || existingConversation?.title || (first ? messageTitle(first).slice(0, 50) : "Untitled"),
+    pluginContext: pluginContextFromMessages(targetMessages),
     connectionName,
     database,
     messages: targetMessages.map((m) => ({
@@ -3965,7 +4302,8 @@ async function persistPendingInputRecovery(conversation: AiConversation, message
   const first = messages.find((m) => m.role === "user" && m.kind !== "contextSummary");
   const snapshot: AiConversation = {
     id: conversation.id,
-    title: first ? messageTitle(first).slice(0, 50) : conversation.title || "Untitled",
+    title: conversation.pluginContext?.title || (first ? messageTitle(first).slice(0, 50) : conversation.title || "Untitled"),
+    pluginContext: conversation.pluginContext,
     connectionName: conversation.connectionName,
     database: conversation.database,
     messages: messages.map((m) => ({
@@ -3988,9 +4326,9 @@ async function persistPendingInputRecovery(conversation: AiConversation, message
 }
 
 async function persistConversation() {
-  if (!messages.value.length || !props.connection) return;
+  if (!messages.value.length || (!pluginContext.value && !props.connection)) return;
   if (!conversationId.value) conversationId.value = uuid();
-  await persistConversationSnapshot(conversationId.value, messages.value, props.connection.name, props.tab?.database || "");
+  await persistConversationSnapshot(conversationId.value, messages.value, pluginContext.value?.pluginName ?? props.connection?.name ?? "", pluginContext.value ? "" : props.tab?.database || "");
 }
 
 async function setConversationListOpen(open: boolean) {
@@ -4036,10 +4374,11 @@ async function commitRenameConversation(conv: AiConversation) {
 }
 
 function chatMessagesFromConversation(conv: AiConversation): ChatMessage[] {
-  return conv.messages.map((m) => ({
+  return conv.messages.map((m, index) => ({
     role: m.role as "user" | "assistant",
     content: m.content,
     sourceConnectionName: m.role === "assistant" ? conv.connectionName : undefined,
+    pluginContext: index === 0 ? conv.pluginContext : undefined,
     mentions: Array.isArray(m.mentions) ? (m.mentions as AiMessageMention[]) : undefined,
     reasoning: m.reasoning,
     kind: m.kind,
@@ -4059,12 +4398,19 @@ function selectConversation(conv: AiConversation) {
   // summaries are filtered out of rendering) so the anchor matches row indices.
   if (conversationId.value) conversationReadMessageCount.set(conversationId.value, visibleMessages.value.length);
   conversationId.value = conv.id;
+  draftPluginContext.value = conv.pluginContext;
+  clearContextReferences();
+  clearPendingWriteGrant();
   cancelEdit();
   clearAttachmentDraftState();
   // Drop the previous conversation's rendered Markdown instead of keeping it until the LRU evicts it.
   messageRenderer.value.clear();
   const activeRun = backgroundAiRunsEnabled ? desktopAiRun<ChatMessage>(conv.id) : undefined;
   messages.value = activeRun?.messages ?? chatMessagesFromConversation(conv);
+  if (pluginContext.value) {
+    assistantMode.value = "ask";
+    activeAction.value = "general";
+  }
   unreadConversations.delete(conv.id);
   isGenerating.value = activeRun?.status === "preparing" || activeRun?.status === "queued" || activeRun?.status === "running";
   currentSessionId.value = activeRun?.currentSessionId ?? "";
@@ -4203,10 +4549,11 @@ function discardRecoveredDraft() {
 function startNewChat() {
   clearMessages();
   showConversationList.value = false;
-  // A fresh conversation starts from the configured default mode.
+  // A fresh conversation starts from the configured default mode and, when the
+  // Settings > AI toggle says so, from the `auto` picker entry (#9118).
   const mode = settings.defaultAiMode;
   assistantMode.value = mode;
-  activeAction.value = resolveDefaultAction(mode);
+  activeAction.value = resolveDefaultActionSelection(mode);
 }
 
 /** Send-button dispatcher: with an active run on the visible conversation the
@@ -4285,7 +4632,7 @@ function retryConversationRun(convId: string) {
     run.cancelRequested = true;
     finishDesktopAiRun(run, "cancelled");
   }
-  scheduleAutoSend(convId, { text, mode: assistantMode.value, action: activeAction.value }, history.slice(0, lastUserIdx));
+  scheduleAutoSend(convId, { text, mode: assistantMode.value, action: activeAction.value }, history.slice(0, lastUserIdx), pluginContextFromMessages(history));
 }
 
 /** Dismisses the "updates while you were away" separator and jumps to the end. */
@@ -4492,6 +4839,7 @@ onUnmounted(() => {
 });
 
 function triggerAction(action: AiAction, instruction?: string) {
+  if (pluginContext.value) startNewChat();
   // External Ask-style entry points (Fix with AI, Explain history) produce/analyze SQL text.
   // If the assistant is currently in Agent mode where those actions aren't offered, switch to
   // Ask mode so the action is valid and the menu reflects what actually runs.
@@ -4506,12 +4854,25 @@ function triggerAction(action: AiAction, instruction?: string) {
   send();
 }
 
-function setPrompt(text: string) {
+function openPluginConversation(request: AiPluginConversationRequest) {
+  initialConversationRestored = true;
+  defaultModeInitialized = true;
+  startNewChat();
+  draftPluginContext.value = request.context;
+  assistantMode.value = "ask";
+  activeAction.value = "general";
+  setPrompt(request.prompt, true);
+  if (request.send) void send();
+}
+
+function setPrompt(text: string, fromPlugin = false) {
+  if (!fromPlugin && pluginContext.value) startNewChat();
   prompt.value = text;
   nextTick(() => promptTextareaRef.value?.focus());
 }
 
 function addTableMention(target: { schema?: string; table: string }) {
+  if (pluginContext.value) startNewChat();
   const table = target.table.trim();
   if (!table) return;
   addSelectedMention({ kind: "table", schema: target.schema, name: table, tableType: "TABLE" });
@@ -4532,7 +4893,7 @@ function focusSearch(): boolean {
   return true;
 }
 
-defineExpose({ triggerAction, setPrompt, addTableMention, clearContextReferences, selectConversationById, focusSearch });
+defineExpose({ openPluginConversation, triggerAction, setPrompt, addTableMention, clearContextReferences, selectConversationById, focusSearch });
 
 const messageRenderer = computed(() => {
   const appearance = aiCodeAppearance.value;
@@ -4571,7 +4932,7 @@ async function openExternalUrl(url: string) {
       <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-tauri-drag-region>
         {{ chatTitle }}
       </span>
-      <ProductionContextBadge v-if="productionContext.active" compact />
+      <ProductionContextBadge v-if="!pluginContext && productionContext.active" compact />
       <DropdownMenu>
         <DropdownMenuTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6" :title="t('ai.exportConversation')" :aria-label="t('ai.exportConversation')">
@@ -4699,7 +5060,7 @@ async function openExternalUrl(url: string) {
 
     <div v-if="messages.length === 0" class="flex-1 min-h-0 flex flex-col items-center justify-center text-center text-muted-foreground">
       <Bot class="h-10 w-10 mb-3 opacity-30" />
-      <p class="text-sm">{{ t("ai.welcome") }}</p>
+      <p class="text-sm">{{ t(pluginContext ? "ai.pluginWelcome" : "ai.welcome") }}</p>
     </div>
     <div v-else class="relative min-h-0 flex-1">
       <ScrollArea ref="scrollRef" class="ai-message-scroll h-full overflow-hidden">
@@ -4840,6 +5201,21 @@ async function openExternalUrl(url: string) {
                       </div>
                       <div v-if="msg.content" data-ai-user-message-content class="whitespace-pre-wrap">{{ msg.content }}</div>
                     </div>
+                    <!-- "Auto" routing outcome (#9118): which action the router picked for
+                         this message, clickable to continue with that explicit action. -->
+                    <div v-if="routedActionOf(msg)" class="mt-1 flex justify-end">
+                      <button
+                        data-ai-auto-routed-chip
+                        type="button"
+                        class="inline-flex max-w-full items-center gap-1 rounded border border-border/70 bg-background/80 px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                        :title="t('ai.routing.switchTo', { action: actionLabelFor(routedActionOf(msg)) })"
+                        :aria-label="t('ai.routing.switchTo', { action: actionLabelFor(routedActionOf(msg)) })"
+                        @click="switchToRoutedAction(routedActionOf(msg))"
+                      >
+                        <Sparkles class="h-3 w-3 shrink-0" />
+                        <span class="truncate">{{ t("ai.routing.chip", { action: actionLabelFor(routedActionOf(msg)) }) }}</span>
+                      </button>
+                    </div>
                     <div v-if="canCopyMessage(msg)" class="mt-1 flex justify-end">
                       <button
                         data-ai-message-copy="user"
@@ -4924,13 +5300,28 @@ async function openExternalUrl(url: string) {
                       <!-- `pending` means the closing fence is still missing, so the code is truncated: never offer to run or apply it. -->
                       <Loader2 v-if="seg.pending && isGenerating" class="h-3 w-3 animate-spin text-zinc-400" />
                       <div class="flex items-center gap-1.5">
-                        <button v-if="!seg.pending && seg.isSql && !isRedisConnection" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.tempRunSql')" @click="tempRunSql(seg.content)">
+                        <button
+                          v-if="!pluginContext && !seg.pending && seg.isSql && !isRedisConnection"
+                          class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200"
+                          :title="t('ai.tempRunSql')"
+                          @click="tempRunSql(seg.content)"
+                        >
                           <FlaskConical class="h-3.5 w-3.5" />
                         </button>
-                        <button v-if="!seg.pending && (seg.isSql || isRedisConnection)" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.executeSql')" @click="executeSql(seg.content)">
+                        <button
+                          v-if="!pluginContext && !seg.pending && (seg.isSql || isRedisConnection)"
+                          class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200"
+                          :title="t('ai.executeSql')"
+                          @click="executeSql(seg.content)"
+                        >
                           <Play class="h-3.5 w-3.5" />
                         </button>
-                        <button v-if="!seg.pending && (seg.isSql || isRedisConnection)" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.apply')" @click="applySql(seg.content)">
+                        <button
+                          v-if="!pluginContext && !seg.pending && (seg.isSql || isRedisConnection)"
+                          class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200"
+                          :title="t('ai.apply')"
+                          @click="applySql(seg.content)"
+                        >
                           <ArrowDownToLine class="h-3.5 w-3.5" />
                         </button>
                         <button
@@ -4983,6 +5374,15 @@ async function openExternalUrl(url: string) {
             </div>
           </template>
 
+          <!-- "Auto" routing in flight (#9118). Only the slow path (classifier)
+               shows this — the rule layer resolves instantly. Rendered while the
+               user message is already visible and before the assistant
+               placeholder exists, so the send never looks stuck. -->
+          <div v-if="routingInFlight" data-ai-auto-routing class="flex min-w-0 items-center gap-[7px] text-xs text-muted-foreground">
+            <Loader2 class="h-3 w-3 shrink-0 animate-spin" aria-hidden="true" />
+            <span class="truncate">{{ t("ai.routing.recognizing") }}</span>
+          </div>
+
           <!-- Live generation-status line (Issue #6743 feature 1). Replaces the old
                "Thinking..." placeholder and covers the WHOLE generation period
                (`v-if="isGenerating"`), not just the wait for the first token. The
@@ -5019,13 +5419,26 @@ async function openExternalUrl(url: string) {
           </div>
         </div>
       </ScrollArea>
+      <!-- Scroll-to-bottom affordance with an AI busy indicator. Shown when the
+           viewport is scrolled away from the bottom (hysteresis in
+           updateMessageScrollState) OR while a run is active for the visible
+           conversation — then the button doubles as a status marker: a
+           decorative rotating arc ring (aria-hidden; static under
+           prefers-reduced-motion) tells the user at a glance that the
+           assistant is still working, even when auto-scroll already pins the
+           view to the bottom. -->
       <button
-        v-if="showScrollToBottom"
+        v-if="showScrollToBottom || isGenerating"
         type="button"
         class="absolute bottom-3 right-3 z-10 inline-flex h-8 w-8 items-center justify-center rounded-full border bg-background/95 text-foreground shadow-md backdrop-blur hover:bg-muted"
         :title="t('ai.scrollToBottom')"
         @click="scrollToBottom({ force: true })"
       >
+        <svg v-if="isGenerating" data-ai-scroll-ring aria-hidden="true" class="pointer-events-none absolute inset-0 h-full w-full animate-spin text-primary motion-reduce:animate-none" viewBox="0 0 32 32" fill="none">
+          <!-- ~288° open arc of the r=13 ring box (statement-gutter spinner
+               geometry scaled to 32 units); spins clockwise via animate-spin. -->
+          <path d="M29 16a13 13 0 1 1-8.98-12.36" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" />
+        </svg>
         <ArrowDown class="h-4 w-4" />
         <span class="sr-only">{{ t("ai.scrollToBottom") }}</span>
       </button>
@@ -5039,7 +5452,11 @@ async function openExternalUrl(url: string) {
         <div class="resize-handle" @mousedown="startResize"></div>
         <div class="px-2 pb-2 pt-1">
           <div data-ai-composer-context-row :class="['ai-prompt-context-row mb-1 flex items-center gap-x-1 text-xs text-foreground/80', showAiSchemaSelector && 'ai-prompt-context-row--schema']">
-            <template v-if="connectionStore.connections.length">
+            <details v-if="pluginContext" class="min-w-0 flex-1" data-ai-plugin-context>
+              <summary class="cursor-pointer truncate">{{ pluginContext.pluginName }} · {{ pluginContext.title }}</summary>
+              <pre class="max-h-56 overflow-auto whitespace-pre-wrap break-all p-2 text-[11px]">{{ pluginContextText(pluginContext) }}</pre>
+            </details>
+            <template v-else-if="connectionStore.connections.length">
               <DatabaseIcon v-if="connection" :db-type="connectionIconType(connection)" class="h-3 w-3 shrink-0" />
               <Server v-else class="h-3 w-3 shrink-0" />
               <ConnectionTreeSelect
@@ -5064,20 +5481,20 @@ async function openExternalUrl(url: string) {
                   "
                 >
                   <PopoverTrigger as-child>
-                    <Button variant="ghost" :class="['h-5 max-w-64 justify-start border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'min-w-0 flex-1']">
+                    <Button variant="ghost" :title="selectedDatabaseLabel" :class="['h-5 max-w-64 justify-start border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'min-w-0 flex-1']">
                       <span class="truncate">{{ selectedDatabaseLabel }}</span>
                     </Button>
                   </PopoverTrigger>
-                  <PopoverContent align="start" class="w-64 p-1">
+                  <PopoverContent align="start" class="w-80 max-w-[calc(100vw-2rem)] p-1">
                     <div class="relative mb-1 flex items-center border-b px-2 py-1">
                       <Search class="pointer-events-none absolute left-3 h-3 w-3 text-muted-foreground" />
                       <input v-model="databaseSearchQuery" type="search" class="h-6 w-full bg-transparent pl-5 text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('ai.searchDatabases')" />
                     </div>
                     <button v-if="selectedDatabases.length > 1" type="button" class="mb-1 flex w-full items-center justify-end gap-1 border-b px-2 py-1 text-xs" @click.stop="selectedDatabases = []"><X class="h-3 w-3" />{{ t("ai.clearDatabaseSelection") }}</button>
                     <div class="max-h-64 overflow-y-auto overscroll-contain">
-                      <button v-for="option in filteredDbSelectOptions" :key="option.value" type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-muted" @click="toggleDatabase(option.database)">
-                        <Check :class="['h-4 w-4', selectedDatabaseValues.has(option.database) ? 'opacity-100' : 'opacity-0']" />
-                        <span class="truncate">{{ option.label }}</span>
+                      <button v-for="option in filteredDbSelectOptions" :key="option.value" type="button" :title="option.label" class="flex w-full min-w-0 items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-muted" @click="toggleDatabase(option.database)">
+                        <Check :class="['h-4 w-4 shrink-0', selectedDatabaseValues.has(option.database) ? 'opacity-100' : 'opacity-0']" />
+                        <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
                       </button>
                       <div v-if="!filteredDbSelectOptions.length" class="px-2 py-1.5 text-sm text-muted-foreground">{{ t("ai.noDatabasesFound") }}</div>
                     </div>
@@ -5109,7 +5526,7 @@ async function openExternalUrl(url: string) {
             </template>
             <span class="ai-prompt-context-spacer min-w-0 flex-1" />
             <!-- Template selector -->
-            <Popover v-model:open="showTemplateSelector">
+            <Popover v-if="!pluginContext" v-model:open="showTemplateSelector">
               <PopoverTrigger as-child>
                 <button
                   type="button"
@@ -5154,6 +5571,56 @@ async function openExternalUrl(url: string) {
                 </div>
               </PopoverContent>
             </Popover>
+            <!-- Skill selector (read-only user SKILL.md library) -->
+            <Popover v-model:open="showSkillSelector">
+              <PopoverTrigger as-child>
+                <button type="button" class="flex min-w-0 items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('ai.skillsEntry')" :title="t('ai.skillsEntry')">
+                  <Layers class="h-3 w-3" />
+                  <span class="truncate">{{ t("ai.skillsEntry") }}</span>
+                  <span v-if="selectedSkillIds.length" class="rounded-sm bg-primary px-1 text-[10px] font-medium text-primary-foreground">{{ selectedSkillIds.length }}</span>
+                </button>
+              </PopoverTrigger>
+              <PopoverContent align="end" class="w-72 gap-0 p-1.5">
+                <div class="max-h-64 overflow-auto">
+                  <div v-if="userSkillStore.isLoading && !userSkillStore.hasLoadedOnce" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                    {{ t("ai.skillsLoading") }}
+                  </div>
+                  <div v-else-if="userSkillStore.lastError" class="space-y-1 px-3 py-4 text-center text-xs text-muted-foreground">
+                    <div>{{ t("ai.skillsLoadError") }}</div>
+                    <button type="button" class="text-[11px] text-primary hover:underline" @click="refreshSkills">
+                      {{ t("ai.skillsRetry") }}
+                    </button>
+                  </div>
+                  <div v-else-if="userSkillStore.totalCount === 0" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                    {{ t("ai.skillsEmpty") }}
+                  </div>
+                  <template v-else>
+                    <template v-for="group in userSkillStore.groupedSkills" :key="group.source">
+                      <div class="px-2 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                        {{ t(group.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}
+                      </div>
+                      <template v-for="skill in group.skills" :key="skill.id">
+                        <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-muted" @click="toggleSkillSelected(skill.id)">
+                          <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="selectedSkillIds.includes(skill.id) ? 'border-primary bg-primary text-primary-foreground' : ''">
+                            <Check v-if="selectedSkillIds.includes(skill.id)" class="h-3 w-3" />
+                          </div>
+                          <div class="min-w-0 flex-1 text-left">
+                            <div class="truncate font-medium">{{ skill.name }}</div>
+                            <div class="truncate text-[10px] text-muted-foreground">{{ skill.description }}</div>
+                          </div>
+                        </button>
+                      </template>
+                    </template>
+                  </template>
+                </div>
+                <div class="border-t mt-1 px-1 pt-1">
+                  <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" :disabled="userSkillStore.isLoading" @click="refreshSkills">
+                    <Loader2 v-if="userSkillStore.isLoading" class="h-3 w-3 animate-spin" />
+                    {{ t("ai.skillsRefresh") }}
+                  </button>
+                </div>
+              </PopoverContent>
+            </Popover>
           </div>
           <div v-if="mentionOpen" class="absolute bottom-full left-2 right-2 z-20 mb-1 max-h-56 overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md">
             <div v-if="mentionLoading" class="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
@@ -5190,16 +5657,16 @@ async function openExternalUrl(url: string) {
             <div class="max-h-56 overflow-auto p-1">
               <button
                 v-for="(cmd, index) in filteredCommands"
-                :key="cmd.action"
+                :key="cmd.type === 'action' ? `action:${cmd.button.action}` : 'skills'"
                 type="button"
                 class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted"
                 :class="{ 'bg-muted': index === commandSelectedIndex }"
                 @mousedown.prevent="selectCommand(cmd)"
                 @mouseenter="commandSelectedIndex = index"
               >
-                <component :is="cmd.icon" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                <span class="font-medium">/{{ cmd.action }}</span>
-                <span class="ml-auto text-[11px] text-muted-foreground">{{ t(cmd.key) }}</span>
+                <component :is="cmd.type === 'action' ? cmd.button.icon : Layers" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <span class="font-medium">/{{ cmd.type === "action" ? cmd.button.action : "skill" }}</span>
+                <span class="ml-auto text-[11px] text-muted-foreground">{{ t(cmd.type === "action" ? cmd.button.key : "ai.skillsEntry") }}</span>
               </button>
             </div>
           </div>
@@ -5215,6 +5682,23 @@ async function openExternalUrl(url: string) {
               <FileCode v-if="mention.kind === 'sqlFile'" class="h-3 w-3 shrink-0 text-primary" />
               <Table2 v-else class="h-3 w-3 shrink-0 text-primary" />
               <span class="truncate">{{ mentionDisplayName(mention) }}</span>
+              <X class="h-3 w-3 shrink-0 text-muted-foreground group-hover:text-foreground" />
+            </button>
+          </div>
+          <div v-if="selectedSkillChips.length" class="mb-1.5 flex flex-wrap gap-1">
+            <button
+              v-for="chip in selectedSkillChips"
+              :key="chip.id"
+              type="button"
+              class="group inline-flex max-w-full items-center gap-1 rounded border bg-muted/60 px-1.5 py-0.5 text-[11px] text-foreground/90 hover:bg-muted"
+              :class="chip.unavailable ? 'border-destructive/50 text-destructive' : 'border-border/80'"
+              :title="chip.description || chip.name"
+              @click="removeSelectedSkill(chip.id)"
+            >
+              <AlertTriangle v-if="chip.unavailable" class="h-3 w-3 shrink-0" />
+              <Layers v-else class="h-3 w-3 shrink-0 text-primary" />
+              <span class="truncate">{{ chip.name }}</span>
+              <span class="shrink-0 text-[9px] text-muted-foreground">{{ t(chip.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}</span>
               <X class="h-3 w-3 shrink-0 text-muted-foreground group-hover:text-foreground" />
             </button>
           </div>
@@ -5250,6 +5734,25 @@ async function openExternalUrl(url: string) {
               @preview="showImageAttachmentPreview(attachment)"
               @remove="removeImageAttachment(index)"
             />
+          </div>
+          <div v-if="skillFailures.length" class="mb-1.5 flex items-start gap-1.5 rounded-[7px] border border-destructive/40 bg-destructive/10 px-[9px] py-[5px] text-[11px] text-destructive" role="alert">
+            <AlertTriangle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div class="min-w-0 flex-1">
+              <div class="font-medium">{{ t("ai.skillsSendBlocked") }}</div>
+              <div v-for="failure in skillFailures" :key="failure.id" class="truncate">{{ userSkillStore.metaFor(failure.id)?.name ?? failure.id }} — {{ t(skillFailureReasonKey(failure.reason)) }}</div>
+            </div>
+            <button type="button" class="shrink-0 rounded border border-destructive/40 px-1.5 py-0.5 text-[10px] font-medium hover:bg-destructive/20" @click="send()">
+              {{ t("ai.skillsRetry") }}
+            </button>
+            <button type="button" class="shrink-0 rounded px-1 py-0.5 text-[10px] text-muted-foreground hover:text-foreground" :disabled="userSkillStore.isLoading" @click="refreshSkills">
+              {{ t("ai.skillsRefresh") }}
+            </button>
+            <button v-if="skillFailures.some((failure) => failure.reason === 'root_unavailable')" type="button" class="shrink-0 rounded px-1 py-0.5 text-[10px] text-muted-foreground hover:text-foreground" @click="openSkillRootSettings">
+              {{ t("ai.skillsOpenSettings") }}
+            </button>
+            <button type="button" class="shrink-0 rounded p-0.5 text-muted-foreground hover:text-destructive" :aria-label="t('common.remove')" @click="removeFailedSkills()">
+              <X class="h-3 w-3" />
+            </button>
           </div>
           <div v-if="recoveredDraftActive" class="mb-1.5 flex items-center gap-1.5 rounded-[7px] border border-primary/30 bg-primary/10 px-[9px] py-[5px] text-[11px] text-primary" role="status">
             <Clock class="h-3.5 w-3.5 shrink-0" />
@@ -5315,7 +5818,8 @@ async function openExternalUrl(url: string) {
               </TooltipContent>
             </Tooltip>
             <!-- Combined mode + action selector -->
-            <Popover v-model:open="modeActionOpen">
+            <span v-if="pluginContext" class="shrink-0 text-xs text-muted-foreground">{{ t("ai.modes.ask") }}</span>
+            <Popover v-else v-model:open="modeActionOpen">
               <PopoverTrigger as-child>
                 <button type="button" class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="modeActionTriggerLabel">
                   <component :is="modeIcon" class="h-3 w-3" />
@@ -5563,11 +6067,11 @@ async function openExternalUrl(url: string) {
             <button v-if="isGenerating" class="h-7 w-7 shrink-0 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center" :title="t('ai.stopGenerating')" @click="cancelStream">
               <Square class="h-3.5 w-3.5" />
             </button>
-            <button v-else-if="hasActiveRunForCurrentConversation" class="h-7 shrink-0 items-center gap-1 rounded-full bg-foreground px-2.5 text-[11px] font-medium text-background disabled:opacity-30 flex" :disabled="!canSubmitPrompt" :title="t('ai.queueSendHint')" @click="onSendClick">
+            <button v-else-if="hasActiveRunForCurrentConversation" class="h-7 shrink-0 items-center gap-1 rounded-full bg-foreground px-2.5 text-[11px] font-medium text-background-solid disabled:opacity-30 flex" :disabled="!canSubmitPrompt" :title="t('ai.queueSendHint')" @click="onSendClick">
               <Hourglass class="h-3.5 w-3.5" />
               <span>{{ t("ai.queueSend") }}</span>
             </button>
-            <button v-else class="h-7 w-7 shrink-0 rounded-full bg-foreground text-background flex items-center justify-center disabled:opacity-30" :disabled="!canSubmitPrompt" @click="send">
+            <button v-else class="h-7 w-7 shrink-0 rounded-full bg-foreground text-background-solid flex items-center justify-center disabled:opacity-30" :disabled="!canSubmitPrompt" @click="send">
               <ArrowUp class="h-4 w-4" />
             </button>
           </div>

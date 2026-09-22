@@ -6,6 +6,7 @@ mod macos_app_delegate;
 #[cfg(target_os = "macos")]
 mod macos_escape_guard;
 mod models;
+mod plugin_ui_protocol;
 #[cfg(any(target_os = "windows", test))]
 mod startup_recovery;
 #[cfg(all(not(target_os = "windows"), not(test)))]
@@ -1436,6 +1437,19 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Metadata/completion command chains nest very large async futures (a single
+    // frame can be 60-150 KiB), which can exhaust tokio's default 2 MiB worker
+    // stack and abort the process with STATUS_STACK_OVERFLOW. Give the runtime a
+    // roomier worker stack so those chains have headroom.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("Failed to build tokio runtime");
+    let runtime_handle = runtime.handle().clone();
+    let _runtime = Box::leak(Box::new(runtime));
+    tauri::async_runtime::set(runtime_handle);
+
     startup_recovery::initialize();
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
     append_startup_probe("runtime prerequisites configured");
@@ -1448,7 +1462,10 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init());
+        .plugin(tauri_plugin_fs::init())
+        // Plugin workbench sandbox documents lazy-load their code-split chunks
+        // through this scheme; see plugin_ui_protocol.rs.
+        .register_asynchronous_uri_scheme_protocol(plugin_ui_protocol::PLUGIN_UI_SCHEME, plugin_ui_protocol::handle);
 
     let builder = if should_enable_single_instance(cfg!(debug_assertions)) {
         builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
@@ -1518,6 +1535,8 @@ pub fn run() {
 
     builder
         .manage(CloseBehaviorState::new())
+        .manage(commands::plugin_file::PluginFileState::new())
+        .manage(commands::plugin_storage::PluginUiStorageState::new())
         .manage(AppLocaleState::new())
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
@@ -1771,10 +1790,14 @@ pub fn run() {
             commands::prompt_template::delete_prompt_template,
             commands::prompt_template::get_ai_global_custom_instructions,
             commands::prompt_template::set_ai_global_custom_instructions,
+            commands::user_skills::list_user_skills,
+            commands::user_skills::read_user_skills,
             commands::app_settings::load_desktop_settings,
             commands::app_settings::save_desktop_settings,
             commands::app_settings::load_max_agent_turns,
             commands::app_settings::save_max_agent_turns,
+            commands::app_settings::load_history_retention_limit,
+            commands::app_settings::save_history_retention_limit,
             commands::app_settings::load_max_retries,
             commands::app_settings::save_max_retries,
             commands::app_settings::set_app_locale,
@@ -1800,6 +1823,8 @@ pub fn run() {
             commands::mcp_http_server::rotate_mcp_http_server_token,
             commands::app_settings::load_editor_settings,
             commands::app_settings::save_editor_settings,
+            commands::app_settings::load_global_search_settings,
+            commands::app_settings::save_global_search_settings,
             commands::app_settings::load_open_tabs_state,
             commands::app_settings::save_open_tabs_state,
             commands::app_settings::save_detached_tab_handoff,
@@ -1845,6 +1870,7 @@ pub fn run() {
             commands::connection::clear_all_session_credentials,
             commands::connection::refresh_connections,
             commands::connection::check_connection_health,
+            commands::connection::prewarm_connection,
             commands::connection::connection_identifier_quote,
             commands::connection::connection_database_info,
             commands::connection::save_connection_database_info,
@@ -1855,6 +1881,16 @@ pub fn run() {
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,
             commands::connection::load_sidebar_layout,
+            commands::connection::save_table_vgroups,
+            commands::connection::load_table_vgroups,
+            commands::connection::delete_table_vgroups_for_connection,
+            commands::plugin_file::plugin_file_open,
+            commands::plugin_file::plugin_file_read,
+            commands::plugin_file::plugin_file_write,
+            commands::plugin_file::plugin_file_close,
+            commands::plugin_storage::plugin_ui_storage_get,
+            commands::plugin_storage::plugin_ui_storage_set,
+            commands::plugin_storage::plugin_ui_storage_delete,
             commands::plugins::list_plugins,
             commands::plugins::list_plugin_trusted_keys,
             commands::plugins::save_plugin_trusted_key,
@@ -1872,6 +1908,8 @@ pub fn run() {
             commands::plugins::list_active_plugins,
             commands::plugins::stop_plugin,
             commands::plugins::invoke_plugin,
+            commands::plugin_download::download_plugin_file,
+            commands::plugin_download::cancel_plugin_download,
             commands::plugins::invoke_plugin_connection_action,
             commands::plugins::notify_plugin,
             commands::plugins::send_plugin_binary,
@@ -1932,6 +1970,7 @@ pub fn run() {
             commands::schema::list_constraints,
             commands::schema::list_partitions,
             commands::schema::get_table_partition_status,
+            commands::schema::get_table_partitioning,
             commands::schema::list_invalid_indexes,
             commands::schema::list_subpartitions,
             commands::schema::get_table_ddl,
@@ -1976,6 +2015,8 @@ pub fn run() {
             commands::query::build_sorted_query_sql,
             commands::query::build_explain_sql,
             commands::query::get_explain_info,
+            commands::query::get_plugin_plan_capabilities,
+            commands::query::get_plugin_estimated_plan,
             commands::query::build_create_user_sql,
             commands::query::build_dropped_file_preview_sql,
             commands::query::build_table_select_sql,
@@ -2011,6 +2052,8 @@ pub fn run() {
             commands::query::preview_sqlite_table_structure_change,
             commands::query::apply_sqlite_table_structure_change,
             commands::query::build_create_table_sql,
+            commands::query::build_create_partitioned_table_sql,
+            commands::query::build_table_partition_operation_sql,
             commands::query::build_single_column_alter_sql,
             commands::query::analyze_editable_query_editability,
             commands::query::prepare_data_grid_save,
@@ -2046,6 +2089,7 @@ pub fn run() {
             commands::list_sql_files::create_sql_file_in_folder,
             commands::list_sql_files::rename_sql_file_in_folder,
             commands::list_sql_files::delete_sql_file_in_folder,
+            commands::global_search::global_search,
             commands::external_db::pending_open_db_files,
             commands::keychain::read_keychain_password,
             commands::keychain::read_keychain_passwords,
@@ -2060,6 +2104,12 @@ pub fn run() {
             commands::mongodb_import_export::cancel_mongodb_import,
             commands::mongodb_import_export::export_mongodb_query,
             commands::mongodb_import_export::cancel_mongodb_export,
+            commands::mongodb_dump::inspect_mongodb_database_dump,
+            commands::mongodb_dump::prepare_mongodb_restore_source,
+            commands::mongodb_dump::release_mongodb_restore_source,
+            commands::mongodb_dump::dump_mongodb_database,
+            commands::mongodb_dump::restore_mongodb_database,
+            commands::mongodb_dump::cancel_mongodb_database_dump,
             commands::redis_cmd::redis_list_databases,
             commands::redis_cmd::redis_scan_keys,
             commands::redis_cmd::redis_scan_keys_batch,
@@ -2319,6 +2369,7 @@ pub fn run() {
             commands::mongo_cmd::mongo_find_documents,
             commands::mongo_cmd::mongo_parse_shell_command,
             commands::mongo_cmd::mongo_find_one,
+            commands::mongo_cmd::mongo_explain_find,
             commands::mongo_cmd::mongo_count_documents,
             commands::mongo_cmd::mongo_server_version,
             commands::mongo_cmd::mongo_collection_stats,
@@ -2336,6 +2387,7 @@ pub fn run() {
             commands::mongo_cmd::mongo_update_document,
             commands::mongo_cmd::mongo_update_documents,
             commands::mongo_cmd::mongo_replace_document,
+            commands::mongo_cmd::mongo_bulk_write,
             commands::document_cmd::document_delete_document,
             commands::document_cmd::document_save_meilisearch_batch,
             commands::document_cmd::meilisearch_search_documents,
@@ -2345,6 +2397,7 @@ pub fn run() {
             commands::document_cmd::meilisearch_update_index_settings,
             commands::document_cmd::meilisearch_get_index_stats,
             commands::document_cmd::meilisearch_get_index_overview,
+            commands::document_cmd::meilisearch_create_index,
             commands::document_cmd::meilisearch_delete_index,
             commands::document_cmd::meilisearch_delete_all_documents,
             commands::document_cmd::meilisearch_get_system_overview,
@@ -2573,6 +2626,7 @@ pub fn run() {
             commands::xlsx_export::export_query_results_xlsx,
             commands::text_export::export_query_result_json,
             commands::text_export::export_query_result_markdown,
+            commands::text_export::export_query_result_html,
             commands::agents::list_installed_agents,
             commands::agents::list_installed_agents_local,
             commands::agents::is_agent_installed,

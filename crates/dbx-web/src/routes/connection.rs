@@ -108,6 +108,15 @@ pub struct DisconnectRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrewarmConnectionRequest {
+    pub connection_id: String,
+    pub database: Option<String>,
+    pub catalog: Option<String>,
+    pub client_session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CloseDatabaseConnectionRequest {
     pub connection_id: String,
     pub database: String,
@@ -273,8 +282,8 @@ async fn run_temporary_connection_test(
 
     if config.db_type == DatabaseType::Plugin {
         let result = async {
-            let (host, port) = app.connection_host_port(&temp_id, &config).await?;
-            app.plugin_host.test_connection(&config, &host, port).await
+            let endpoint = app.plugin_connection_endpoint(&temp_id, &config).await?;
+            app.plugin_host.test_connection(&config, &endpoint.host, endpoint.port, endpoint.proxy).await
         }
         .await;
         app.reset_connection_transport_for_config(&temp_id, &config).await;
@@ -428,7 +437,7 @@ pub async fn connect_db(
     app.configs.write().await.insert(connection_id.clone(), runtime_config);
 
     if config.db_type == dbx_core::models::connection::DatabaseType::Plugin {
-        let (host, port) = match app.connection_host_port(&connection_id, &config).await {
+        let endpoint = match app.plugin_connection_endpoint(&connection_id, &config).await {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 app.reset_connection_transport_for_config(&connection_id, &config).await;
@@ -441,14 +450,15 @@ pub async fn connect_db(
             rollback_session_credential_writes(app, &session_credential_writes);
             return Err(AppError::from(error));
         }
-        let handle = match app.plugin_host.connect_connection(&config, &host, port).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                app.reset_connection_transport_for_config(&connection_id, &config).await;
-                rollback_session_credential_writes(app, &session_credential_writes);
-                return Err(AppError::from(error));
-            }
-        };
+        let handle =
+            match app.plugin_host.connect_connection(&config, &endpoint.host, endpoint.port, endpoint.proxy).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    app.reset_connection_transport_for_config(&connection_id, &config).await;
+                    rollback_session_credential_writes(app, &session_credential_writes);
+                    return Err(AppError::from(error));
+                }
+            };
         let pool = PoolKind::PluginConnection(handle);
         if let Err(error) =
             app.insert_connection_pool_for_attempt(&connection_id, attempt, connection_id.clone(), pool, &config).await
@@ -598,6 +608,21 @@ pub async fn check_connection_health(
     Json(body): Json<DisconnectRequest>,
 ) -> Result<Json<()>, AppError> {
     state.app.check_connection_health(&body.connection_id).await.map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
+pub async fn prewarm_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<PrewarmConnectionRequest>,
+) -> Result<Json<()>, AppError> {
+    let database = body.database.as_deref().filter(|value| !value.is_empty());
+    let catalog = body.catalog.as_deref().filter(|value| !value.is_empty());
+    let client_session_id = body.client_session_id.as_deref().filter(|value| !value.is_empty());
+    state
+        .app
+        .prewarm_connection_pool(&body.connection_id, database, catalog, client_session_id)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 

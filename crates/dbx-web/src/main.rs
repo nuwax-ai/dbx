@@ -391,6 +391,7 @@ async fn main() {
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
+        .route("/connection/prewarm", post(routes::connection::prewarm_connection))
         .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
         .route("/connection/forget-session-credential", post(routes::connection::forget_session_credential))
         .route(
@@ -521,6 +522,7 @@ async fn main() {
         .route("/schema/constraints", get(routes::schema::list_constraints))
         .route("/schema/partitions", get(routes::schema::list_partitions))
         .route("/schema/table-partition-status", get(routes::schema::get_table_partition_status))
+        .route("/schema/table-partitioning", get(routes::schema::get_table_partitioning))
         .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
@@ -569,6 +571,8 @@ async fn main() {
         .route("/query/build-explain-sql", post(routes::query::build_explain_sql))
         .route("/query/build-dropped-file-preview-sql", post(routes::query::build_dropped_file_preview_sql))
         .route("/query/get-explain-info", post(routes::query::get_explain_info))
+        .route("/query/plugin-plan-capabilities", post(routes::query::get_plugin_plan_capabilities))
+        .route("/query/plugin-estimated-plan", post(routes::query::get_plugin_estimated_plan))
         .route("/query/build-create-user-sql", post(routes::query::build_create_user_sql))
         .route("/query/build-table-select-sql", post(routes::query::build_table_select_sql))
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
@@ -604,6 +608,8 @@ async fn main() {
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
         .route("/query/build-table-owner-change-sql", post(routes::query::build_table_owner_change_sql))
+        .route("/query/build-table-partition-operation-sql", post(routes::query::build_table_partition_operation_sql))
+        .route("/query/build-create-partitioned-table-sql", post(routes::query::build_create_partitioned_table_sql))
         .route(
             "/query/preview-sqlite-table-structure-change",
             post(routes::query::preview_sqlite_table_structure_change),
@@ -663,6 +669,7 @@ async fn main() {
         .route("/query/close-client-session", post(routes::query::close_client_connection_session))
         .route("/export/query-result-json", post(routes::text_export::export_query_result_json))
         .route("/export/query-result-markdown", post(routes::text_export::export_query_result_markdown))
+        .route("/export/query-result-html", post(routes::text_export::export_query_result_html))
         // Redis
         .route("/redis/list-databases", post(routes::redis::list_databases))
         .route("/redis/scan-keys", post(routes::redis::scan_keys))
@@ -933,6 +940,7 @@ async fn main() {
         .route("/document-store/meilisearch/settings/update", post(routes::document_store::meilisearch_update_settings))
         .route("/document-store/meilisearch/stats", post(routes::document_store::meilisearch_get_stats))
         .route("/document-store/meilisearch/overview", post(routes::document_store::meilisearch_get_overview))
+        .route("/document-store/meilisearch/index/create", post(routes::document_store::meilisearch_create_index))
         .route("/document-store/meilisearch/index/delete", post(routes::document_store::meilisearch_delete_index))
         .route(
             "/document-store/meilisearch/system/overview",
@@ -970,6 +978,7 @@ async fn main() {
         .route("/mongo/update-document", post(routes::mongo::update_document))
         .route("/mongo/update-documents", post(routes::mongo::update_documents))
         .route("/mongo/replace-document", post(routes::mongo::replace_document))
+        .route("/mongo/bulk-write", post(routes::mongo::bulk_write))
         .route("/mongo/delete-document", post(routes::mongo::delete_document))
         .route("/mongo/delete-documents", post(routes::mongo::delete_documents))
         .route("/mongo/find-one-and-update", post(routes::mongo::find_one_and_update))
@@ -990,6 +999,25 @@ async fn main() {
         .route("/mongo/export/progress/{exportId}", get(routes::mongodb_import_export::export_progress))
         .route("/mongo/export/download/{exportId}", get(routes::mongodb_import_export::export_download))
         .route("/mongo/export/cancel", post(routes::mongodb_import_export::cancel_export))
+        .route("/mongo/dump/catalog", post(routes::mongodb_dump::catalog))
+        .route(
+            "/mongo/dump/source",
+            post(routes::mongodb_dump::prepare_source).layer(DefaultBodyLimit::max(
+                routes::table_import::import_request_body_limit_for_upload(web_body_limit_bytes()),
+            )),
+        )
+        .route("/mongo/dump/source/release", post(routes::mongodb_dump::release_source))
+        .route("/mongo/dump/upload-limit", get(routes::mongodb_dump::upload_limit))
+        .route(
+            "/mongo/dump/source/upload",
+            post(routes::mongodb_dump::upload_restore_source).layer(DefaultBodyLimit::max(
+                routes::table_import::import_request_body_limit_for_upload(web_body_limit_bytes()),
+            )),
+        )
+        .route("/mongo/dump/export", post(routes::mongodb_dump::start_dump))
+        .route("/mongo/dump/restore", post(routes::mongodb_dump::start_restore))
+        .route("/mongo/dump/progress/{taskId}", get(routes::mongodb_dump::progress))
+        .route("/mongo/dump/cancel", post(routes::mongodb_dump::cancel))
         // History
         .route("/history", get(routes::history::load_history).delete(routes::history::clear_history))
         .route("/history/save", post(routes::history::save_history))
@@ -1093,6 +1121,14 @@ async fn main() {
         .route("/changelog", get(routes::update::fetch_changelog))
         // Layout
         .route("/layout/sidebar", post(routes::layout::save_sidebar_layout).get(routes::layout::load_sidebar_layout))
+        .route(
+            "/layout/table-vgroups",
+            post(routes::layout::save_table_vgroups).get(routes::layout::load_table_vgroups),
+        )
+        .route(
+            "/layout/table-vgroups/connection/{connection_id}",
+            delete(routes::layout::delete_table_vgroups_for_connection),
+        )
         // App settings
         .route(
             "/app-settings/pinned-tree-node-ids",
@@ -1106,6 +1142,11 @@ async fn main() {
         .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),
+        )
+        .route(
+            "/app-settings/history-retention-limit",
+            get(routes::app_settings::load_history_retention_limit)
+                .put(routes::app_settings::save_history_retention_limit),
         )
         .route(
             "/app-settings/max-retries",

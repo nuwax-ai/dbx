@@ -105,10 +105,13 @@ async fn live_clickhouse_query_result_export_xlsx_streams_random_order_query_onc
         csv_quote_mode: Default::default(),
         export_table_name: None,
         export_column_types: None,
+        export_column_extras: None,
         column_comments: None,
         auto_filter: None,
         identifier_quote: None,
         numeric_column_right_align: false,
+        exclude_primary_keys: false,
+        primary_keys: Vec::new(),
     };
     let done_seen = AtomicBool::new(false);
     let result = export_query_result_core(&state, &request, None, |progress| {

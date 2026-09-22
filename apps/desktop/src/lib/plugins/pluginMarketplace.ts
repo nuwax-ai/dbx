@@ -1,4 +1,5 @@
 import type { InstalledPlugin, PluginMarketplaceArtifact, PluginMarketplacePlugin, PluginRepository, PluginRepositoryCatalogResult } from "@/types/database";
+import { uuid } from "@/lib/common/utils";
 
 export type MarketplacePluginStatus = "install" | "installed" | "update" | "unsupported";
 
@@ -60,19 +61,92 @@ export function selectMarketplaceArtifact(artifacts: readonly PluginMarketplaceA
   return artifacts.find((candidate) => candidate.target === target) || artifacts.find((candidate) => candidate.target === UNIVERSAL_PLUGIN_TARGET);
 }
 
+export interface InstalledPluginUpdateEntry {
+  listing: MarketplacePluginListing;
+  repositoryName: string;
+}
+
+// Same plugin id can be published by several enabled repositories. Prefer a repository allowed to
+// verify the plugin (official/enterprise), then the higher latestVersion, so every consumer of the
+// catalog join (marketplace cards, installed tab, batch) resolves the same single source.
+function preferredUpdateListing(left: MarketplacePluginListing, right: MarketplacePluginListing): MarketplacePluginListing {
+  if (left.verified !== right.verified) return left.verified ? left : right;
+  return compareVersions(right.plugin.latestVersion, left.plugin.latestVersion) > 0 ? right : left;
+}
+
+/**
+ * Catalog join for the installed tab: update-bearing listings indexed by plugin id, with at most
+ * one entry per id (see preferredUpdateListing for the multi-repository collision rule).
+ */
+export function buildInstalledUpdateIndex(listings: readonly MarketplacePluginListing[]): Map<string, InstalledPluginUpdateEntry> {
+  const index = new Map<string, InstalledPluginUpdateEntry>();
+  for (const listing of listings) {
+    if (listing.status !== "update") continue;
+    const existing = index.get(listing.plugin.id);
+    if (existing && preferredUpdateListing(existing.listing, listing) === existing.listing) continue;
+    index.set(listing.plugin.id, { listing, repositoryName: listing.repository.name });
+  }
+  return index;
+}
+
+export interface PluginSourceChange {
+  repositoryChanged: boolean;
+  publisherChanged: boolean;
+  signingKeyChanged: boolean;
+}
+
+/**
+ * Compare the provenance recorded at install time against the candidate listing. Null means "no
+ * confirmation needed": nothing recorded yet (installs from before provenance existed stay
+ * unconstrained), or the recorded repository/publisher/signing key all match the candidate.
+ */
+export function pluginSourceChange(listing: MarketplacePluginListing): PluginSourceChange | null {
+  const provenance = listing.installed?.provenance;
+  if (!provenance) return null;
+  const repositoryChanged = !!provenance.repositoryId && provenance.repositoryId !== listing.repository.id;
+  const publisherChanged = !!provenance.publisher && !!listing.plugin.publisher && provenance.publisher !== listing.plugin.publisher;
+  const signingKeyChanged = !!provenance.signingKeyId && !!listing.artifact?.signingKeyId && provenance.signingKeyId !== listing.artifact.signingKeyId;
+  if (!repositoryChanged && !publisherChanged && !signingKeyChanged) return null;
+  return { repositoryChanged, publisherChanged, signingKeyChanged };
+}
+
 export function listingRepositoryCanVerify(repository: PluginRepository): boolean {
   return repository.kind === "official" || repository.kind === "enterprise";
 }
 
 const INSTALL_BEACON_URL = "https://dbxio.com/api/plugins/install";
+const INSTALLATION_ID_STORAGE_KEY = "dbx-installation-id";
+const INSTALLATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-// Fire-and-forget install beacon for marketplace statistics; never blocks or fails the install.
-export function beaconPluginInstall(pluginId: string, version: string): void {
+// Anonymous, purely random per-installation id so server-side stats can count
+// distinct machines without any user or hardware fingerprint. Clearing local
+// storage (or reinstalling) regenerates it, which is acceptable for
+// decorative statistics.
+function installationClientId(): string {
+  try {
+    if (typeof localStorage === "undefined") return "";
+    let id = localStorage.getItem(INSTALLATION_ID_STORAGE_KEY);
+    if (!id || !INSTALLATION_ID_PATTERN.test(id)) {
+      id = uuid();
+      localStorage.setItem(INSTALLATION_ID_STORAGE_KEY, id);
+    }
+    return id;
+  } catch {
+    return "";
+  }
+}
+
+export type PluginInstallBeaconKind = "install" | "update";
+
+// Fire-and-forget install beacon for marketplace statistics; never blocks or
+// fails the install. `kind` separates fresh installs from version updates so
+// update traffic cannot inflate the install numbers.
+export function beaconPluginInstall(pluginId: string, version: string, kind: PluginInstallBeaconKind = "install"): void {
   try {
     void fetch(INSTALL_BEACON_URL, {
       method: "POST",
       headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ id: pluginId, version }),
+      body: JSON.stringify({ id: pluginId, version, kind, clientId: installationClientId() }),
       keepalive: true,
     }).catch(() => undefined);
   } catch {
@@ -99,7 +173,37 @@ function marketplacePluginLocalization(plugin: PluginMarketplacePlugin, locale: 
   };
 }
 
-function compareVersions(left: string, right: string): number {
+// Semver prerelease ordering: an identifier pair compares numerically when both are numeric,
+// numeric ranks below alphanumeric, a shorter identifier list ranks lower, and a version WITHOUT
+// a prerelease ranks above any prerelease. Plain localeCompare gets the last rule backwards
+// ("~" collates below letters), which used to rank releases below their own betas.
+function comparePrerelease(left: string, right: string): number {
+  if (left === right) return 0;
+  if (left === "~") return 1;
+  if (right === "~") return -1;
+  const leftIds = left.split(".");
+  const rightIds = right.split(".");
+  for (let index = 0; index < Math.max(leftIds.length, rightIds.length); index += 1) {
+    const leftId = leftIds[index];
+    const rightId = rightIds[index];
+    if (leftId === undefined) return -1;
+    if (rightId === undefined) return 1;
+    const leftNumber = Number(leftId);
+    const rightNumber = Number(rightId);
+    const leftNumeric = leftId !== "" && !Number.isNaN(leftNumber);
+    const rightNumeric = rightId !== "" && !Number.isNaN(rightNumber);
+    if (leftNumeric && rightNumeric) {
+      if (leftNumber !== rightNumber) return leftNumber - rightNumber;
+    } else if (leftNumeric !== rightNumeric) {
+      return leftNumeric ? -1 : 1;
+    } else if (leftId !== rightId) {
+      return leftId < rightId ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+export function compareVersions(left: string, right: string): number {
   const leftParts = parseVersion(left);
   const rightParts = parseVersion(right);
   if (!leftParts || !rightParts) return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
@@ -108,7 +212,7 @@ function compareVersions(left: string, right: string): number {
   for (let index = 0; index < leftNumbers.length; index += 1) {
     if (leftNumbers[index] !== rightNumbers[index]) return leftNumbers[index] - rightNumbers[index];
   }
-  return leftParts[3].localeCompare(rightParts[3]);
+  return comparePrerelease(leftParts[3], rightParts[3]);
 }
 
 function parseVersion(version: string): [number, number, number, string] | null {

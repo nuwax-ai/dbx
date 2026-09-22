@@ -1,5 +1,6 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { GAUSSDB_M_JDBC_DRIVER_PROFILE } from "@/lib/database/jdbcDialect";
+import { effectiveRedisDatabaseIndex } from "@/lib/redis/redisDatabaseIndex";
 
 /**
  * Builds copy-ready connection strings (standard URL / JDBC URL / libpq DSN /
@@ -73,7 +74,7 @@ const STANDARD_URL_SCHEMES: Partial<Record<DatabaseType, string>> = {
 };
 
 /** Schemes that are plain HTTP(S) endpoints. */
-const HTTP_URL_DB_TYPES = new Set<DatabaseType>(["elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "rqlite", "consul", "victoriametrics", "influxdb", "influxdb3", "dynamodb"]);
+const HTTP_URL_DB_TYPES = new Set<DatabaseType>(["elasticsearch", "easysearch", "meilisearch", "solr", "qdrant", "milvus", "weaviate", "chromadb", "rqlite", "consul", "victoriametrics", "influxdb", "influxdb3", "dynamodb"]);
 
 /**
  * Generic `prefix://host:port/db` JDBC dialects. Dialects with a different URL
@@ -145,7 +146,11 @@ export function connectionSupportsUrlCopy(config: ConnectionUrlCopyConfig | unde
 }
 
 function effectiveDatabase(config: ConnectionUrlCopyConfig, options?: ConnectionUrlCopyOptions): string {
-  return options?.database?.trim() || config.database?.trim() || "";
+  const database = options?.database?.trim() || config.database?.trim() || "";
+  // A Redis database is a numeric index; dirty values resolve to the index the
+  // backend actually connects with (see effectiveRedisDatabaseIndex).
+  if (database && config.db_type === "redis") return effectiveRedisDatabaseIndex(database);
+  return database;
 }
 
 function queryHasParam(params: string, keys: string[]): boolean {

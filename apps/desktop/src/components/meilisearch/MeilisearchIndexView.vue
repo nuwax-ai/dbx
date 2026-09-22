@@ -1,17 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import dayjs from "dayjs";
-import relativeTime from "dayjs/plugin/relativeTime";
-import "dayjs/locale/zh-cn";
-import "dayjs/locale/zh-tw";
-import "dayjs/locale/az";
-import "dayjs/locale/es";
-import "dayjs/locale/it";
-import "dayjs/locale/ja";
-import "dayjs/locale/ko";
-import "dayjs/locale/pt-br";
-import "dayjs/locale/tr";
 import { Copy, FileText, ListChecks, Settings } from "@lucide/vue";
 import * as api from "@/lib/backend/api";
 import type { MeilisearchIndexOverview } from "@/lib/backend/tauri";
@@ -21,20 +10,7 @@ import { useTabUiState } from "@/lib/tabs/tabUiState";
 import MeilisearchDocumentsPage from "./MeilisearchDocumentsPage.vue";
 import MeilisearchSettingsPage from "./MeilisearchSettingsPage.vue";
 import MeilisearchTasksPage from "./MeilisearchTasksPage.vue";
-
-dayjs.extend(relativeTime);
-
-const DAYJS_LOCALES: Record<string, string> = {
-  az: "az",
-  "zh-CN": "zh-cn",
-  "zh-TW": "zh-tw",
-  "pt-BR": "pt-br",
-  es: "es",
-  it: "it",
-  ja: "ja",
-  ko: "ko",
-  tr: "tr",
-};
+import { formatMeilisearchTaskDateTime } from "@/types/meilisearchManagement";
 
 const props = defineProps<{
   connectionId: string;
@@ -62,9 +38,7 @@ const navSections = computed<Array<{ value: ActiveSection; label: string; icon: 
 const updatedAtLabel = computed(() => {
   const value = overview.value?.updatedAt;
   if (!value) return "-";
-  return dayjs(value)
-    .locale(DAYJS_LOCALES[locale.value] ?? "en")
-    .fromNow();
+  return formatMeilisearchTaskDateTime(value, locale.value);
 });
 
 async function refreshStats() {
@@ -126,8 +100,17 @@ onMounted(() => {
           <div class="text-muted-foreground">{{ t("meilisearch.documentCountLabel") }}</div>
           <div class="mt-0.5 tabular-nums text-foreground/80">{{ overview ? overview.numberOfDocuments : "-" }}</div>
         </div>
-        <div v-if="overview?.databaseSize != null">
-          <div class="text-muted-foreground">{{ t("meilisearch.databaseSize") }}</div>
+        <div v-if="overview?.documentSize != null">
+          <div class="text-muted-foreground">{{ t("meilisearch.documentSize") }}</div>
+          <div class="mt-0.5 tabular-nums text-foreground/80">{{ formatBytes(overview.documentSize) }}</div>
+        </div>
+        <div v-if="overview?.avgDocumentSize != null">
+          <div class="text-muted-foreground">{{ t("meilisearch.avgDocumentSize") }}</div>
+          <div class="mt-0.5 tabular-nums text-foreground/80">{{ formatBytes(overview.avgDocumentSize) }}</div>
+        </div>
+        <!-- Older servers report no per-index size; label the instance-wide number so it is not read as this index's size. -->
+        <div v-else-if="overview?.databaseSize != null">
+          <div class="text-muted-foreground">{{ t("meilisearch.instanceDatabaseSize") }}</div>
           <div class="mt-0.5 tabular-nums text-foreground/80">{{ formatBytes(overview.databaseSize) }}</div>
         </div>
       </div>

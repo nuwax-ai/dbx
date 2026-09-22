@@ -2,7 +2,7 @@
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, PlugZap, FileDown, FolderTree } from "@lucide/vue";
+import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, PlugZap, FileDown, FolderTree, Pin, PinOff } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
@@ -36,6 +36,7 @@ const props = defineProps<{
   agentDriverUpdateCount: number;
   hasMcpUpdateAvailable: boolean;
   hasConnections: boolean;
+  canNewQuery: boolean;
   hasSqlFileConnections: boolean;
 }>();
 
@@ -60,7 +61,8 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
-const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
+const showToolbarUpdateEntry = computed(() => toolbarItems.value.checkUpdates || props.hasUpdateAvailable);
+const { isMac, isDesktop, showControls, isMaximized, isFullscreen, isAlwaysOnTop, minimize, toggleMaximize, toggleAlwaysOnTop, close } = useWindowControls();
 // The in-app updater misbehaves in this fork's Docker deployment; keep its toolbar entries hidden.
 const UPDATER_ENABLED = false;
 const updateTooltip = computed(() => {
@@ -154,7 +156,7 @@ const collapsibleRightItemDefs = computed(() => {
     disabled: boolean;
   }
   const items: ItemDef[] = [];
-  if (UPDATER_ENABLED && toolbarItems.value.checkUpdates) {
+  if (UPDATER_ENABLED && showToolbarUpdateEntry.value) {
     items.push({
       key: "checkUpdates",
       label: t("updates.check"),
@@ -505,7 +507,7 @@ const toolbarStyle = computed(() => {
       </span>
     </Button>
 
-    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')" :disabled="!hasConnections">
+    <Button v-if="canNewQuery" variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')">
       <FilePlus2 class="h-3.5 w-3.5" />
       <span :class="toolbarTextLabelClass">{{ t("toolbar.newQuery") }}</span>
     </Button>
@@ -562,17 +564,47 @@ const toolbarStyle = computed(() => {
 
     <!-- Right-side items wrapped in overflow-aware container -->
     <div ref="rightWrapper" class="flex min-w-0 items-center gap-1 overflow-hidden">
-      <template v-if="UPDATER_ENABLED && toolbarItems.checkUpdates">
+      <template v-if="UPDATER_ENABLED && showToolbarUpdateEntry">
         <Tooltip>
           <TooltipTrigger as-child>
-            <Button v-show="isRightItemVisible('checkUpdates')" data-toolbar-update-trigger variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" @click="emit('check-updates')">
-              <ToolbarUpdateIcon />
-              <span v-if="hasUpdateAvailable" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" />
+            <Button
+              v-show="isRightItemVisible('checkUpdates')"
+              data-toolbar-update-trigger
+              :data-toolbar-update-action="hasUpdateAvailable ? '' : undefined"
+              :variant="hasUpdateAvailable ? 'default' : 'ghost'"
+              :size="hasUpdateAvailable ? 'sm' : 'icon'"
+              class="toolbar-action-button shrink-0"
+              :class="hasUpdateAvailable ? 'h-7 gap-1.5 px-2 text-xs' : 'relative h-8 w-8'"
+              @click="emit('check-updates')"
+            >
+              <template v-if="hasUpdateAvailable">
+                <CloudDownload class="h-3.5 w-3.5" />
+                <span>{{ t("updates.updateAction") }}</span>
+              </template>
+              <ToolbarUpdateIcon v-else :available="false" />
             </Button>
           </TooltipTrigger>
           <TooltipContent>{{ updateTooltip }}</TooltipContent>
         </Tooltip>
       </template>
+
+      <Tooltip v-if="isDesktop">
+        <TooltipTrigger as-child>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="toolbar-action-button relative h-8 w-8 shrink-0"
+            :class="{ 'toolbar-action-button--active bg-accent': isAlwaysOnTop }"
+            :aria-pressed="isAlwaysOnTop"
+            :aria-label="isAlwaysOnTop ? t('toolbar.alwaysOnTopOff') : t('toolbar.alwaysOnTop')"
+            @click="toggleAlwaysOnTop"
+          >
+            <Pin v-if="isAlwaysOnTop" class="toolbar-action-icon h-4 w-4 fill-current" />
+            <PinOff v-else class="toolbar-action-icon h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ isAlwaysOnTop ? t("toolbar.alwaysOnTopOff") : t("toolbar.alwaysOnTop") }}</TooltipContent>
+      </Tooltip>
 
       <div v-show="isRightItemVisible('exportProgress')" class="contents">
         <ExportProgressPopover />

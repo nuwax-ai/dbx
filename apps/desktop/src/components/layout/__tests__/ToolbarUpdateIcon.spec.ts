@@ -1,5 +1,7 @@
 // @vitest-environment happy-dom
 import { createApp, h } from "vue";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import ToolbarUpdateIcon from "../ToolbarUpdateIcon.vue";
 describe("silent toolbar update icon", () => {
@@ -10,5 +12,31 @@ describe("silent toolbar update icon", () => {
     expect(container.querySelector("[data-toolbar-update-idle]")).not.toBeNull();
     expect(container.querySelector("[data-toolbar-update-progress], [data-toolbar-update-scan]")).toBeNull();
     app.unmount();
+  });
+
+  it("renders a text Update action whenever any aggregate update is available", () => {
+    const source = readFileSync(resolve(process.cwd(), "apps/desktop/src/components/layout/AppToolbar.vue"), "utf8");
+
+    expect(source).toContain('v-if="hasUpdateAvailable"');
+    expect(source).toContain("data-toolbar-update-action");
+    expect(source).toContain('t("updates.updateAction")');
+  });
+
+  it("keeps the update entry visible when the appearance setting is off but an update is available", () => {
+    const source = readFileSync(resolve(process.cwd(), "apps/desktop/src/components/layout/AppToolbar.vue"), "utf8");
+
+    expect(source).toContain("const showToolbarUpdateEntry = computed(() => toolbarItems.value.checkUpdates || props.hasUpdateAvailable);");
+    // nuwax fork: the update entry is additionally gated by UPDATER_ENABLED (dbx-web cannot self-update).
+    expect(source).toContain("if (UPDATER_ENABLED && showToolbarUpdateEntry.value) {");
+    expect(source).toContain('<template v-if="UPDATER_ENABLED && showToolbarUpdateEntry">');
+    expect(source).not.toContain('<template v-if="toolbarItems.checkUpdates">');
+  });
+
+  it("passes only opt-out component badges to their separate toolbar entries", () => {
+    const source = readFileSync(resolve(process.cwd(), "apps/desktop/src/App.vue"), "utf8");
+
+    expect(source).toContain(':agent-driver-update-count="showDriverStoreUpdateBadge"');
+    expect(source).toContain(':has-mcp-update-available="showMcpSettingsUpdateBadge"');
+    expect(source).not.toContain(':agent-driver-update-count="toolbarDriverUpdateCount"');
   });
 });

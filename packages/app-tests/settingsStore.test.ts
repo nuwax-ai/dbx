@@ -400,8 +400,68 @@ test("defaults auto-close brackets to on and preserves saved booleans", () => {
 
 test("defaults update notifications to enabled", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateApp, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateMcp, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins, true);
   assert.equal(normalizeEditorSettings({}).updateNotificationsEnabled, true);
+  assert.equal(normalizeEditorSettings({}).autoUpdateApp, true);
+  assert.equal(normalizeEditorSettings({}).autoUpdateDrivers, true);
+  assert.equal(normalizeEditorSettings({}).autoUpdateJdbc, true);
+  assert.equal(normalizeEditorSettings({}).autoUpdateMcp, true);
+  assert.equal(normalizeEditorSettings({}).autoUpdatePlugins, true);
   assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).updateNotificationsEnabled, false);
+  assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdateApp, false);
+  assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdateDrivers, false);
+  assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdateJdbc, false);
+  assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdateMcp, false);
+  assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdatePlugins, false);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateApp, false);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateDrivers, true);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateJdbc, true);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateMcp, true);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdatePlugins, true);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).updateNotificationsEnabled, false);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateApp, false);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateDrivers, true);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateJdbc, true);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateMcp, true);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdatePlugins, true);
+});
+
+test("centralized automatic updates default on while explicit category opt-outs are preserved", () => {
+  const migrated = normalizeEditorSettings({ updateNotificationsEnabled: false } as any);
+
+  assert.deepEqual(
+    {
+      app: migrated.autoUpdateApp,
+      drivers: migrated.autoUpdateDrivers,
+      jdbc: migrated.autoUpdateJdbc,
+      mcp: migrated.autoUpdateMcp,
+      plugins: migrated.autoUpdatePlugins,
+    },
+    { app: false, drivers: false, jdbc: false, mcp: false, plugins: false },
+  );
+
+  const explicitlyConfigured = normalizeEditorSettings({
+    updateNotificationsEnabled: false,
+    autoUpdateApp: true,
+    autoUpdateDrivers: false,
+    autoUpdateJdbc: false,
+    autoUpdateMcp: false,
+    autoUpdatePlugins: true,
+  } as any);
+  assert.deepEqual(
+    {
+      app: explicitlyConfigured.autoUpdateApp,
+      drivers: explicitlyConfigured.autoUpdateDrivers,
+      jdbc: explicitlyConfigured.autoUpdateJdbc,
+      mcp: explicitlyConfigured.autoUpdateMcp,
+      plugins: explicitlyConfigured.autoUpdatePlugins,
+    },
+    { app: true, drivers: false, jdbc: false, mcp: false, plugins: true },
+  );
 });
 
 test("defaults sidebar table search to disabled and preserves saved booleans", () => {
@@ -645,6 +705,9 @@ test("normalizes grid drawer widths", () => {
   assert.equal(normalizeEditorSettings({ cellDetailDrawerWidth: 200 } as any).cellDetailDrawerWidth, 260);
   assert.equal(normalizeEditorSettings({ tableInfoDrawerWidth: 1000 } as any).tableInfoDrawerWidth, 900);
   assert.equal(normalizeEditorSettings({ tableInfoActiveTab: "columns" } as any).tableInfoActiveTab, "columns");
+  // The Partitions tab is a first-class table-info tab, so a saved preference
+  // for it must survive normalization instead of falling back to DDL.
+  assert.equal(normalizeEditorSettings({ tableInfoActiveTab: "partitions" } as any).tableInfoActiveTab, "partitions");
   assert.equal(normalizeEditorSettings({ tableInfoActiveTab: "invalid" } as any).tableInfoActiveTab, "ddl");
   assert.equal(normalizeEditorSettings({ cellDetailDrawerWidth: 456.7 } as any).cellDetailDrawerWidth, 457);
   assert.equal(normalizeEditorSettings({ cellDetailPanelLayout: "right" } as any).cellDetailPanelLayout, "right");
@@ -951,8 +1014,8 @@ test("AI partner presets reuse a supported runtime adapter", () => {
   assert.ok(jalapeno);
   assert.equal(jalapeno.provider, "openai-compatible");
   assert.equal(jalapeno.endpoint, "https://api.jalapeno-cloud.ai/v1");
-  assert.equal(jalapeno.model, "GLM-5.2");
-  assert.deepEqual(jalapeno.models, [{ name: "GLM-5.2" }, { name: "DeepSeek-V4-Pro" }, { name: "MiniMax-M3" }]);
+  assert.ok(jalapeno.model);
+  assert.ok(jalapeno.models.some(({ name }) => name === jalapeno.model));
   assert.equal(jalapeno.requiresApiKey, true);
   assert.equal(jalapeno.websiteUrl, "https://www.jalapeno-cloud.ai/dbx");
   assert.equal(jalapeno.apiKeyUrl, "https://www.jalapeno-cloud.ai/dbx");

@@ -13,7 +13,7 @@ import { createContentSurfaceEventForwarders } from "@/lib/tabs/contentSurfaceEv
 import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { resolveExecutableSql } from "@/lib/sql/sqlExecutionTarget";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { usesOracleStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
+import { usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
 import { GROUP_TAB_BAR_PORTAL } from "./groupTabBarPortal";
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps, QueryEditorSurfaceHandle, StatementRange } from "./querySurfaces";
 import type { QueryTab } from "@/types/database";
@@ -110,7 +110,7 @@ const groupTabs = computed(() => {
 const activeTab = computed(() => groupTabs.value.find((tab) => tab.id === props.activeTabId) ?? groupTabs.value[0] ?? null);
 const activeConnection = computed(() => (activeTab.value ? connectionStore.getConfig(activeTab.value.connectionId) : undefined));
 const showGroupToolbar = computed(() => activeTab.value?.mode === "query" && !isPreviewTab(activeTab.value));
-const isGroupOracleManualTransaction = computed(() => usesOracleStickyTransactionState(effectiveDatabaseTypeForConnection(activeConnection.value)) && (activeTab.value?.autoCommit ?? true) === false);
+const isGroupStickyManualTransaction = computed(() => usesProvenReadOnlyStickyTransactionState(effectiveDatabaseTypeForConnection(activeConnection.value)) && (activeTab.value?.autoCommit ?? true) === false);
 // Each group previews the executable SQL of its own active tab (selection
 // stored on the tab), not the focused tab's global selection.
 // tabPlacement drives each pane's own bar position: the strip sits above,
@@ -185,8 +185,11 @@ const groupExecutableSql = computed(() => {
         :auto-commit="activeTab.autoCommit ?? true"
         :txn-session-id="activeTab.txnSessionId"
         :txn-auto-rolled-back="activeTab.txnAutoRolledBack"
-        :oracle-txn-possibly-dirty="activeTab.oracleTxnPossiblyDirty"
-        :is-oracle-manual-transaction="isGroupOracleManualTransaction"
+        :txn-possibly-dirty="activeTab.txnPossiblyDirty"
+        :auto-commit-open-transaction="activeTab.autoCommitOpenTransaction"
+        :auto-commit-txn-rolled-back="activeTab.autoCommitTxnRolledBack"
+        :auto-commit-session-txn-rolled-back="activeTab.autoCommitSessionTxnRolledBack"
+        :sticky-proven-read-only-state="isGroupStickyManualTransaction"
         @update:explain-mode="(m: 'explain' | 'autotrace') => (toolbar.explainMode.value = m)"
         @update:block-dangerous-redis-commands="(v: boolean) => (toolbar.blockDangerousRedisCommands.value = v)"
         @update:auto-commit="
@@ -199,6 +202,8 @@ const groupExecutableSql = computed(() => {
         @commit="activeTab && queryStore.commitTransaction(activeTab.id)"
         @rollback="activeTab && queryStore.rollbackTransaction(activeTab.id)"
         @dismiss-txn-rolled-back="activeTab && (activeTab.txnAutoRolledBack = false)"
+        @dismiss-auto-commit-txn-rolled-back="activeTab && (activeTab.autoCommitTxnRolledBack = false)"
+        @dismiss-auto-commit-session-txn-rolled-back="activeTab && (activeTab.autoCommitSessionTxnRolledBack = false)"
         @execute-pointer-down="toolbar.captureExecutionSnapshot(activeTab.id)"
         @toolbar-execute="toolbar.toolbarExecute($event, activeTab.id)"
         @multi-execute="toolbar.multiExecute()"

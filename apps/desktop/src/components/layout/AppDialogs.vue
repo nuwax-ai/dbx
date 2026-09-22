@@ -14,6 +14,7 @@ const SchemaDiagramDialog = defineAsyncComponent(() => import("@/components/diag
 const DatabaseDocsDialog = defineAsyncComponent(() => import("@/components/docs/DatabaseDocsDialog.vue"));
 const TableImportDialog = defineAsyncComponent(() => import("@/components/import/TableImportDialog.vue"));
 const MongoImportDialog = defineAsyncComponent(() => import("@/components/document/MongoImportDialog.vue"));
+const MongoDatabaseDumpDialog = defineAsyncComponent(() => import("@/components/document/MongoDatabaseDumpDialog.vue"));
 const FieldLineageDialog = defineAsyncComponent(() => import("@/components/lineage/FieldLineageDialog.vue"));
 const ConfigPassphraseDialog = defineAsyncComponent(() => import("@/components/config/ConfigPassphraseDialog.vue"));
 const ConfigConnectionSelectDialog = defineAsyncComponent(() => import("@/components/config/ConfigConnectionSelectDialog.vue"));
@@ -27,7 +28,7 @@ import { useSqlExecutionDangerStore } from "@/stores/sqlExecutionDangerStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { useReadOnlyUnlockStore, WRITE_UNLOCK_FIVE_MINUTES_SECS, WRITE_UNLOCK_ONE_MINUTE_SECS, type WriteUnlockDurationSecs } from "@/stores/readOnlyUnlockStore";
 import { useDialogSources } from "@/composables/useDialogSources";
-import type { ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
+import type { ConnectionDeepLinkDraft, ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import type { SqlParameterDescriptor, SqlParameterSyntax } from "@/lib/sql/sqlParameters";
 import type { ConfigTab } from "@/components/connection/ConnectionDialog.vue";
@@ -37,6 +38,7 @@ import type { PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 const props = defineProps<{
   showConnectionDialog: boolean;
   connectionPrefill?: ConnectionDeepLinkDraft | null;
+  connectionUpdate?: ConnectionDeepLinkUpdate | null;
   connectionPluginProvider?: PluginCenterFocus | null;
   connectionInitialTab?: ConfigTab;
   showDangerDialog: boolean;
@@ -170,6 +172,7 @@ watch(
     :open="shouldShowConnectionDialog"
     :edit-config="editConfig"
     :prefill-config="connectionPrefill"
+    :update-prefill="connectionUpdate"
     :plugin-provider="connectionPluginProvider"
     :initial-tab="connectionInitialTab"
     @update:open="emit('update:showConnectionDialog', $event)"
@@ -301,6 +304,13 @@ watch(
     :prefill-table="dialogs.tableImportPrefillTable.value"
   />
   <MongoImportDialog v-model:open="dialogs.showMongoImportDialog.value" :connection-id="dialogs.mongoImportPrefillConnectionId.value" :database="dialogs.mongoImportPrefillDatabase.value" :collection="dialogs.mongoImportPrefillCollection.value" />
+  <MongoDatabaseDumpDialog
+    v-if="dialogs.showMongoDatabaseDumpDialog.value"
+    v-model:open="dialogs.showMongoDatabaseDumpDialog.value"
+    :connection-id="dialogs.mongoDatabaseDumpPrefillConnectionId.value"
+    :database="dialogs.mongoDatabaseDumpPrefillDatabase.value"
+    :mode="dialogs.mongoDatabaseDumpMode.value"
+  />
   <DataGenerateDialog
     v-if="dialogs.showTableDataGenerateDialog.value"
     v-model:open="dialogs.showTableDataGenerateDialog.value"
