@@ -281,7 +281,8 @@ describe("normalizeEditorSettings", () => {
   });
 
   it("migrates legacy update opt-outs without overriding explicit category settings", () => {
-    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(true);
+    // nuwax fork: app update notifications default to off (dbx-web cannot self-update).
+    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(false);
     expect(normalizeEditorSettings({ autoDownloadUpdates: true }).autoDownloadUpdates).toBe(true);
     expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoDownloadUpdates).toBe(false);
     expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateDrivers).toBe(true);
@@ -1048,7 +1049,8 @@ describe("settingsStore persisted settings initialization", () => {
       fontSize: 17,
       theme: "xcode-dark",
       executeMode: "all",
-      updateNotificationsEnabled: true,
+      // nuwax fork: legacy updateNotificationsEnabled=true no longer opts in; default is off.
+      updateNotificationsEnabled: false,
       appLayout: "separated",
     });
     expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ fontSize: 17, theme: "xcode-dark", appLayout: "separated" }));

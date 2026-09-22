@@ -1160,9 +1160,10 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   generateSqlIncludeDatabaseName: false,
   generateSqlQuoteIdentifiers: true,
   formatSqlOnSqlFileSave: false,
-  updateNotificationsEnabled: true,
-  autoDownloadUpdates: true,
-  autoUpdateApp: true,
+  // nuwax fork: dbx-web deployments cannot self-update; default app update notifications off.
+  updateNotificationsEnabled: false,
+  autoDownloadUpdates: false,
+  autoUpdateApp: false,
   autoUpdateDrivers: true,
   autoUpdateJdbc: true,
   autoUpdateMcp: true,
