@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { defineAsyncComponent, onMounted, ref, watch } from "vue";
+import { defineAsyncComponent, onMounted, provide, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import LoginPage from "@/components/auth/LoginPage.vue";
 import SecurityMigrationWizard from "@/components/migration/SecurityMigrationWizard.vue";
@@ -18,6 +18,12 @@ const loginRequired = ref(false);
 const setupRequired = ref(false);
 const authFailed = ref(false);
 const enteringApp = ref(false);
+// nuwax fork: App is only mounted after auth/migration cleared here, so its own
+// auth re-check (and the intermediate screens that check flashes) can be skipped.
+provide("dbxStartupAuthResolved", true);
+// nuwax fork: hold the loading screen until App finished mounting; the async
+// chunk load otherwise shows a blank flash between the checks and the app.
+const appLoaded = ref(false);
 let launchTransitionTimer: number | undefined;
 
 watch(
@@ -30,6 +36,7 @@ watch(
 );
 
 function appReady() {
+  appLoaded.value = true;
   window.clearTimeout(launchTransitionTimer);
   launchTransitionTimer = window.setTimeout(() => {
     enteringApp.value = false;
@@ -38,6 +45,7 @@ function appReady() {
 async function initialize() {
   checkingAuth.value = true;
   authFailed.value = false;
+  appLoaded.value = false;
   try {
     if (!isTauriRuntime()) {
       const response = await fetch(apiUrl("/api/auth/check"), { credentials: "same-origin" });
@@ -87,6 +95,11 @@ onMounted(initialize);
         </div>
       </div>
     </Transition>
+    <!-- nuwax fork: keep one continuous loading screen until the app mounted;
+         without it the async App chunk load flashes intermediate states. -->
+    <div v-if="!appLoaded" class="fixed inset-0 z-[1000] flex flex-col items-center justify-center gap-4 bg-background text-foreground" role="status">
+      <p>{{ t("migration.checking") }}</p>
+    </div>
   </div>
 </template>
 

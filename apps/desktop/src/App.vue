@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { blockingDesktopAiRunsForUpdate } from "@/lib/ai/desktopAiRunRegistry";
 import { setupUpdatePreparation, prepareUpdateWithDraftRecovery, isUpdatePreparationActive } from "@/lib/app/updatePreparation";
-import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent, provide } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent, provide, inject } from "vue";
 import { useI18n } from "vue-i18n";
 import { FileText } from "@lucide/vue";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -361,9 +361,14 @@ const { mcpUpdateAvailable, refreshMcpUpdateStatus, handleMcpStatusChanged, appl
 const drawDesktopWindowFrame = shouldDrawDesktopWindowFrame(isMacOS(), isDesktop, isWindows());
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 let updateCheckTimer: ReturnType<typeof setInterval> | undefined;
-const needsAuth = ref(!isDesktop);
-const authenticated = ref(isDesktop);
+// nuwax fork: StartupGate (the web entry) already resolved auth before mounting
+// App, so trust its result and skip the redundant /api/auth/check round-trip —
+// re-checking here flashes the login page on DBX_DISABLE_PASSWORD deployments.
+const startupAuthResolved = inject<boolean>("dbxStartupAuthResolved", false);
+const needsAuth = ref(!isDesktop && !startupAuthResolved);
+const authenticated = ref(isDesktop || startupAuthResolved);
 const setupRequired = ref(false);
+const authCheckPending = ref(!isDesktop && !startupAuthResolved);
 
 const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
@@ -4022,14 +4027,21 @@ onMounted(async () => {
     true,
   );
   if (!isDesktop) {
-    try {
-      const res = await fetch(apiUrl("/api/auth/check"));
-      const data = await res.json();
-      needsAuth.value = data.required;
-      authenticated.value = data.authenticated;
-      setupRequired.value = data.setup_required;
-    } catch {
-      /* server unreachable */
+    if (startupAuthResolved) {
+      needsAuth.value = false;
+      authenticated.value = true;
+    } else {
+      try {
+        const res = await fetch(apiUrl("/api/auth/check"));
+        const data = await res.json();
+        needsAuth.value = data.required;
+        authenticated.value = data.authenticated;
+        setupRequired.value = data.setup_required;
+      } catch {
+        /* server unreachable */
+      } finally {
+        authCheckPending.value = false;
+      }
     }
     if (needsAuth.value && !authenticated.value) {
       history.replaceState(null, "", webPath("/login"));
@@ -4100,8 +4112,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <LoginPage v-if="setupRequired || (needsAuth && !authenticated)" :setup-mode="setupRequired" @authenticated="onLoginSuccess" />
-  <div v-show="!setupRequired && (!needsAuth || authenticated)" class="fixed inset-0 h-screen w-screen overflow-hidden">
+  <LoginPage v-if="!authCheckPending && (setupRequired || (needsAuth && !authenticated))" :setup-mode="setupRequired" @authenticated="onLoginSuccess" />
+  <div v-show="!authCheckPending && !setupRequired && (!needsAuth || authenticated)" class="fixed inset-0 h-screen w-screen overflow-hidden">
     <div v-if="appBackgroundActive && appBackgroundObjectUrl" data-app-background class="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
       <div class="h-full w-full" :style="appBackgroundImageStyle"></div>
     </div>
