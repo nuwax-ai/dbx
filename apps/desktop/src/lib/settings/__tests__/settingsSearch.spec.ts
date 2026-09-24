@@ -212,7 +212,9 @@ describe("settings search", () => {
     const webKeys = visibleToolbarVisibilityItems(TOOLBAR_VISIBILITY_ITEMS, true).map((item) => item.key);
     expect(desktopKeys).toEqual(TOOLBAR_VISIBILITY_ITEMS.map((item) => item.key));
     expect(webKeys).not.toContain("alwaysOnTop");
-    expect(webKeys).toContain("theme");
+    // nuwax fork: the theme/github toolbar buttons are removed, so their visibility switches are gone too.
+    expect(webKeys).not.toContain("theme");
+    expect(webKeys).not.toContain("github");
 
     const definitions = createToolbarVisibilitySettingsSearchDefinitions();
     const entryIds = (isWeb: boolean) => resolveSettingsSearchEntries(definitions, { isWeb, visibleCategories: new Set<SettingsCategory>(["appearance"]) }, (key) => key, categoryLabels).map((entry) => entry.id);
