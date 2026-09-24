@@ -3,8 +3,8 @@
 本仓库是官方 [t8y2/dbx](https://github.com/t8y2/dbx) 的 fork，**核心用途是 dbx-web 模式的 Docker 自部署**。
 相对官方 main 保留少量刻意差异，本文档是这些差异的权威清单，合并官方更新时对照使用。
 
-> 快速定位所有定制点：前端搜 `UPDATER_ENABLED` 和注释 `nuwax`，Rust 侧搜 `nuwax`。
-> 最近的差异核验：2026-09-24（合并官方 734503f4c 之后）。
+> 快速定位所有定制点：前端搜 `UPDATER_ENABLED`、`dbxStartupAuthResolved` 和注释 `nuwax`，Rust 侧搜 `nuwax`。
+> 最近的差异核验：2026-09-25（合并官方 734503f4c + 启动屏优化之后）。
 
 ## 差异总览
 
@@ -17,6 +17,7 @@
 | 5 | 应用更新提醒默认关闭 | `apps/desktop/src/stores/settingsStore.ts` | 默认值 true → false |
 | 6 | PG 本地免密登录（unix socket） | `crates/dbx-core/src/local_pg.rs` 等 5 处 | 新增模块 + 启动钩子 |
 | 7 | Docker 构建加固 | `deploy/Dockerfile` | pip 镜像重试 + amd64 交叉库 |
+| 8 | 启动屏连续化（密码页不闪现） | `apps/desktop/src/StartupGate.vue` + `App.vue` | provide/inject 跳过重复认证 + 加载屏覆盖到 App 挂载 |
 
 ---
 
@@ -100,6 +101,30 @@ JSON 迁移已归迁移门禁管。
 
 - **ziglang pip 安装重试**：国内镜像偶发连接死掉，外层循环换新 TCP 连接重试 5 次，独立层隔离
 - **amd64 交叉编译库**：arm64 宿主（OrbStack/mac）交叉 amd64 时补装 fontconfig/freetype 的 amd64 dev 库
+
+## 8. 启动屏连续化（密码页不闪现）（2026-09-25 新增）
+
+**原因**：免密部署（`DBX_DISABLE_PASSWORD=1`）下，入口组件 StartupGate 完成认证检查后才挂载 App，
+但 App 挂载后又会自己重复请求一次 `/api/auth/check`；请求返回前 App 按"未认证"默认状态把
+LoginPage 渲染出来再卸载——用户看到密码输入界面一闪而过。此外启动序列原有 4 次画面切换
+（Loading → 检查中 → 空白 → 转圈），观感差。
+
+**实现**（两个文件联动，均有 `nuwax fork` 注释）：
+
+- `StartupGate.vue`：`provide("dbxStartupAuthResolved", true)`——App 只会在认证通过后挂载，
+  把结果直接传下去；新增 `appLoaded` ref，App 异步 chunk 加载期间保持同一张 loading 屏覆盖
+  （z-[1000] overlay），Suspense `@resolve` 后才收起。全程只有一次视觉切换：loading → 主界面。
+- `App.vue`：`inject("dbxStartupAuthResolved", false)` 后跳过重复的 auth 请求，
+  `needsAuth`/`authenticated`/`authCheckPending` 初始即按已认证设置——免密模式下 LoginPage
+  的渲染条件永远为假。`authCheckPending` 兜底门控保留（App 被直接挂载、无 inject 的场景，
+  如部分测试）。
+
+**边界行为**：桌面模式（Tauri）零变化；真正需要密码的部署（未设免密且未登录）由 StartupGate
+自己的 LoginPage 正常处理，行为不变；登录成功后的重新初始化会重置 `appLoaded` 再次覆盖 loading。
+
+**合并注意**：官方对 StartupGate/App 认证流的后续重构可能与此冲突，冲突时按"App 不重复认证 +
+单一连续 loading 屏"两个目标重套。`packages/app-tests/externalSqlFileStartup.test.ts` 断言
+App.vue onMounted 内的源码顺序（fetch → replaceState → initApp），本改动保留了这些锚点。
 
 ---
 
