@@ -691,7 +691,31 @@ impl LocalBackend {
     /// Same as [`open`], but lets tests and embedded callers pin the app version
     /// used for plugin compatibility checks instead of the compile-time version.
     pub async fn open_with_app_version(path: &Path, app_version: &str) -> Result<Self, String> {
-        let storage = Storage::open(path).await?;
+        // A local CLI/MCP process may share an already provisioned desktop
+        // Keychain/credential-store key. Preflight only reads that provider;
+        // it never provisions a key or migrates legacy credentials.
+        let storage = Storage::open_unmigrated(path).await?.with_secret_key_creation(false);
+        let migration = storage.inspect_data_migration().await?;
+        if !migration.is_ready() {
+            // The migration wizard may have already completed on Desktop with
+            // the key provisioned in the OS keychain, which a keyring-less
+            // CLI/MCP build cannot read. Pointing those users back at the
+            // wizard loops forever, so separate the two failure shapes.
+            let migration_data_remaining = migration.database_plaintext_count > 0
+                || migration.sync_credential_count > 0
+                || migration.legacy_json_files.iter().any(|file| file.exists);
+            if !migration_data_remaining && !migration.key_provider_available {
+                return Err(format!(
+                    "SECRET_KEY_UNAVAILABLE: this process cannot read the DBX data encryption key ({}). \
+                     If the data security upgrade was completed in DBX Desktop, its key may live in the OS \
+                     keychain: use an MCP/CLI build with OS keychain support, or expose the key to headless \
+                     tools via the DBX_SECRET_KEY_FILE / DBX_SECRET_KEY environment variables. Otherwise open \
+                     DBX Desktop or Web to complete the data security upgrade first.",
+                    migration.error_code.as_deref().unwrap_or("KEY_PROVIDER_UNAVAILABLE")
+                ));
+            }
+            return Err("DATA_MIGRATION_REQUIRED: open DBX Desktop or Web to complete the data security upgrade".into());
+        }
         let configs = storage.load_connections().await?;
         let desktop_settings = storage.load_desktop_settings().await.unwrap_or_default();
         let data_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
@@ -2563,6 +2587,7 @@ fn infer_document_columns(documents: &[Value]) -> Vec<ColumnInfo> {
             enum_values: None,
             character_set: None,
             collation: None,
+            metadata_capabilities: None,
         })
         .collect()
 }
@@ -4010,6 +4035,29 @@ mod tests {
 
         let connections = backend.load_connections().await.unwrap();
         assert!(connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_backend_rejects_legacy_data_without_migrating_it() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let database_path = data_dir.path().join("dbx.db");
+        let legacy_path = data_dir.path().join("secrets.json");
+        let legacy_contents = br#"{"legacy-connection":{"password":"legacy-test-password"}}"#;
+        std::fs::write(&legacy_path, legacy_contents).unwrap();
+
+        let error = match LocalBackend::open(&database_path).await {
+            Ok(_) => panic!("legacy data must not be opened by CLI/MCP"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("DATA_MIGRATION_REQUIRED"));
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_contents);
+        assert!(!data_dir.path().join("secrets.json.bak").exists());
+        assert!(std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .all(|entry| { !entry.unwrap().file_name().to_string_lossy().starts_with("dbx-secret-migration-") }));
+        let storage = Storage::open_unmigrated(&database_path).await.unwrap();
+        assert!(storage.inspect_data_migration().await.unwrap().needs_migration);
+        assert!(storage.load_connections().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -78,6 +78,7 @@ import { isTableVGroupGroupableRowType, selectedTableVGroupMoveTargets, tableVGr
 import { findTreeNodeById } from "@/lib/sql/newQueryContext";
 import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
+import { redactConnectionStringSecrets } from "@/lib/connection/connectionStringRedaction";
 import { isFocusSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
@@ -516,10 +517,6 @@ function isLocalFileConnection(config: Pick<ConnectionConfig, "db_type" | "port"
   return config.db_type === "sqlite" || config.db_type === "duckdb" || config.db_type === "access" || (config.db_type === "h2" && config.port === 0);
 }
 
-function redactedConnectionString(value: string): string {
-  return value.replace(/(:\/\/[^/\s:@?#;]+):([^@\s/?#;]+)@/g, "$1:***@").replace(/([?&;](?:password|pwd|pass|token|secret|key)=)[^&;]*/gi, "$1***");
-}
-
 function hostForDisplay(host: string): string {
   if (!host.includes(":") || host.startsWith("[") || host.includes("://") || host.includes(",")) return host;
   return `[${host}]`;
@@ -534,11 +531,11 @@ function tooltipDatabaseValue(config: ConnectionConfig): string {
 
 function connectionTooltipUrl(config: ConnectionConfig): string {
   const explicit = cleanTooltipValue(config.connection_string);
-  if (explicit) return redactedConnectionString(explicit);
+  if (explicit) return redactConnectionStringSecrets(explicit);
 
   const host = cleanTooltipValue(config.host);
   if (!host) return "";
-  if (host.includes("://")) return redactedConnectionString(host);
+  if (host.includes("://")) return redactConnectionStringSecrets(host);
 
   if (isLocalFileConnection(config)) {
     if (config.db_type === "access") return `jdbc:ucanaccess://${host}`;
@@ -554,7 +551,7 @@ function connectionTooltipUrl(config: ConnectionConfig): string {
   const path = database ? `/${encodedDatabase}` : "";
   const params = cleanTooltipValue(config.url_params);
   const query = params ? (params.startsWith("?") ? params : `?${params}`) : "";
-  return redactedConnectionString(`${scheme}://${userInfo}${hostForDisplay(host)}${port}${path}${query}`);
+  return redactConnectionStringSecrets(`${scheme}://${userInfo}${hostForDisplay(host)}${port}${path}${query}`);
 }
 
 const detailTooltip = computed(() => {
@@ -638,10 +635,12 @@ const detailTooltip = computed(() => {
       ],
     };
   }
-  const comment = node.type === "column" && node.meta && "comment" in node.meta ? (node.meta as ColumnInfo).comment : node.comment;
-  if (!comment || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column")) return null;
+  const column = node.type === "column" ? (node.meta as ColumnInfo | undefined) : undefined;
+  const comment = column && "comment" in column ? column.comment : node.comment;
+  if ((!comment && !column) || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column")) return null;
   const rows: DetailTooltipRow[] = [
     { label: t("connection.name"), value: visibleLabel(node) },
+    ...(column ? [{ label: t("structureEditor.nullable"), value: t(column.is_nullable ? "structureEditor.nullable" : "structureEditor.notNull") }] : []),
     { label: t("structureEditor.comment"), value: cleanTooltipValue(comment), multiline: true },
   ].filter((row) => row.value);
   return { rows };
@@ -1695,6 +1694,14 @@ function onKeydown(event: KeyboardEvent) {
               ]"
               >{{ visibleLabel(node) }}</span
             >
+            <span
+              v-if="node.type === 'column' && node.meta"
+              class="shrink-0 rounded px-1 text-[10px] leading-4"
+              :class="(node.meta as ColumnInfo).is_nullable ? 'text-muted-foreground bg-muted/50' : 'text-amber-700 bg-amber-500/10 dark:text-amber-300'"
+              :title="t((node.meta as ColumnInfo).is_nullable ? 'structureEditor.nullable' : 'structureEditor.notNull')"
+            >
+              {{ t((node.meta as ColumnInfo).is_nullable ? "structureEditor.nullable" : "structureEditor.notNull") }}
+            </span>
             <button v-if="node.type === 'oracle-db-links'" class="ml-auto rounded p-0.5 text-muted-foreground hover:bg-muted" :aria-label="t('databaseLinks.manage')" :title="t('databaseLinks.manage')" @click.stop="showDatabaseLinks = true" @dblclick.stop>
               <TableProperties class="h-3.5 w-3.5" />
             </button>

@@ -3,6 +3,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { hexToRgba } from "@/lib/common/color";
 import type { CSSProperties } from "vue";
 import { findConnectionGroupPath } from "@/lib/sidebar/sidebarLayout";
+import { supportsConnectionDatabaseInfo } from "@/lib/connection/connectionDatabaseInfo";
 import { splitMongoCommandRanges } from "@/lib/mongo/mongoShellCommand";
 import { executableStatementRanges, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
@@ -259,8 +260,12 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
 export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; value: string }[] {
   const connName = connectionDisplayName(tab.connectionId);
   const groupName = connectionGroupDisplayName(tab.connectionId, t);
-  const database = databaseDisplayNameForTab(tab.connectionId, tab.database, t);
-  const lines: { label: string; value: string }[] = [{ label: t("tabs.tooltipConnection"), value: connName }, ...(groupName ? [{ label: t("tabs.tooltipGroup"), value: groupName }] : []), { label: t("tabs.tooltipDatabase"), value: database }];
+  const connection = useConnectionStore().getConfig(tab.connectionId);
+  const lines: { label: string; value: string }[] = [
+    { label: t("tabs.tooltipConnection"), value: connName },
+    ...(groupName ? [{ label: t("tabs.tooltipGroup"), value: groupName }] : []),
+    ...(!connection || supportsConnectionDatabaseInfo(connection.db_type) ? [{ label: t("tabs.tooltipDatabase"), value: databaseDisplayNameForTab(tab.connectionId, tab.database, t) }] : []),
+  ];
   if (tab.mode === "query" && queryTitle(tab)) {
     lines.unshift({ label: t("tabs.tooltipTitle"), value: tab.title });
   }
@@ -626,6 +631,9 @@ export function tabIconClass(tab: QueryTab): string {
   if (tab.mode === "mongo") return "text-green-400";
   if (tab.mode === "vector") return "text-cyan-400";
   if (tab.mode === "structure") return "text-blue-500";
+  // query 的图标是数据库品牌 logo（TabModeIcon），不吃文字颜色；回退的
+  // Database 图标自带 text-blue-400，与 mq 模式同样返回空串。
+  if (tab.mode === "query") return "";
   return "text-blue-600 dark:text-blue-400";
 }
 
