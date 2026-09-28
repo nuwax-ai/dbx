@@ -141,6 +141,28 @@ test("table DDL wrapping defaults on and normalizes saved booleans independently
   assert.equal(settings.wordWrap, true);
 });
 
+test("data grid column width mode defaults to content and normalizes saved values", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.dataGridColumnWidthMode, "content");
+  assert.equal(normalizeEditorSettings({}).dataGridColumnWidthMode, "content");
+  assert.equal(normalizeEditorSettings({ dataGridColumnWidthMode: "content" }).dataGridColumnWidthMode, "content");
+  assert.equal(normalizeEditorSettings({ dataGridColumnWidthMode: "invalid" as any }).dataGridColumnWidthMode, "content");
+});
+
+test("updateEditorSettings persists the data grid column width mode", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    store.updateEditorSettings({ dataGridColumnWidthMode: "content" });
+    assert.equal(store.editorSettings.dataGridColumnWidthMode, "content");
+    await vi.waitFor(() => {
+      const saved = saveEditorSettingsMock.mock.calls.at(-1)?.[0] as { dataGridColumnWidthMode?: string } | undefined;
+      assert.equal(saved?.dataGridColumnWidthMode, "content");
+    });
+  });
+});
+
 test("updateEditorSettings persists completion column sort toggles", async () => {
   await withMockLocalStorage({}, async () => {
     setActivePinia(createPinia());
@@ -628,6 +650,35 @@ test("keeps saved data grid header display settings", () => {
   assert.equal(settings.showColumnCommentsInHeader, true);
   assert.equal(settings.dataGridShowTransposeFieldMetadata, true);
   assert.equal(settings.compactColumnHeaderActions, false);
+});
+
+test("defaults column header hover tooltips to on", () => {
+  // Existing installs have no persisted flag, so the grid must keep showing the
+  // header tooltip until the user opts out.
+  assert.equal(DEFAULT_EDITOR_SETTINGS.showColumnHeaderTooltips, true);
+  assert.equal(normalizeEditorSettings({}).showColumnHeaderTooltips, true);
+  assert.equal(normalizeEditorSettings({ showColumnHeaderTooltips: undefined } as any).showColumnHeaderTooltips, true);
+});
+
+test("keeps a disabled column header hover tooltip preference", () => {
+  assert.equal(normalizeEditorSettings({ showColumnHeaderTooltips: false } as any).showColumnHeaderTooltips, false);
+  assert.equal(normalizeEditorSettings({ showColumnHeaderTooltips: true } as any).showColumnHeaderTooltips, true);
+});
+
+test("updates the column header hover tooltip preference through the store", () => {
+  setActivePinia(createPinia());
+  const store = useSettingsStore();
+
+  assert.equal(store.editorSettings.showColumnHeaderTooltips, true);
+
+  store.updateEditorSettings({ showColumnHeaderTooltips: false });
+  assert.equal(store.editorSettings.showColumnHeaderTooltips, false);
+
+  store.updateEditorSettings({ showColumnTypesInHeader: false });
+  assert.equal(store.editorSettings.showColumnHeaderTooltips, false);
+
+  store.updateEditorSettings({ showColumnHeaderTooltips: true });
+  assert.equal(store.editorSettings.showColumnHeaderTooltips, true);
 });
 
 test("normalizes data grid render mode", () => {

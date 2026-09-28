@@ -52,6 +52,7 @@ import type {
   PartitionInfo,
   SubpartitionInfo,
   ExtensionInfo,
+  EventTriggerInfo,
   FunctionInfo,
   SequenceInfo,
   RuleInfo,
@@ -84,6 +85,7 @@ import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSql
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { AiChatSelectionState, AiEffortCapability } from "@/types/ai";
+import type { SalesforceCurrentUser, SalesforceOAuthAuthorizeParams, SalesforceOAuthDevicePollResult, SalesforceOAuthDeviceStartResult, SalesforceOAuthRefreshResult, SalesforceOAuthToken } from "@/types/salesforce";
 import type {
   AgentDriverInfo,
   AiCompletionRequest,
@@ -196,6 +198,8 @@ import type {
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import type { PluginTableMetadata, PluginTableMetadataRequest } from "@/types/pluginSchemaMetadata";
+import type { PluginDataGrant, PluginDataQueryRequest, PluginDataQueryResult } from "@/types/pluginData";
+import type { PluginToolPreview } from "@/types/pluginAiTools";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import type { MigrationPreflight, MigrationReport } from "./migration";
 export type { MigrationPreflight, MigrationReport } from "./migration";
@@ -237,7 +241,7 @@ import type {
   TableAdminSqlOptions,
   VacuumTableSqlOptions,
 } from "@/lib/database/dbAdminSql";
-import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/export/databaseExport";
+import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, BuildExportSqlInsertOptions } from "@/lib/export/databaseExport";
 import { loadBrowserAppState, saveBrowserAppState } from "@/lib/backend/browserAppStateStorage";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataGrid/dataCompare";
 import { apiUrl, apiWebSocketUrl } from "@/lib/common/webPath";
@@ -463,6 +467,39 @@ export async function testConnectionWithInfo(config: ConnectionConfig): Promise<
   return normalizeConnectionTestResult(await response.json(), config);
 }
 
+// ---------------------------------------------------------------------------
+// Salesforce OAuth (browser redirect + device-code flows)
+// ---------------------------------------------------------------------------
+// Web mode only supports the device-code flow end-to-end; the browser-redirect
+// flow is gated by the desktop shell (it binds a localhost callback server).
+// The HTTP endpoints mirror the Tauri commands one-for-one so `api.ts` can
+// forward both transports through the same surface.
+
+export async function salesforceOauthBrowserAuthorize(params: SalesforceOAuthAuthorizeParams): Promise<SalesforceOAuthToken> {
+  return post("/api/connection/salesforce-oauth-browser-authorize", { params });
+}
+
+export async function salesforceOauthDeviceStart(params: SalesforceOAuthAuthorizeParams): Promise<SalesforceOAuthDeviceStartResult> {
+  return post("/api/connection/salesforce-oauth-device-start", { params });
+}
+
+export async function salesforceOauthDevicePoll(params: SalesforceOAuthAuthorizeParams, deviceCode: string, intervalSecs: number): Promise<SalesforceOAuthDevicePollResult> {
+  return post("/api/connection/salesforce-oauth-device-poll", { params, deviceCode, intervalSecs });
+}
+
+export async function salesforceOauthRefresh(params: SalesforceOAuthAuthorizeParams, refreshToken: string): Promise<SalesforceOAuthRefreshResult> {
+  return post("/api/connection/salesforce-oauth-refresh", { params, refreshToken });
+}
+
+export async function salesforceOauthPasswordLogin(params: SalesforceOAuthAuthorizeParams, username: string, password: string): Promise<SalesforceOAuthToken> {
+  return post("/api/connection/salesforce-oauth-password-login", { params, username, password });
+}
+
+/** Identity of the user an established Salesforce connection is authenticated as (cached backend-side). */
+export async function salesforceCurrentUser(connectionId: string): Promise<SalesforceCurrentUser> {
+  return get(`/api/salesforce/current-user?${qs({ connection_id: connectionId })}`);
+}
+
 export async function connectDb(config: ConnectionConfig, clientAttempt?: number): Promise<string> {
   return post("/api/connection/connect", { config, clientAttempt });
 }
@@ -533,7 +570,12 @@ export async function closeDatabaseConnection(connectionId: string, database: st
   return post("/api/connection/close-database", { connectionId, database });
 }
 
-export async function saveConnections(configs: ConnectionConfig[]): Promise<void> {
+export async function saveConnections(configs: ConnectionConfig[], removedIds: string[] = []): Promise<void> {
+  // Saving upserts; ids this client deleted are sent explicitly so that a
+  // stale local list can never drop connections another client created.
+  if (removedIds.length) {
+    return post("/api/connection/save", { configs, removedIds });
+  }
   return post("/api/connection/save", { configs });
 }
 
@@ -1299,6 +1341,10 @@ export async function listAvailableExtensions(connectionId: string, database: st
   return get(`/api/schema/available-extensions?${qs({ connection_id: connectionId, database })}`);
 }
 
+export async function listEventTriggers(connectionId: string, database: string): Promise<EventTriggerInfo[]> {
+  return get(`/api/schema/event-triggers?${qs({ connection_id: connectionId, database })}`);
+}
+
 export async function listDialectDataTypes(dialectName: string): Promise<string[]> {
   return get(`/api/dialect/data-types?${qs({ dialect_name: dialectName })}`);
 }
@@ -1309,6 +1355,11 @@ export async function listDialectDataTypes(dialectName: string): Promise<string[
 
 export async function collectDocsSnapshot(connectionId: string, database: string, schemas: string[], tables: string[], projectName?: string): Promise<SchemaSnapshot> {
   return post("/api/docs/snapshot", { connectionId, database, schemas, tables, projectName });
+}
+
+// HTTP snapshot transport is request/response; its progress remains indeterminate.
+export async function collectDocsSnapshotForExport(connectionId: string, database: string, schemas: string[], tables: string[], _onProgress: (progress: import("./tauri").DocsCollectProgress) => void): Promise<SchemaSnapshot> {
+  return post("/api/docs/snapshot", { connectionId, database, schemas, tables, projectName: database, maxConcurrentTables: 2 });
 }
 
 export async function loadDocsAnnotations(connectionId: string): Promise<AnnotationFile | null> {
@@ -1641,6 +1692,22 @@ export async function getPluginEstimatedPlan(request: PluginPlanRequest): Promis
   return post<PluginPlanResult>("/api/query/plugin-estimated-plan", request);
 }
 
+/**
+ * Plugin Host API (`host.data:read`): one read-only statement on a connection
+ * the user granted to `pluginId`. The backend enforces permission, grant, and gate.
+ */
+export async function queryPluginData(pluginId: string, request: PluginDataQueryRequest): Promise<PluginDataQueryResult> {
+  return post<PluginDataQueryResult>("/api/plugin/data/query", { pluginId, request });
+}
+
+export async function getPluginDataGrants(pluginId: string): Promise<PluginDataGrant[]> {
+  return post<PluginDataGrant[]>("/api/plugin/data/grants", { pluginId });
+}
+
+export async function setPluginDataGrant(pluginId: string, connectionId: string, granted: boolean): Promise<PluginDataGrant[]> {
+  return post<PluginDataGrant[]>("/api/plugin/data/grant", { pluginId, connectionId, granted });
+}
+
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
   const result = await post<string | null>("/api/query/build-dropped-file-preview-sql", { options });
   return result ?? undefined;
@@ -1866,7 +1933,7 @@ export async function buildExportInsertStatements(options: BuildExportInsertStat
   return post("/api/query/build-export-insert-statements", { options });
 }
 
-export async function buildExportSqlInsert(options: BuildExportInsertStatementsOptions): Promise<string> {
+export async function buildExportSqlInsert(options: BuildExportSqlInsertOptions): Promise<string> {
   return post("/api/query/build-export-sql-insert", { options });
 }
 
@@ -1940,6 +2007,25 @@ export async function aiStream(sessionId: string, request: AiCompletionRequest, 
 
 export async function aiCancelStream(sessionId: string): Promise<boolean> {
   return post("/api/ai/cancel-stream", { sessionId });
+}
+
+/** Answers a pending plugin tool approval of the agent run `sessionId`; false when nothing was waiting. */
+export async function resolveAiToolApproval(sessionId: string, approvalId: string, approved: boolean): Promise<boolean> {
+  return post("/api/ai/tool-approval", { sessionId, approvalId, approved });
+}
+
+/** Plugin ids whose MCP tools the built-in AI agent may call. */
+export async function getAiPluginToolPlugins(): Promise<string[]> {
+  return get("/api/ai/plugin-tools/plugins");
+}
+
+export async function setAiPluginToolPluginEnabled(pluginId: string, enabled: boolean): Promise<string[]> {
+  return post("/api/ai/plugin-tools/plugins", { pluginId, enabled });
+}
+
+/** Tools the built-in AI would get from a plugin (may start its sidecar). */
+export async function previewPluginAiTools(pluginId: string): Promise<PluginToolPreview> {
+  return post("/api/ai/plugin-tools/preview", { pluginId });
 }
 
 export async function aiTestConnection(config: AiConfig): Promise<AiTestConnectionResult> {
@@ -2136,6 +2222,22 @@ export async function loadWebMcpHttpStatus(): Promise<import("@/lib/backend/taur
   return get("/api/app-settings/mcp-http-status");
 }
 
+export async function saveWebMcpHttpSettings(settings: import("@/lib/backend/tauri").WebMcpHttpSettings): Promise<import("@/lib/backend/tauri").WebMcpHttpStatus> {
+  const res = await fetch(apiUrl("/api/app-settings/mcp-http"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-DBX-MCP-Settings": "1" },
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return res.json();
+}
+
+export async function rotateWebMcpToken(): Promise<import("@/lib/backend/tauri").WebMcpHttpStatus> {
+  const res = await fetch(apiUrl("/api/app-settings/mcp-http/rotate-token"), { method: "POST", headers: { "X-DBX-MCP-Settings": "1" } });
+  if (!res.ok) throw await backendResponseError(res);
+  return res.json();
+}
+
 export async function loadMaxAgentTurns(): Promise<number> {
   return get("/api/app-settings/max-agent-turns");
 }
@@ -2168,6 +2270,19 @@ export async function loadHistoryRetentionLimit(): Promise<number> {
 
 export async function saveHistoryRetentionLimit(limit: number): Promise<void> {
   const res = await fetch(apiUrl("/api/app-settings/history-retention-limit"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ limit }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+}
+
+export async function loadMcpHistoryRetentionLimit(): Promise<number> {
+  return get("/api/app-settings/mcp-history-retention-limit");
+}
+
+export async function saveMcpHistoryRetentionLimit(limit: number): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/mcp-history-retention-limit"), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ limit }),
@@ -2690,7 +2805,7 @@ export async function saveGlobalSearchSettings(settings: GlobalSearchSettings): 
 // Data Transfer
 // ---------------------------------------------------------------------------
 
-export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void): Promise<void> {
+export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void, onStarted?: () => void): Promise<void> {
   // 1. POST to start the transfer
   const res = await fetch(apiUrl("/api/transfer/start"), {
     method: "POST",
@@ -2698,6 +2813,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
     body: JSON.stringify({ request }),
   });
   if (!res.ok) throw await backendResponseError(res);
+  onStarted?.();
 
   // 2. SSE to listen for progress
   return new Promise((resolve, reject) => {
@@ -3577,6 +3693,10 @@ export async function redisSetKeysExpireAt(connectionId: string, db: number, key
 
 export async function redisDeleteKeys(connectionId: string, db: number, keyRaws: string[]): Promise<number> {
   return post("/api/redis/delete-keys", { connectionId, db, keyRaws });
+}
+
+export async function redisDeleteKeysByPattern(connectionId: string, db: number, pattern: string): Promise<number> {
+  return post("/api/redis/delete-keys-by-pattern", { connectionId, db, pattern });
 }
 
 export async function redisFlushDb(connectionId: string, db: number): Promise<void> {
@@ -5091,6 +5211,14 @@ export async function clearHistory(): Promise<void> {
   return del("/api/history");
 }
 
+export async function clearHistoryBySource(source: string): Promise<void> {
+  return del(`/api/history?source=${encodeURIComponent(source)}`);
+}
+
+export async function cleanupMcpHistoryRetention(): Promise<number> {
+  return post("/api/app-settings/mcp-history-retention-cleanup", {});
+}
+
 export async function clearRedisHistory(): Promise<void> {
   const entries = await loadRedisHistory(1000, 0);
   await Promise.all(entries.map((e) => deleteHistoryEntry(e.id)));
@@ -5120,7 +5248,9 @@ export async function fetchChangelog(lang?: string): Promise<import("@/lib/app/c
 export async function checkMcpServerStatus(): Promise<import("@/lib/backend/tauri").McpServerStatus> {
   return {
     installed: false,
+    installation_source: null,
     npm_available: false,
+    npm_installed: false,
     node_path: null,
     node_version: null,
     current_version: null,
@@ -5141,8 +5271,16 @@ export async function installMcpServer(): Promise<string> {
   throw new Error("MCP Server installation is only available in the desktop app.");
 }
 
+export async function installNativeMcpServer(): Promise<string> {
+  throw new Error("Native MCP Server installation is only available in the desktop app.");
+}
+
 export async function uninstallMcpServer(): Promise<string> {
   throw new Error("MCP Server uninstallation is only available in the desktop app.");
+}
+
+export async function uninstallNpmMcpServer(): Promise<string> {
+  throw new Error("MCP Server npm fallback removal is only available in the desktop app.");
 }
 
 export async function getSystemProxyUrl(): Promise<string | null> {
@@ -5233,6 +5371,14 @@ export async function writePluginLocalFileChunk(_pluginId: string, _handleId: st
 
 export async function closePluginLocalFile(_pluginId: string, _handleId: string): Promise<void> {
   throw new Error("Plugin local file access is not available in the web backend");
+}
+
+export async function openPluginMedia(_pluginId: string, _method: string, _params: Record<string, unknown>): Promise<string> {
+  throw new Error("Plugin media URLs are not available in the web backend");
+}
+
+export async function closePluginMedia(_pluginId: string, _token: string): Promise<void> {
+  throw new Error("Plugin media URLs are not available in the web backend");
 }
 
 // Plugin UI storage goes through the Rust plugin-data tree on native hosts;

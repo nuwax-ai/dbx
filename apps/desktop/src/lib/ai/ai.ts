@@ -286,6 +286,9 @@ export async function runAgentStream(input: AiRequestInput, history: api.AiMessa
 }
 
 export function buildUserPrompt(action: AiAction, context: AiContext, instruction: string, isZh: boolean): string {
+  if (context.databaseType === "plugin") {
+    return instruction.trim() || (isZh ? "（无额外说明）" : "(No extra instruction provided.)");
+  }
   const userRequest = instruction.trim() || (isZh ? "（无额外说明）" : "(No extra instruction provided.)");
   const attachedTextData = formatAttachedTextData(context, isZh);
   if (isVectorDbType(context.databaseType) || context.databaseType === "redis") {
@@ -325,6 +328,20 @@ function attachmentSafetyInstruction(isZh: boolean): string {
 }
 
 export function buildSystemPrompt(action: AiAction, context: AiContext, mode: AiAssistantMode = "ask", custom?: CustomPromptContext): string {
+  if (context.databaseType === "plugin") {
+    const isZh = isChineseLocale(currentLocale());
+    return [
+      isZh ? "你是 DBX 中连接插件的实时 Agent。" : "You are DBX's live Agent for a connected plugin.",
+      isZh
+        ? "必须优先调用当前插件提供的工具获取实时数据，再基于工具结果回答。不要把历史上下文快照当作当前状态，也不要在没有工具结果时声称已经查询过资源。"
+        : "Always call the connected plugin's tools first to obtain live data. Do not treat historical context snapshots as current state or claim that a resource was queried without tool results.",
+      isZh ? "工具调用遵循工具定义和现有确认策略；如果没有可用工具，明确告知用户当前连接未提供实时查询能力。" : "Follow the tool definitions and the existing approval policy. If no tool is available, tell the user that this connection does not provide live query capability.",
+      ...buildCustomInstructionLines(custom, isZh),
+      `Connection: ${context.connectionName}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  }
   if (isVectorDbType(context.databaseType)) {
     return buildVectorSystemPrompt(context, mode, custom);
   }
@@ -784,13 +801,14 @@ export async function buildAiContext(
   const maxFksPerTable = options.maxFksPerTable ?? 10;
   const databaseType = aiDatabaseTypeForConnection(connection);
   const { database, schema } = resolveAiDatabaseTarget(tab, connection);
+  const supportsMetadata = connection.db_type !== "plugin";
   const tables: AiSchemaTable[] = [];
   const tableKeys = new Set<string>();
   let truncated = false;
   let schemaScope: AiContext["schemaScope"] = "database";
   let currentCollectionName: string | undefined;
 
-  if (tab.tableMeta) {
+  if (supportsMetadata && tab.tableMeta) {
     schemaScope = "focused_table";
     const s = tab.tableMeta.schema ?? "";
     const tName = tab.tableMeta.tableName;
@@ -809,7 +827,7 @@ export async function buildAiContext(
     truncated = tab.tableMeta.columns.length > maxColumnsPerTable;
   }
 
-  for (const mention of options.mentionedTables ?? []) {
+  for (const mention of supportsMetadata ? (options.mentionedTables ?? []) : []) {
     const key = aiTableMentionKey(mention.schema, mention.table);
     if (tableKeys.has(key)) continue;
     const entry = await loadMentionedTableContext(tab, connection, mention, maxColumnsPerTable, maxIndexesPerTable, maxFksPerTable).catch(() => undefined);
@@ -819,7 +837,7 @@ export async function buildAiContext(
   }
 
   // Vector databases: load collections instead of SQL tables
-  if (isVectorDbType(databaseType)) {
+  if (supportsMetadata && isVectorDbType(databaseType)) {
     try {
       const collections = await api.vectorListCollections(tab.connectionId, database);
 
@@ -854,7 +872,7 @@ export async function buildAiContext(
     }
   }
 
-  if (!tab.tableMeta && !["redis", "mongodb"].includes(connection.db_type) && !isVectorDbType(databaseType)) {
+  if (supportsMetadata && !tab.tableMeta && !["redis", "mongodb"].includes(connection.db_type) && !isVectorDbType(databaseType)) {
     try {
       const schemas = await loadCandidateSchemas(tab, connection);
       for (const schema of schemas) {

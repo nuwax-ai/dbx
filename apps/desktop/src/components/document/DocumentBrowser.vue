@@ -14,6 +14,7 @@ import DataGrid from "@/components/grid/DataGrid.vue";
 import DataGridColumnLayoutPopover from "@/components/grid/DataGridColumnLayoutPopover.vue";
 import DataGridCopyFormatControl from "@/components/grid/DataGridCopyFormatControl.vue";
 import DataGridFontFamilyControl from "@/components/grid/DataGridFontFamilyControl.vue";
+import DataGridColumnWidthModeControl from "@/components/grid/DataGridColumnWidthModeControl.vue";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { Switch } from "@/components/ui/switch";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
@@ -321,6 +322,9 @@ type DocumentGridChanges = {
   rows: MongoInputValue[][];
 };
 const documentFilterBuilderOpen = ref(false);
+/// Why an Apply click did not filter. The shared `error` banner lives in the document pane, which
+/// the open filter popover covers, so a rejected rule there reads as a dead button.
+const documentFilterBuilderError = ref("");
 const documentFilterFieldPopoverOpen = ref<Record<string, boolean>>({});
 const documentFilterFieldSearch = ref<Record<string, string>>({});
 const documentFilterRules = ref<DocumentFilterRule[]>(restoredDocumentBrowserState?.documentFilterRules ?? []);
@@ -908,12 +912,14 @@ function documentFilterFieldKindLabel(kind: DocumentFieldPathNode["kind"]): stri
 }
 
 function removeDocumentFilterRule(ruleId: string) {
+  documentFilterBuilderError.value = "";
   documentFilterRules.value = documentFilterRules.value.filter((rule) => rule.id !== ruleId);
   setDocumentFilterFieldPopoverOpen(ruleId, false);
   if (documentFilterRules.value.length === 0) appliedDocumentFilter.value = null;
 }
 
 function updateDocumentFilterRule(ruleId: string, patch: Partial<DocumentFilterRule>) {
+  documentFilterBuilderError.value = "";
   documentFilterRules.value = documentFilterRules.value.map((rule) => {
     if (rule.id !== ruleId) return rule;
     const next = { ...rule, ...patch };
@@ -947,6 +953,7 @@ function elasticsearchQueryTypeLabel(queryType: ElasticsearchQueryType): string 
 }
 
 function resetDocumentFilterBuilder() {
+  documentFilterBuilderError.value = "";
   appliedDocumentFilter.value = null;
   documentFilterFieldPopoverOpen.value = {};
   documentFilterFieldSearch.value = {};
@@ -1399,9 +1406,10 @@ async function applyDocumentStructuredFilters() {
       }))
       .filter((item): item is { rule: DocumentFilterRule; condition: Record<string, unknown> } => !!item.condition);
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    documentFilterBuilderError.value = e instanceof Error ? e.message : String(e);
     return;
   }
+  documentFilterBuilderError.value = "";
   error.value = "";
   const structured = combineDocumentFilterConditions(
     items.map((item) => item.condition),
@@ -2826,6 +2834,7 @@ defineExpose({ focusSearch });
               </button>
             </div>
           </div>
+          <DataGridColumnWidthModeControl />
           <DataGridFontFamilyControl />
           <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
             <div class="min-w-0 flex items-center gap-2 font-medium">
@@ -3185,6 +3194,10 @@ defineExpose({ focusSearch });
                 <div v-else class="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
                   {{ t("grid.filterBuilderEmpty") }}
                 </div>
+
+                <p v-if="documentFilterBuilderError" data-document-filter-builder-error class="text-xs text-destructive">
+                  {{ documentFilterBuilderError }}
+                </p>
 
                 <div class="flex items-center justify-between gap-2">
                   <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="addDocumentFilterRule">

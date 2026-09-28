@@ -9,9 +9,7 @@ import {
   buildSqlCompletionItemsFromContext,
   buildPostgresSequenceLiteralCompletionItems,
   getSqlCompletionContext,
-  getPostgresSequenceLiteralCompletionContext,
   getSqlCompletionResultValidFor,
-  isSqlCompletionSuppressedContext,
   isSqlLikeCompletionStatement,
   prepareSqlCompletionReplacement,
   recordCompletionSelection,
@@ -21,10 +19,9 @@ import {
 } from "@/lib/sql/sqlCompletion";
 import { originForSqlCompletionProvider, originForTypedSqlCompletionStart, shouldAllowSqlCompletionTrigger, type SqlCompletionTriggerFacts, type SqlCompletionTriggerOrigin } from "@/lib/sql/sqlCompletionTriggerPolicy";
 import { driverProfileHasCompletionCandidates } from "@/lib/database/driverProfileExtensions";
-import { sqlCompletionContextFromSemantic } from "@/lib/sql/semantic/completion";
-import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import { buildElasticsearchCompletionItemsFromContext, elasticsearchCompletionNeedsFields, getElasticsearchCompletionContext, getElasticsearchCompletionResultValidFor, shouldAutoOpenElasticsearchCompletion, type ElasticsearchCompletionField } from "@/lib/elasticsearch/elasticsearchCompletion";
 import { buildMongoCompletionItemsFromContext, getMongoCompletionContext, getMongoCompletionResultValidFor, mongoCompletionNeedsCollections, mongoCompletionNeedsFields, shouldAutoOpenMongoCompletion } from "@/lib/mongo/mongoCompletion";
+import { buildSoqlCompletionItems, getSoqlCompletionContext, getSoqlCompletionResultValidFor, resolveSoqlFieldCandidates, resolveSoqlValueField, shouldAutoOpenSoqlCompletion, soqlCompletionNeedsObjects, type SoqlCompletionField, type SoqlCompletionObject } from "@/lib/soql/soqlCompletion";
 import {
   buildSqlServerUseDatabaseCompletionItems,
   mergeSqlCompletionQualifierNames,
@@ -32,7 +29,6 @@ import {
   resolveSqlCompletionSchemaLookupDatabase,
   resolveSqlCompletionScope,
   resolveSqlCompletionTableLookupTarget,
-  resolveSqlServerUseDatabaseCompletion,
   sqlServerUseCompletionDatabaseNames,
   sqlServerUseDatabaseBeforeCursor,
 } from "@/lib/sql/sqlCompletionLookupTarget";
@@ -41,7 +37,8 @@ import { completionReplacementTo, shouldResolveSqlColumnCompletion } from "@/lib
 import { completionLabelPresentation } from "@/lib/editor/sqlCompletionPresentation";
 import { supportsDatabaseNameCompletion } from "@/lib/database/databaseFeatureSupport";
 import { sqlSnippetDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { oracleDatabaseLinkCompletionContext, oracleDatabaseLinkCompletionItems } from "@/lib/sql/oracleDatabaseLinkCompletion";
+import { oracleDatabaseLinkCompletionItems } from "@/lib/sql/oracleDatabaseLinkCompletion";
+import { isOracleCompletionDatabase } from "@/lib/sql/oracleCompletionSession";
 import { buildRedisCompletionItemsFromContext, getRedisCompletionContext, getRedisCompletionResultValidFor, shouldAutoOpenRedisCompletion, takesKeyArgument } from "@/lib/redis/redisCompletion";
 import type { SqlCompletionColumn, SqlCompletionContext, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject } from "@/lib/sql/sqlCompletion";
 import type { CompletionAssistantObjectKind, SqlServerCompletionContext } from "@/types/database";
@@ -85,6 +82,8 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     supportsDatabaseSchemaQualifierCompletion,
     sqlCompletionDialectOptions,
     getEditorSqlCompletionContext,
+    getEditorSqlCompletionAnalysis,
+    cancelEditorSqlCompletionAnalysis,
     supportsDatabaseQualifierCompletion,
     completionObjectsForScope,
     usesOracleSessionCompletionColumns,
@@ -117,7 +116,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
   const COMPLETION_TRIGGER_DEFER_DELAY_MS = options.triggerDeferDelayMs;
   const MAX_COMPLETION_TABLES = options.maxCompletionTables;
   const PRESTO_ON_DEMAND_TABLE_COMPLETION_LIMIT = options.onDemandTableLimit;
-  const SEMANTIC_SQL_COMPLETION_ENABLED = options.semanticCompletionEnabled;
+  let analyzedCtes: { sql: string; definitions: ReturnType<typeof extractCteDefinitions> } | null = null;
 
   const snippetDatabaseType = computed(() => {
     const connection = props.connectionId ? connectionStore.getConfig(props.connectionId) : undefined;
@@ -360,7 +359,16 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
   }
 
   function shouldInsertSqlCompletionSpace(): boolean {
-    return props.databaseType !== "mongodb" && props.databaseType !== "redis" && props.databaseType !== "elasticsearch" && props.databaseType !== "easysearch" && props.databaseType !== "meilisearch" && props.databaseType !== "solr" && props.databaseType !== "victoriametrics";
+    return (
+      props.databaseType !== "mongodb" &&
+      props.databaseType !== "redis" &&
+      props.databaseType !== "elasticsearch" &&
+      props.databaseType !== "easysearch" &&
+      props.databaseType !== "meilisearch" &&
+      props.databaseType !== "solr" &&
+      props.databaseType !== "victoriametrics" &&
+      props.databaseType !== "salesforce"
+    );
   }
 
   // Snippet expansion normally follows from the item type; a provider can also
@@ -562,7 +570,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
 
     if (props.database && mongoCompletionNeedsCollections(completionContext.mode)) {
       try {
-        collections = await connectionStore.listMongoCompletionCollections(props.connectionId, props.database);
+        collections = await connectionStore.listMongoCompletionCollections(props.connectionId, completionContext.database ?? props.database);
       } catch {
         collections = [];
       }
@@ -570,7 +578,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
 
     if (props.database && mongoCompletionNeedsFields(completionContext.mode) && completionContext.collection) {
       try {
-        fields = await connectionStore.listMongoCompletionFields(props.connectionId, props.database, completionContext.collection);
+        fields = await connectionStore.listMongoCompletionFields(props.connectionId, completionContext.database ?? props.database, completionContext.collection);
       } catch {
         fields = [];
       }
@@ -587,6 +595,59 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       from: completionContext.from,
       options: items.map((item) => completionOptionForItem(item)),
       validFor: getMongoCompletionResultValidFor(completionContext),
+    };
+  }
+
+  async function provideSoqlCompletions(currentState: import("@codemirror/state").EditorState, position: number, explicit: boolean) {
+    if (!props.connectionId) return null;
+    const epoch = ++completionEpoch;
+    const fullDoc = currentState.doc.toString();
+    if (!explicit && !shouldAutoOpenSoqlCompletion(fullDoc, position)) return null;
+
+    const completionContext = getSoqlCompletionContext(fullDoc, position);
+    if (completionContext.mode === "none") return null;
+    // The Salesforce backend ignores the database parameter for metadata (the whole
+    // org is one synthesized database), so completion must not gate on props.database
+    // being populated — a restored/toolbar-opened tab can carry an empty database
+    // while the connection works fine. Pass it through (possibly "") and let the
+    // store/backend resolve it.
+    const database = props.database ?? "";
+
+    let objects: SoqlCompletionObject[] = [];
+    let fields: SoqlCompletionField[] = [];
+    let valueField: SoqlCompletionField | null = null;
+
+    // Field loader backed by the store (which reads the backend describe cache), so
+    // relationship traversal costs at most one describe per distinct sObject.
+    const loadFields = (objectName: string) => connectionStore.listSoqlCompletionFields(props.connectionId!, database, objectName);
+
+    try {
+      if (soqlCompletionNeedsObjects(completionContext.mode)) {
+        objects = await connectionStore.listSoqlCompletionObjects(props.connectionId, database);
+      }
+      if (completionContext.mode === "field") {
+        fields = await resolveSoqlFieldCandidates(completionContext, loadFields);
+      }
+      if (completionContext.mode === "value") {
+        valueField = await resolveSoqlValueField(completionContext, loadFields);
+      }
+    } catch (error) {
+      // Metadata load failed (offline, describe error, no cache yet): fall back to
+      // keyword/function-only completion. Logged so a persistent empty field list is
+      // diagnosable instead of silently looking like "custom fields are excluded".
+      console.debug("[soql-completion] metadata load failed", error);
+      objects = [];
+      fields = [];
+      valueField = null;
+    }
+    if (epoch !== completionEpoch) return null;
+
+    const items = buildSoqlCompletionItems(completionContext, { objects, fields, valueField });
+    if (items.length === 0) return null;
+    return {
+      from: completionContext.from,
+      options: items.map((item) => completionOptionForItem(item)),
+      validFor: getSoqlCompletionResultValidFor(completionContext),
     };
   }
 
@@ -611,27 +672,30 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       return provideRedisCompletions(currentState, position, explicit);
     }
     if (props.databaseType === "victoriametrics") return null;
+    if (props.databaseType === "salesforce") {
+      return provideSoqlCompletions(currentState, position, explicit);
+    }
     const hasDatabase = props.database != null;
-    const sequenceLiteralContext = getPostgresSequenceLiteralCompletionContext(fullDoc, position, props.databaseType);
-    const databaseLinkContext = oracleDatabaseLinkCompletionContext(fullDoc, position, props.databaseType);
-
     const epoch = ++completionEpoch;
+    context.addEventListener(
+      "abort",
+      () => {
+        if (epoch !== completionEpoch) return;
+        completionEpoch++;
+        cancelEditorSqlCompletionAnalysis();
+      },
+      { onDocChange: true },
+    );
 
     try {
-      // 1. Suppressed context (comment / string literal) rejects everything, including explicit.
-      if (isSqlCompletionSuppressedContext(fullDoc, position, { databaseType: props.databaseType, editorState: currentState }) && !sequenceLiteralContext) return null;
-
-      // 2. Determine completion origin (session-level marker).
       activeCompletionOrigin = originForSqlCompletionProvider(activeCompletionOrigin, context.explicit);
       const origin = activeCompletionOrigin;
-
-      // 3. Explicit (manual shortcut) -> always proceed. No mode gating.
-      // 4. For typing sessions, apply mode gating with lazy fact computation.
-      const useDatabaseCompletion = resolveSqlServerUseDatabaseCompletion({
-        sql: fullDoc,
-        cursor: position,
-        databaseType: props.databaseType,
-      });
+      if (origin !== "explicit" && settingsStore.editorSettings.completionTriggerMode === "manual") return null;
+      const analysis = await getEditorSqlCompletionAnalysis(fullDoc, position, currentState);
+      if (!analysis || context.aborted || epoch !== completionEpoch) return null;
+      analyzedCtes = { sql: fullDoc, definitions: analysis.cteDefinitions };
+      const { sequenceLiteralContext, databaseLinkContext, useDatabaseCompletion } = analysis;
+      if (analysis.suppressed && !sequenceLiteralContext) return null;
       const useDatabasePrefix = useDatabaseCompletion?.prefix ?? null;
 
       if (origin !== "explicit") {
@@ -642,7 +706,8 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
 
         // require-prefix: only compute local facts (no positionalEligible).
         if (mode === "require-prefix") {
-          const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
+          const ctx = databaseLinkContext ?? sequenceLiteralContext ?? analysis.completionContext;
+          if (!ctx || epoch !== completionEpoch) return null;
           const prevChar = fullDoc[position - 1] ?? "";
           const facts: SqlCompletionTriggerFacts = {
             origin,
@@ -655,9 +720,10 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
 
         // positional: compute positionalEligible (lazy).
         if (mode === "positional") {
-          const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
+          const ctx = databaseLinkContext ?? sequenceLiteralContext ?? analysis?.completionContext;
+          if (!ctx || epoch !== completionEpoch) return null;
           const prevChar = fullDoc[position - 1] ?? "";
-          const positionalEligible = shouldAutoOpenSqlCompletion(fullDoc, position, sqlCompletionDialectOptions());
+          const positionalEligible = !!databaseLinkContext || !!sequenceLiteralContext || !!analysis?.positionalEligible;
           const facts: SqlCompletionTriggerFacts = {
             origin,
             hasIdentifierPrefix: ctx.prefix.length > 0,
@@ -725,9 +791,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
         return buildCompletionResult(buildPostgresSequenceLiteralCompletionItems(sequenceLiteralContext, sequences), sequenceLiteralContext.from, undefined, sequenceLiteralContext.prefix);
       }
 
-      const legacyCompletionContext = getEditorSqlCompletionContext(fullDoc, position);
-      const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED ? buildSqlSemanticModel(fullDoc, position, sqlCompletionDialectOptions()) : null;
-      let completionContext = semanticModel ? sqlCompletionContextFromSemantic(semanticModel, legacyCompletionContext) : legacyCompletionContext;
+      let completionContext = analysis.completionContext;
 
       if (!hasDatabase) {
         const items = buildSqlCompletionItemsFromContext(completionContext, {
@@ -744,6 +808,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
           functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
           autoAliasTables: settingsStore.editorSettings.autoAliasTables,
+          tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
         });
         return buildSqlCompletionResult(items, completionContext, fullDoc, position);
@@ -806,6 +871,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
           functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
           autoAliasTables: settingsStore.editorSettings.autoAliasTables,
+          tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
         });
         return buildSqlCompletionResult(items, completionContext, fullDoc, position);
@@ -891,10 +957,11 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     clearDeferredCompletionTrigger();
     const expectedDoc = currentView.state.doc;
     const expectedPosition = currentView.state.selection.main.head;
-    deferredCompletionTriggerTimer = setTimeout(() => {
+    deferredCompletionTriggerTimer = setTimeout(async () => {
       deferredCompletionTriggerTimer = null;
       if (view.value !== currentView || currentView.state.doc !== expectedDoc || currentView.state.selection.main.head !== expectedPosition || isEditorComposing(currentView)) return;
-      if (shouldStartSqlCompletionAfterInput(insertedText, removedText, currentView)) {
+      if (await shouldStartSqlCompletionAfterInput(insertedText, removedText, currentView)) {
+        if (view.value !== currentView || currentView.state.doc !== expectedDoc || currentView.state.selection.main.head !== expectedPosition || isEditorComposing(currentView)) return;
         scheduleSqlCompletionStart(currentView);
       }
     }, COMPLETION_TRIGGER_DEFER_DELAY_MS);
@@ -904,47 +971,27 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
    * Returns true when the current SQL position should trigger completion under the active trigger mode.
    * Used by flushImeComposition and shouldStartSqlCompletionAfterInput.
    */
-  function shouldTriggerSqlCompletionForPosition(fullDoc: string, position: number): boolean {
-    const sequenceLiteralContext = getPostgresSequenceLiteralCompletionContext(fullDoc, position, props.databaseType);
-    const databaseLinkContext = oracleDatabaseLinkCompletionContext(fullDoc, position, props.databaseType);
-    if (isSqlCompletionSuppressedContext(fullDoc, position, { databaseType: props.databaseType, editorState: view.value?.state }) && !sequenceLiteralContext) return false;
+  async function shouldTriggerSqlCompletionForPosition(fullDoc: string, position: number): Promise<boolean> {
     const mode = settingsStore.editorSettings.completionTriggerMode;
     if (mode === "manual") return false;
-
-    const useDatabaseCompletion = resolveSqlServerUseDatabaseCompletion({
-      sql: fullDoc,
-      cursor: position,
-      databaseType: props.databaseType,
-    });
-    const useDatabasePrefix = useDatabaseCompletion?.prefix ?? null;
-
-    if (mode === "require-prefix") {
-      const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
-      const prevChar = fullDoc[position - 1] ?? "";
-      const facts: SqlCompletionTriggerFacts = {
-        origin: "typing",
-        hasIdentifierPrefix: ctx.prefix.length > 0,
-        qualifierTriggered: !!databaseLinkContext || (prevChar === "." && ("schema" in ctx ? ctx.schema != null : "qualifier" in ctx && ctx.qualifier != null)),
-        useDatabasePrefix,
-      };
-      return shouldAllowSqlCompletionTrigger(mode, facts);
-    }
-
-    // positional
-    const ctx = databaseLinkContext ?? sequenceLiteralContext ?? getEditorSqlCompletionContext(fullDoc, position);
+    const currentView = view.value;
+    const expectedDoc = currentView?.state.doc;
+    const analysis = await getEditorSqlCompletionAnalysis(fullDoc, position, currentView?.state);
+    if (!analysis || view.value !== currentView || currentView?.state.doc !== expectedDoc || settingsStore.editorSettings.completionTriggerMode !== mode) return false;
+    const { sequenceLiteralContext, databaseLinkContext, useDatabaseCompletion } = analysis;
+    if (analysis.suppressed && !sequenceLiteralContext) return false;
+    const context = databaseLinkContext ?? sequenceLiteralContext ?? analysis.completionContext;
     const prevChar = fullDoc[position - 1] ?? "";
-    const positionalEligible = shouldAutoOpenSqlCompletion(fullDoc, position, sqlCompletionDialectOptions());
-    const facts: SqlCompletionTriggerFacts = {
+    return shouldAllowSqlCompletionTrigger(mode, {
       origin: "typing",
-      hasIdentifierPrefix: ctx.prefix.length > 0,
-      qualifierTriggered: !!databaseLinkContext || (prevChar === "." && ("schema" in ctx ? ctx.schema != null : "qualifier" in ctx && ctx.qualifier != null)),
-      useDatabasePrefix,
-      positionalEligible,
-    };
-    return shouldAllowSqlCompletionTrigger(mode, facts);
+      hasIdentifierPrefix: context.prefix.length > 0,
+      qualifierTriggered: !!databaseLinkContext || (prevChar === "." && ("schema" in context ? context.schema != null : "qualifier" in context && context.qualifier != null)),
+      useDatabasePrefix: useDatabaseCompletion?.prefix ?? null,
+      positionalEligible: analysis.positionalEligible,
+    });
   }
 
-  function shouldStartSqlCompletionAfterInput(insertedText: string, removedText: string, currentView: EditorViewType): boolean {
+  async function shouldStartSqlCompletionAfterInput(insertedText: string, removedText: string, currentView: EditorViewType): Promise<boolean> {
     const position = currentView.state.selection.main.head;
     const fullDoc = currentView.state.doc.toString();
 
@@ -995,7 +1042,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       completionContext,
       knownDatabases: databaseNames,
     });
-    const globalOracleTableSearch = props.databaseType === "oracle" && completionContext.suggestTables && !completionContext.qualifier;
+    const globalOracleTableSearch = isOracleCompletionDatabase(props.databaseType) && completionContext.suggestTables && !completionContext.qualifier;
     const tables = schemaLookupDatabase
       ? []
       : shouldLoadTables
@@ -1053,7 +1100,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       }
     }
 
-    const cteDefs = extractCteDefinitions(fullDoc);
+    const cteDefs = analyzedCtes?.sql === fullDoc ? analyzedCtes.definitions : extractCteDefinitions(fullDoc);
     for (const refTable of completionContext.referencedTables) {
       if (refTable.columns?.length) {
         columnsByTable.set(
@@ -1127,6 +1174,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
       functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
       autoAliasTables: settingsStore.editorSettings.autoAliasTables,
+      tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
       quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
     });
 
@@ -1157,7 +1205,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       knownDatabases: databaseNames,
     });
     if (!localOnlyMetadata && !schemaLookupDatabase && (completionContext.suggestTables || (!!completionContext.qualifier && !isReferencedTableQualifier(completionContext)))) {
-      const globalOracleTableSearch = props.databaseType === "oracle" && completionContext.suggestTables && !completionContext.qualifier;
+      const globalOracleTableSearch = isOracleCompletionDatabase(props.databaseType) && completionContext.suggestTables && !completionContext.qualifier;
       const refreshEpoch = completionEpoch;
       queueTableCompletionRefresh(async () => {
         if (refreshEpoch !== completionEpoch) return;
@@ -1270,7 +1318,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     if (parts.length === 0) {
       // Oracle resolves unqualified routines across all schemas (owner semantics).
       // openGauss keeps the PG search_path scope for the unqualified case.
-      if (props.databaseType === "oracle") return [{ schema: props.schema, globalSearch: true }];
+      if (isOracleCompletionDatabase(props.databaseType)) return [{ schema: props.schema, globalSearch: true }];
       return [{ schema: props.schema }];
     }
     if (parts.length === 1) {
@@ -1366,7 +1414,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       completionContext,
       knownDatabases: databaseNames,
     });
-    const globalOracleTableSearch = props.databaseType === "oracle" && completionContext.suggestTables && !completionContext.qualifier;
+    const globalOracleTableSearch = isOracleCompletionDatabase(props.databaseType) && completionContext.suggestTables && !completionContext.qualifier;
     let tables = schemaLookupDatabase
       ? []
       : shouldLoadTables
@@ -1385,7 +1433,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     let completionObjects = shouldLoadObjects ? (localOnlyMetadata ? lookupLocalCompletionObjectsForContext(completionContext, scope) : await listCompletionObjectsForContext(completionContext, scope)) : scopedCachedCompletionObjects;
     if (epoch !== completionEpoch) return null;
 
-    if (!props.catalog && props.databaseType !== "oracle" && !localOnlyMetadata && completionContext.qualifier && completionObjects.length === 0) {
+    if (!props.catalog && !isOracleCompletionDatabase(props.databaseType) && !localOnlyMetadata && completionContext.qualifier && completionObjects.length === 0) {
       const target = routineCompletionTargetForContext(completionContext, scope);
       const schemaObjects = await connectionStore.listCompletionObjects(props.connectionId!, target.database, target.mask, MAX_COMPLETION_TABLES, target.schema, undefined, false, scope.schema);
       if (schemaObjects.length > 0) {
@@ -1471,7 +1519,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     }
 
     // Populate CTE columns from parsed definitions
-    const cteDefs = extractCteDefinitions(fullDoc);
+    const cteDefs = analyzedCtes?.sql === fullDoc ? analyzedCtes.definitions : extractCteDefinitions(fullDoc);
     for (const refTable of refs) {
       if (refTable.columns) continue;
       const cteDef = cteDefs.find((c) => c.name.toLowerCase() === refTable.name.toLowerCase());
@@ -1588,6 +1636,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
       functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
       autoAliasTables: settingsStore.editorSettings.autoAliasTables,
+      tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
       quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
     });
 
@@ -1605,11 +1654,14 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     return completionContext.suggestTables || completionContext.exclusiveTableSuggestions;
   }
 
-  function refreshActiveSqlCompletion(fullDoc: string, position: number, completionContext: ReturnType<typeof getSqlCompletionContext>) {
+  async function refreshActiveSqlCompletion(fullDoc: string, position: number, completionContext: ReturnType<typeof getSqlCompletionContext>) {
     const currentView = view.value;
     if (!currentView || runtime.codeMirrorCompletionStatus?.(currentView.state) !== "active") return;
     if (currentView.state.doc.toString() !== fullDoc || currentView.state.selection.main.head !== position) return;
-    const currentContext = getSqlCompletionContext(fullDoc, position);
+    const doc = currentView.state.doc;
+    const analysis = await getEditorSqlCompletionAnalysis(fullDoc, position, currentView.state);
+    if (!analysis || view.value !== currentView || currentView.state.doc !== doc || currentView.state.selection.main.head !== position) return;
+    const currentContext = analysis.completionContext;
     if (currentContext.prefix !== completionContext.prefix || currentContext.contextKind !== completionContext.contextKind) return;
     scheduleSqlCompletionStart(currentView);
   }
@@ -1625,6 +1677,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     clearDeferredCompletionTrigger,
     invalidateRequests() {
       completionEpoch++;
+      cancelEditorSqlCompletionAnalysis();
     },
     get activeOrigin() {
       return activeCompletionOrigin;

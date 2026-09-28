@@ -13,6 +13,7 @@ const DataCompareDialog = defineAsyncComponent(() => import("@/components/diff/D
 const SqlFileExecutionDialog = defineAsyncComponent(() => import("@/components/sql-file/SqlFileExecutionDialog.vue"));
 const SchemaDiagramDialog = defineAsyncComponent(() => import("@/components/diagram/SchemaDiagramDialog.vue"));
 const DatabaseDocsDialog = defineAsyncComponent(() => import("@/components/docs/DatabaseDocsDialog.vue"));
+const DataDictionaryDialog = defineAsyncComponent(() => import("@/components/docs/DataDictionaryDialog.vue"));
 const TableImportDialog = defineAsyncComponent(() => import("@/components/import/TableImportDialog.vue"));
 const MongoImportDialog = defineAsyncComponent(() => import("@/components/document/MongoImportDialog.vue"));
 const MongoDatabaseDumpDialog = defineAsyncComponent(() => import("@/components/document/MongoDatabaseDumpDialog.vue"));
@@ -234,6 +235,7 @@ watch(
   />
   <DataTransferDialog
     v-model:open="dialogs.showTransferDialog.value"
+    :task-id="dialogs.transferTaskId.value"
     :prefill-connection-id="dialogs.transferPrefillConnectionId.value"
     :prefill-database="dialogs.transferPrefillDatabase.value"
     :prefill-catalog="dialogs.transferPrefillCatalog.value"
@@ -280,6 +282,14 @@ watch(
     @open-target="emit('openDiagramTarget', $event)"
   />
   <DatabaseDocsDialog v-if="dialogs.showDocsDialog.value" v-model:open="dialogs.showDocsDialog.value" :prefill-connection-id="dialogs.docsPrefillConnectionId.value" :prefill-database="dialogs.docsPrefillDatabase.value" :prefill-schema="dialogs.docsPrefillSchema.value" />
+  <DataDictionaryDialog
+    v-if="dialogs.showDataDictionaryDialog.value"
+    v-model:open="dialogs.showDataDictionaryDialog.value"
+    :prefill-connection-id="dialogs.dataDictionaryPrefillConnectionId.value"
+    :prefill-database="dialogs.dataDictionaryPrefillDatabase.value"
+    :prefill-schema="dialogs.dataDictionaryPrefillSchema.value"
+    :prefill-table-names="dialogs.dataDictionaryPrefillTableNames.value"
+  />
   <TableImportDialog
     v-if="dialogs.showTableImportDialog.value"
     v-model:open="dialogs.showTableImportDialog.value"
@@ -299,6 +309,7 @@ watch(
   <DataGenerateDialog
     v-if="dialogs.showTableDataGenerateDialog.value"
     v-model:open="dialogs.showTableDataGenerateDialog.value"
+    :session-id="dialogs.tableDataGenerateSessionId.value"
     :prefill-connection-id="dialogs.tableDataGeneratePrefillConnectionId.value"
     :prefill-database="dialogs.tableDataGeneratePrefillDatabase.value"
     :prefill-schema="dialogs.tableDataGeneratePrefillSchema.value"

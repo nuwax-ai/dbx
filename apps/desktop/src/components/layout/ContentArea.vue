@@ -61,7 +61,6 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
-import QueryEditor from "@/components/editor/QueryEditor.vue";
 import ColumnInfoPanel from "@/components/editor/ColumnInfoPanel.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import QueryErrorActions from "@/components/common/QueryErrorActions.vue";
@@ -71,6 +70,7 @@ import ResultSetNavigator from "@/components/layout/ResultSetNavigator.vue";
 import QueryResultViewSwitcher from "@/components/layout/QueryResultViewSwitcher.vue";
 import DataGridCopyFormatControl from "@/components/grid/DataGridCopyFormatControl.vue";
 import DataGridFontFamilyControl from "@/components/grid/DataGridFontFamilyControl.vue";
+import DataGridColumnWidthModeControl from "@/components/grid/DataGridColumnWidthModeControl.vue";
 import DataGridColumnLayoutPopover from "@/components/grid/DataGridColumnLayoutPopover.vue";
 import type { DataGridColumnLayoutHandle } from "@/components/grid/dataGridColumnLayoutPopover";
 import type { ColumnInfo } from "@/components/editor/ColumnInfoPanel.vue";
@@ -93,8 +93,10 @@ function preloadDataGridComponent() {
   void loadDataGridComponent();
 }
 
+const QueryEditor = defineAsyncComponent({ loader: () => import("@/components/editor/QueryEditor.vue"), loadingComponent: QueryLoadingState, delay: 0 });
 const DataGrid = defineAsyncComponent(loadDataGridComponent);
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
+const RedisQueryConsoleOutput = defineAsyncComponent(() => import("@/components/redis/RedisQueryConsoleOutput.vue"));
 const RedisDashboard = defineAsyncComponent(() => import("@/components/redis/RedisDashboard.vue"));
 const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
 const EtcdDashboard = defineAsyncComponent(() => import("@/components/etcd/EtcdDashboard.vue"));
@@ -140,7 +142,7 @@ import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps } from "@/compone
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridRowNumberMode, type DataGridSearchMode, type ResultRunDisplayMode } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
-import { canCancelQueryExecution, isActiveResultLoading, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
+import { canCancelQueryExecution, isActiveResultLoading, queryExecutionLabelKey, shouldShowCancelAction } from "@/lib/sql/queryExecutionState";
 import { sqlErrorDisplayPosition, sqlErrorEditorOffset, logSqlErrorPosition } from "@/lib/sql/errorPosition";
 import {
   databaseDisplayNameForTab,
@@ -175,6 +177,7 @@ import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 import { queryResultExportBaseName } from "@/lib/export/saveTextFile";
 import { applyMongoGridChangesToDocument, applyMongoGridChangesToDocumentBaseline, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import { buildMongoQueryResultOperations, formatMongoQueryResultOperationPreview } from "@/lib/mongo/mongoQueryResultEditing";
+import { buildInfluxDbV1DeleteStatements, canDeleteInfluxDbV1Row, resolveInfluxDbV1DeleteTarget } from "@/lib/influxdb/influxDbV1Delete";
 import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import { isDataGridToolbarCompact, type DataGridReloadIntent } from "@/lib/dataGrid/dataGridToolbar";
 import { useTabScroll } from "@/composables/useTabScroll";
@@ -185,7 +188,7 @@ import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { formatDdlForDisplay } from "@/lib/sql/ddlDisplay";
 import { sqlObjectNavigationTypeFromTableType } from "@/lib/sql/sqlNavigation";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
-import type { QueryMessage, QueryTab, TableInfoTab, TreeNode, VectorCollectionMeta } from "@/types/database";
+import type { QueryMessage, QueryTab, RedisResultViewMode, TableInfoTab, TreeNode, VectorCollectionMeta } from "@/types/database";
 import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
@@ -494,8 +497,10 @@ const activeQueryError = computed(() => {
   return String(result.rows[0]?.[0] ?? "");
 });
 const hasQueryOutput = computed(() => tabHasQueryOutput(props.activeTab));
-const visibleResultItems = computed(() => tabularResultItems(props.activeTab.results ?? (props.activeTab.result ? [props.activeTab.result] : undefined)));
-const tabularResults = computed(() => tabularResultItems(props.activeTab.results));
+// 结果集页签/列表的名称是否带库名，由编辑器设置控制（默认带库名）
+const includeResultSourceDatabase = computed(() => settingsStore.editorSettings.showResultSourceDatabase);
+const visibleResultItems = computed(() => tabularResultItems(props.activeTab.results ?? (props.activeTab.result ? [props.activeTab.result] : undefined), { includeSourceDatabase: includeResultSourceDatabase.value }));
+const tabularResults = computed(() => tabularResultItems(props.activeTab.results, { includeSourceDatabase: includeResultSourceDatabase.value }));
 const allResultExportSheets = computed(() =>
   tabularResults.value.map((item) => ({
     sheetName: item.label || t("tabs.resultN", { n: item.n }),
@@ -503,7 +508,14 @@ const allResultExportSheets = computed(() =>
     sql: item.index === props.activeTab.activeResultIndex ? queryResultExecutionSql(props.activeTab) : item.result.sourceStatement,
   })),
 );
-const resultRuns = computed(() => resultRunItems(props.activeTab));
+// 结果标签优先显示来源（表名），历史批次缺少来源信息时按批次 SQL 重新解析
+const resultRuns = computed(() =>
+  resultRunItems(props.activeTab, {
+    includeSourceDatabase: includeResultSourceDatabase.value,
+    database: props.activeTab.database,
+    databaseType: activeEffectiveDatabaseType.value,
+  }),
+);
 const activeResultGridCacheKey = computed(() => resultGridCacheKey(props.activeTab));
 const activeResultGridColumnWidthCacheKey = computed(() => resultGridColumnWidthCacheKey(props.activeTab));
 const activeResultGridInstanceKey = computed(() => resultGridInstanceKey(props.activeTab));
@@ -603,6 +615,9 @@ const hasTabularResult = computed(() => {
   if (props.activeTab.result?.columns.length && props.activeTab.result.server_message !== true) return true;
   return visibleResultItems.value.length > 0;
 });
+const redisConsoleResults = computed(() => (props.activeTab.results?.length ? props.activeTab.results : props.activeTab.result ? [props.activeTab.result] : []));
+const canShowRedisConsoleOutput = computed(() => activeEffectiveDatabaseType.value === "redis" && (props.activeTab.isExecuting || redisConsoleResults.value.some((result) => result.execution_error === true || typeof result.redis_console_output === "string")));
+const redisResultViewMode = computed<RedisResultViewMode>(() => (activeEffectiveDatabaseType.value === "redis" ? (props.activeTab.uiState?.redisResultViewMode ?? "grid") : "grid"));
 const canShowResultOutput = computed(() => hasTabularResult.value || props.activeTab.isExecuting);
 const canShowExplainOutput = computed(() => !!props.activeTab.explainPlan || !!props.activeTab.explainError || !!props.activeTab.explainTableResult || !!props.activeTab.explainTableError || props.activeTab.isExplaining === true);
 // A batch can attach server messages to more than one statement result (for
@@ -616,13 +631,18 @@ const resultMessages = computed<QueryMessage[]>(() => {
 });
 const resultMessageCount = computed(() => resultMessages.value.length);
 const canShowMessagesOutput = computed(() => resultMessageCount.value > 0);
-const showStandaloneResultToolbar = computed(() => activeElasticsearchJsonResponse.value || props.activeOutputView !== "result" || !props.activeTab.result || !hasTabularResult.value);
+const showStandaloneResultToolbar = computed(() => activeElasticsearchJsonResponse.value || props.activeOutputView !== "result" || (redisResultViewMode.value === "console" && canShowRedisConsoleOutput.value) || !props.activeTab.result || !hasTabularResult.value);
 const standaloneResultToolbarCompact = computed(() => isDataGridToolbarCompact(standaloneResultToolbarWidth.value, standaloneResultToolbarViewportWidth.value));
 let standaloneResultToolbarResizeObserver: ResizeObserver | undefined;
 
 function updateStandaloneResultToolbarDimensions() {
   standaloneResultToolbarWidth.value = standaloneResultToolbarRef.value?.clientWidth ?? 0;
   standaloneResultToolbarViewportWidth.value = typeof window === "undefined" ? 0 : window.innerWidth;
+}
+
+function setRedisResultViewMode(mode: RedisResultViewMode) {
+  if (activeEffectiveDatabaseType.value !== "redis") return;
+  queryStore.updateTabUiState(props.activeTab.id, { redisResultViewMode: mode });
 }
 
 function observeStandaloneResultToolbar() {
@@ -695,6 +715,45 @@ const mongoQueryResultSaveHandler = computed<CustomSaveHandler | undefined>(() =
   };
 
   return { save, preview, applySavedChanges, canInsert: false, canDelete: true, supportsInsert: false, readonlyColumns: [target.idColumn], targetLabel: target.collection };
+});
+const influxDbV1DeleteSaveHandler = computed<CustomSaveHandler | undefined>(() => {
+  const tab = props.activeTab;
+  const result = tab.result;
+  const tableMeta = activeTableMeta.value;
+  const connection = connectionStore.getConfig(tab.connectionId) ?? props.activeConnection;
+  const database = activeDataTabExecutionDatabase.value;
+  if (tab.mode !== "data" || tab.tableMetaPending || !result || !tableMeta || !tab.connectionId || !database.trim()) return undefined;
+
+  const target = resolveInfluxDbV1DeleteTarget({
+    connection,
+    measurement: tableMeta.tableName,
+    tableColumns: tableMeta.columns,
+    resultColumns: result.columns,
+  });
+  if (!target) return undefined;
+
+  const preview: NonNullable<CustomSaveHandler["preview"]> = async (changes) => buildInfluxDbV1DeleteStatements(target, changes);
+  const save: CustomSaveHandler["save"] = async (changes) => {
+    const statements = buildInfluxDbV1DeleteStatements(target, changes);
+    if (statements.length === 0) throw new Error("InfluxDB deletion requires at least one guarded statement.");
+    for (const statement of statements) {
+      await api.executeQuery(tab.connectionId, database, statement);
+    }
+  };
+
+  return {
+    save,
+    preview,
+    canInsert: false,
+    canUpdate: false,
+    canDelete: true,
+    canDeleteRow: (_sourceIndex, row) => canDeleteInfluxDbV1Row(target, row),
+    confirmation: "influxdb-v1-delete",
+    reloadOnFailure: true,
+    supportsInsert: false,
+    readonlyColumns: [...result.columns],
+    targetLabel: target.measurement,
+  };
 });
 const resultsPaneOpen = ref(false);
 const resultsPaneSize = ref(Number(safeLocalStorageGet("dbx-results-pane-size")) || DEFAULT_QUERY_RESULTS_PANE_SIZE);
@@ -1176,8 +1235,8 @@ function openPluginResultView(pluginId: string, contributionId: string, label: s
   if (!result) return;
   // The tab carries the result-view contribution id, not a workbench id: the
   // plugin UI is told which declared surface the user picked, and it receives a
-  // bounded snapshot — plugins re-query through their backend when they need the
-  // full or streamed result set.
+  // bounded snapshot — plugins that need more rows re-run the statement through
+  // `host.queryData` (host.data:read, with the user's consent).
   const cappedRows = result.rows.slice(0, 500);
   queryStore.openPluginWorkbench(pluginId, contributionId, {
     title: label,
@@ -1243,7 +1302,7 @@ async function closeResultRunsToRight(runId: string) {
 
 function openResultRunRename(run: (typeof resultRuns.value)[number]) {
   resultRunRenameId.value = run.id;
-  resultRunRenameTitle.value = run.title || t("tabs.runN", { n: run.sequence });
+  resultRunRenameTitle.value = run.title || run.sourceLabel || t("tabs.runN", { n: run.sequence });
   resultRunRenameOpen.value = true;
   nextTick(() => {
     const input = document.querySelector<HTMLInputElement>("[data-result-run-name-input]");
@@ -1312,6 +1371,16 @@ async function selectResultRun(runId: string) {
   }
   emit("update:activeOutputView", props.activeTab.id, "result");
   return true;
+}
+
+/**
+ * 点击结果标签：切换显示的同时固定该结果（issue #9975）。
+ * 未固定的结果会被下一次普通查询复用/覆盖，点击后固定即可保留下来。
+ */
+async function selectResultRunFromTab(runId: string) {
+  if (!(await selectResultRun(runId))) return;
+  const run = resultRuns.value.find((item) => item.id === runId);
+  if (run && !run.pinned) toggleResultRunPinned(runId);
 }
 
 async function focusResultRunByIndex(index: number) {
@@ -1743,11 +1812,11 @@ defineExpose({
                             :aria-selected="run.active"
                             :data-active-result-run="run.active ? 'true' : undefined"
                             class="flex h-full select-none items-center gap-1 whitespace-nowrap pl-2.5 pr-1 text-xs font-medium outline-none focus-visible:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50"
-                            @click="selectResultRun(run.id)"
+                            @click="selectResultRunFromTab(run.id)"
                             @keydown="onResultRunTabKeydown($event, runIndex)"
                           >
                             <Pin v-if="run.pinned" class="h-3 w-3 shrink-0 fill-current text-primary" />
-                            {{ run.title || t("tabs.runN", { n: run.sequence }) }}
+                            {{ run.title || run.sourceLabel || t("tabs.runN", { n: run.sequence }) }}
                           </button>
                           <button
                             type="button"
@@ -1767,17 +1836,17 @@ defineExpose({
                   <DropdownMenu>
                     <DropdownMenuTrigger as-child>
                       <Button variant="ghost" size="sm" class="h-6 max-w-48 gap-1 px-2 text-xs">
-                        <span class="min-w-0 truncate">{{ activeResultRunItem ? activeResultRunItem.title || t("tabs.runN", { n: activeResultRunItem.sequence }) : t("tabs.resultRuns") }}</span>
+                        <span class="min-w-0 truncate">{{ activeResultRunItem ? activeResultRunItem.title || activeResultRunItem.sourceLabel || t("tabs.runN", { n: activeResultRunItem.sequence }) : t("tabs.resultRuns") }}</span>
                         <ChevronDown class="h-3.5 w-3.5 shrink-0" />
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="start" class="w-48">
                       <CustomContextMenu v-for="run in resultRuns" :key="run.id" :items="() => resultRunContextMenuItems(run)" v-slot="{ onContextMenu }">
-                        <DropdownMenuItem class="flex items-center gap-2 pr-1" @select="selectResultRun(run.id)" @contextmenu="onContextMenu">
+                        <DropdownMenuItem class="flex items-center gap-2 pr-1" @select="selectResultRunFromTab(run.id)" @contextmenu="onContextMenu">
                           <Check v-if="run.active" class="h-3.5 w-3.5 shrink-0" />
                           <span v-else class="h-3.5 w-3.5 shrink-0" />
                           <Pin v-if="run.pinned" class="h-3 w-3 shrink-0 fill-current text-primary" />
-                          <span class="min-w-0 flex-1 truncate">{{ run.title || t("tabs.runN", { n: run.sequence }) }}</span>
+                          <span class="min-w-0 flex-1 truncate">{{ run.title || run.sourceLabel || t("tabs.runN", { n: run.sequence }) }}</span>
                           <button
                             type="button"
                             class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -1797,7 +1866,7 @@ defineExpose({
                 <ResultSetNavigator v-if="visibleResultItems.length > 0" :key="`${activeTab.id}:${activeTab.activeResultRunId ?? 'current'}`" :items="visibleResultItems" :active-index="activeTab.activeResultIndex ?? 0" :active="activeOutputView === 'result'" @select="selectResultItem" />
               </template>
               <div class="ml-auto flex shrink-0 items-center gap-1">
-                <Popover v-if="activeOutputView === 'result' && activeTab.result && hasTabularResult && !activeElasticsearchJsonResponse" v-model:open="dataGridViewOptionsOpen">
+                <Popover v-if="activeOutputView === 'result' && redisResultViewMode === 'grid' && activeTab.result && hasTabularResult && !activeElasticsearchJsonResponse" v-model:open="dataGridViewOptionsOpen">
                   <PopoverTrigger as-child>
                     <Button variant="ghost" size="icon" class="h-6 w-7 shrink-0 text-foreground hover:bg-accent" :title="t('grid.viewOptions')" :aria-label="t('grid.viewOptions')">
                       <Wrench class="h-4 w-4" />
@@ -1881,6 +1950,7 @@ defineExpose({
                         </button>
                       </div>
                     </div>
+                    <DataGridColumnWidthModeControl />
                     <DataGridFontFamilyControl />
                     <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                       <div class="min-w-0 flex items-center gap-2 font-medium">
@@ -2075,9 +2145,12 @@ defineExpose({
                 :can-show-summary="hasExecutionSummary"
                 :can-show-chart="hasNumericData && !activeElasticsearchJsonResponse"
                 :can-show-messages="canShowMessagesOutput"
+                :can-show-redis-console="canShowRedisConsoleOutput"
+                :result-mode="redisResultViewMode"
                 :message-count="resultMessageCount"
                 :compact="standaloneResultToolbarCompact"
                 @select-view="emit('update:activeOutputView', activeTab.id, $event)"
+                @select-result-mode="setRedisResultViewMode"
               />
               <QueryResultToolbarActions
                 class="ml-auto"
@@ -2229,6 +2302,8 @@ defineExpose({
               </div>
             </div>
 
+            <RedisQueryConsoleOutput v-else-if="activeOutputView === 'result' && redisResultViewMode === 'console' && canShowRedisConsoleOutput" :result="activeTab.result" :results="activeTab.results" :loading="activeTab.isExecuting" />
+
             <QueryMessagesView v-else-if="activeOutputView === 'messages'" class="flex-1 min-h-0" :messages="resultMessages" />
 
             <template v-else>
@@ -2298,6 +2373,10 @@ defineExpose({
                 "
                 :all-export-results="allResultExportSheets"
                 :export-file-base-name="activeQueryResultExportBaseName"
+                :show-cancel="shouldShowCancelAction(activeTab)"
+                :cancelling="activeTab.isCancelling"
+                :cancel-disabled="!canCancelQueryExecution(activeTab)"
+                @cancel="emit('cancel', activeTab.id)"
                 @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
                 @local-column-filters-change="(filters: Record<string, string[]>) => queryStore.updateDataGridLocalColumnFilters(activeTab.id, filters)"
                 @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number, intent?: DataGridReloadIntent) => emit('reload', activeTab.id, sql, searchText, whereInput, orderBy, limit, offset, intent)"
@@ -2312,9 +2391,12 @@ defineExpose({
                     :can-show-summary="hasExecutionSummary"
                     :can-show-chart="hasNumericData && !activeElasticsearchJsonResponse"
                     :can-show-messages="canShowMessagesOutput"
+                    :can-show-redis-console="canShowRedisConsoleOutput"
+                    :result-mode="redisResultViewMode"
                     :message-count="resultMessageCount"
                     :compact="compact"
                     @select-view="emit('update:activeOutputView', activeTab.id, $event)"
+                    @select-result-mode="setRedisResultViewMode"
                   />
                   <template v-if="activeElasticsearchRawBody">
                     <div class="mx-1 h-4 w-px bg-border" />
@@ -2511,6 +2593,7 @@ defineExpose({
                   </button>
                 </div>
               </div>
+              <DataGridColumnWidthModeControl />
               <DataGridFontFamilyControl />
               <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                 <div class="min-w-0 flex items-center gap-2 font-medium">
@@ -2705,7 +2788,8 @@ defineExpose({
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
-          :editable="!activeTab.tableMetaPending && isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType)"
+          :editable="!activeTab.tableMetaPending && (isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType) || !!influxDbV1DeleteSaveHandler)"
+          :custom-save-handler="influxDbV1DeleteSaveHandler"
           context="table-data"
           :initial-where-input="activeTab.whereInput"
           :database-type="activeEffectiveDatabaseType"
@@ -2723,6 +2807,10 @@ defineExpose({
           :on-execute-sql="async (sql: string) => emit('executeSql', activeTab.id, sql)"
           :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
           :export-file-base-name="activeTab.title"
+          :show-cancel="shouldShowCancelAction(activeTab)"
+          :cancelling="activeTab.isCancelling"
+          :cancel-disabled="!canCancelQueryExecution(activeTab)"
+          @cancel="emit('cancel', activeTab.id)"
           @update:where-input="(v: string) => (activeTab.whereInput = v)"
           @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
           @local-column-filters-change="(filters: Record<string, string[]>) => queryStore.updateDataGridLocalColumnFilters(activeTab.id, filters)"

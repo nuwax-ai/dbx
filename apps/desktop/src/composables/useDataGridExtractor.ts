@@ -15,12 +15,14 @@ import {
   type DataGridCopyPreference,
   type DataGridExtractPreview,
   type DataGridExtractRequest,
+  type DataGridExtractResult,
   type DataGridExtractorOptions,
   type DataGridExtractWarningCode,
 } from "@/lib/dataGrid/dataGridCopyExtractor";
 import type { DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
 import { binaryCellClipboardText } from "@/lib/dataGrid/binaryCellDownload";
 import { formatError } from "@/lib/backend/errorUtils";
+import { parseJsonPreservingLargeNumbers, stringifyJsonPreservingLargeNumbers } from "@/lib/common/safeJsonFormat";
 import { tableMetaWithoutOptionalDatabaseQualifier } from "@/lib/table/tableSelectSql";
 import type { DatabaseType } from "@/types/database";
 
@@ -35,8 +37,15 @@ interface ExtractorRequestSource {
   sourceColumnIndexes: number[];
   columnTypes: Array<string | undefined>;
   normalizeValues: boolean;
+  keepUnsafeJsonText: boolean;
   presentBinaryText: boolean;
   rawRows: unknown[][];
+}
+
+interface ResolvedDataGridExtraction {
+  initialRequest: DataGridExtractRequest;
+  request: DataGridExtractRequest;
+  result: DataGridExtractResult;
 }
 
 interface UseDataGridExtractorOptions {
@@ -76,10 +85,13 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
   const hasUnsupportedDiscreteSelection = computed(() => options.hasCellSelection.value && options.selectedCellMatrix.value === null);
   const requestSources = new WeakMap<DataGridExtractRequest, ExtractorRequestSource>();
 
-  function normalizeCellValue(value: unknown, columnType: string | undefined): unknown {
+  function normalizeCellValue(value: unknown, columnType: string | undefined, keepUnsafeJsonText: boolean): unknown {
     if (typeof value !== "string" || columnType?.trim().toLowerCase() !== "json") return value;
     try {
-      return JSON.parse(value);
+      const parsed = JSON.parse(value);
+      // SQL literals must keep numbers JavaScript would round (e.g. 64-bit ids above 2^53), so send the original text.
+      if (keepUnsafeJsonText && stringifyJsonPreservingLargeNumbers(parseJsonPreservingLargeNumbers(value)) !== JSON.stringify(parsed)) return value;
+      return parsed;
     } catch {
       return value;
     }
@@ -87,12 +99,12 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
 
   // 除 SQL 外的剪贴板展示格式都可把文本型 MySQL VARBINARY 从 `0x<hex>` 还原为原始字符串。
   // SQL 必须继续持有 hex 才能保证 round-trip；rawRows 则始终保存原值，供 DBX 内部网格回粘使用。
-  function extractorCellValue(value: unknown, columnType: string | undefined, normalizeValues: boolean, presentBinaryText: boolean, columnIndex: number): unknown {
+  function extractorCellValue(value: unknown, columnType: string | undefined, normalizeValues: boolean, keepUnsafeJsonText: boolean, presentBinaryText: boolean, columnIndex: number): unknown {
     if (presentBinaryText) {
       const text = binaryCellClipboardText(value, columnType, options.databaseType.value);
       if (text !== null) return text;
     }
-    const normalized = normalizeValues ? normalizeCellValue(value, columnType) : value;
+    const normalized = normalizeValues ? normalizeCellValue(value, columnType, keepUnsafeJsonText) : value;
     const externalValue = options.externalCellValue?.(normalized, columnIndex);
     return externalValue === undefined ? normalized : externalValue;
   }
@@ -214,9 +226,10 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     const selectedColumnIndexes = selectedSourceIndexes.map((sourceIndex) => compactIndexBySource.get(sourceIndex)).filter((index): index is number => index !== undefined);
     const columnTypes = requiredSourceIndexes.map((sourceIndex) => columnTypesBySource.get(sourceIndex));
     const normalizeValues = descriptor.category === "json" || descriptor.category === "sql";
+    const keepUnsafeJsonText = descriptor.category === "sql";
     const presentBinaryText = descriptor.category !== "sql";
     const rawRows = sourceRows.map((row) => requiredSourceIndexes.map((sourceIndex) => row[sourceIndex]));
-    const rows = rawRows.map((row) => row.map((value, index) => extractorCellValue(value, columnTypes[index], normalizeValues, presentBinaryText, index)));
+    const rows = rawRows.map((row) => row.map((value, index) => extractorCellValue(value, columnTypes[index], normalizeValues, keepUnsafeJsonText, presentBinaryText, index)));
     const tableMeta =
       descriptor.category === "sql"
         ? tableMetaWithoutOptionalDatabaseQualifier(
@@ -245,6 +258,7 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
       sourceColumnIndexes: requiredSourceIndexes,
       columnTypes,
       normalizeValues,
+      keepUnsafeJsonText,
       presentBinaryText,
       rawRows,
     });
@@ -279,7 +293,7 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
         return sourceIndex !== undefined && values.has(sourceIndex) ? values.get(sourceIndex) : value;
       });
     });
-    const rows = rawRows.map((row) => row.map((value, index) => extractorCellValue(value, limitedSource.columnTypes[index], limitedSource.normalizeValues, limitedSource.presentBinaryText, index)));
+    const rows = rawRows.map((row) => row.map((value, index) => extractorCellValue(value, limitedSource.columnTypes[index], limitedSource.normalizeValues, limitedSource.keepUnsafeJsonText, limitedSource.presentBinaryText, index)));
     const resolvedRequest = { ...request, rows };
     requestSources.set(resolvedRequest, { ...limitedSource, rawRows });
     return resolvedRequest;
@@ -369,19 +383,27 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     return { text, mimeType: "application/javascript", fileExtension: "js", rowCount: rowLimit ?? request.rows.length, columnCount: request.selectedColumnIndexes.length, warnings: undefined, omittedColumns: undefined };
   }
 
+  async function extractWithExtractor(extractor: DataGridCopyExtractorId, extractorOptions: DataGridExtractorOptions = options.extractorOptions?.value ?? DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, maxRows?: number): Promise<ResolvedDataGridExtraction | null> {
+    const initialRequest = buildRequest(extractor, extractorOptions);
+    if (!initialRequest) return null;
+    const rowLimit = maxRows === undefined ? undefined : Math.min(initialRequest.rows.length, maxRows);
+    const request = await resolveRequestSourceValues(initialRequest, rowLimit);
+    const mongoResult = await resolveMongoExtractorResult(extractor, request, rowLimit);
+    const result = mongoResult ?? (await api.extractDataGridSelection(request));
+    if (!result.text && !extractorAllowsEmptyOutput(extractor)) return null;
+    return { initialRequest, request, result };
+  }
+
   async function copyWithExtractor(extractor: DataGridCopyExtractorId, extractorOptions: DataGridExtractorOptions = options.extractorOptions?.value ?? DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS): Promise<boolean> {
     if (hasUnsupportedDiscreteSelection.value && !hasContextPredicateTarget(extractor)) {
       toast(t("grid.copyExtractorUnsupportedSelection"), 5000);
       return false;
     }
     if (!canCopyWithExtractor(extractor, extractorOptions)) return false;
-    const initialRequest = buildRequest(extractor, extractorOptions);
-    if (!initialRequest) return false;
     try {
-      const request = await resolveRequestSourceValues(initialRequest);
-      const mongoResult = await resolveMongoExtractorResult(extractor, request);
-      const result = mongoResult ?? (await api.extractDataGridSelection(request));
-      if (!result.text && !extractorAllowsEmptyOutput(extractor)) return false;
+      const extraction = await extractWithExtractor(extractor, extractorOptions);
+      if (!extraction) return false;
+      const { request, result } = extraction;
       // Derive the grid paste-back payload from the effective request schema so
       // hidden support columns, row headers, NULLs, tabs, and newlines keep the
       // same shape and values as the rendered raw text or TSV.
@@ -411,14 +433,10 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
 
   async function previewWithExtractor(extractor: DataGridCopyExtractorId, extractorOptions: DataGridExtractorOptions): Promise<DataGridExtractPreview> {
     if (hasUnsupportedDiscreteSelection.value && !hasContextPredicateTarget(extractor)) throw new Error(t("grid.copyExtractorUnsupportedSelection"));
-    const initialRequest = buildRequest(extractor, extractorOptions);
-    if (!initialRequest) throw new Error(t("grid.copyExtractorEmptySelection"));
+    const extraction = await extractWithExtractor(extractor, extractorOptions, DATA_GRID_EXTRACTOR_PREVIEW_MAX_ROWS);
+    if (!extraction) throw new Error(t("grid.copyExtractorEmptySelection"));
+    const { initialRequest, result } = extraction;
     const sourceRowCount = initialRequest.rows.length;
-    const previewRowCount = Math.min(sourceRowCount, DATA_GRID_EXTRACTOR_PREVIEW_MAX_ROWS);
-    const request = await resolveRequestSourceValues(initialRequest, previewRowCount);
-    const mongoResult = await resolveMongoExtractorResult(extractor, request, previewRowCount);
-    const result = mongoResult ?? (await api.extractDataGridSelection(request));
-    if (!result.text && !extractorAllowsEmptyOutput(extractor)) throw new Error(t("grid.copyExtractorEmptySelection"));
     return { ...result, sourceRowCount, truncated: sourceRowCount > result.rowCount };
   }
 
@@ -446,7 +464,7 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     }
   }
 
-  return { copyWithExtractor, copyWithPreference, previewWithExtractor, previewWithPreference, canCopyWithExtractor };
+  return { extractWithExtractor, copyWithExtractor, copyWithPreference, previewWithExtractor, previewWithPreference, canCopyWithExtractor };
 }
 
 function extractorAllowsEmptyOutput(extractor: DataGridCopyExtractorId): boolean {

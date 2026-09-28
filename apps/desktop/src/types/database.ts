@@ -3,6 +3,7 @@ import type { TransferContent, TransferMode, TransferObjectKind, TransferTableNa
 import type { SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import type { MultiDbExecutionTarget, MultiDbResultRunExecution } from "@/types/sqlExecution";
 import type { DatabaseType } from "@/types/generated/databaseTypes";
+import type { PluginAiRecommendation } from "@/types/pluginAiRecommendations";
 
 export type { DatabaseType } from "@/types/generated/databaseTypes";
 
@@ -104,6 +105,8 @@ export interface ConnectionConfig {
   visible_database_patterns?: string[];
   visible_schemas?: Record<string, string[]>;
   show_system_schemas?: boolean;
+  /** Load every page when the sidebar's Tables group is opened for this connection. */
+  sidebar_auto_load_all_tables?: boolean;
   attached_databases?: AttachedDatabaseConfig[];
   init_script?: string;
   color?: string;
@@ -359,7 +362,9 @@ export interface PluginFormField {
   default?: PluginFormFieldValue | null;
   options?: PluginFormFieldOption[];
   /** Plugin method returning `{ options: [{ value, label }] }` for dynamic
-   * select rendering; falls back to the declared type when unavailable. */
+   * select rendering; the host calls it with `{ locale }` (the current DBX UI
+   * locale) so plugins can localize the labels. Falls back to the declared
+   * type when unavailable. */
   options_action?: string;
   /** Host API 1.1: offer a local-file action on this field. */
   picker?: PluginFormFieldPicker;
@@ -418,6 +423,11 @@ export interface PluginWorkbenchContribution {
   label: string;
   description?: string;
   icon?: string;
+  ai?: PluginWorkbenchAiContribution;
+}
+
+export interface PluginWorkbenchAiContribution {
+  recommendations?: PluginAiRecommendation[];
 }
 
 export interface PluginFilesystemProviderContribution {
@@ -476,6 +486,7 @@ export interface PluginContextMenuContribution {
   description?: string;
   icon?: string;
   menu: PluginContextMenuTarget;
+  action?: PluginOpenWorkbenchTarget;
 }
 
 export interface PluginResultViewContribution {
@@ -490,11 +501,15 @@ export type PluginCommandPresentation = "tab" | "panel";
 export type PluginCommandReuse = "singleton" | "new";
 export type PluginCommandRestore = "none";
 
-/** v1 ships exactly one action (HOST_PLUGIN_UI_SPEC §4.1): open a declared workbench. */
-export interface PluginOpenWorkbenchAction {
+/** Shared wire-level navigation contract used by commands and context-menu contributions. */
+export interface PluginOpenWorkbenchTarget {
   type: "open-workbench";
   /** Workbench contribution of the SAME plugin. */
   workbench: string;
+}
+
+/** v1 command action extends the shared target with command-specific launch behavior. */
+export interface PluginOpenWorkbenchAction extends PluginOpenWorkbenchTarget {
   presentation?: PluginCommandPresentation;
   reuse?: PluginCommandReuse;
   instance_key?: string;
@@ -504,8 +519,10 @@ export interface PluginOpenWorkbenchAction {
   /**
    * Generic launch-options extension point: sidecar method returning
    * `{ entries: [{ label, description?, context? }] }` for the dock "+" picker.
-   * The host renders labels and merges the chosen context into the
-   * host-authored panel context — never interpreting the business meaning.
+   * The host calls it with `{ locale }` (the current DBX UI locale, e.g.
+   * "en"/"zh-CN") so plugins can localize the returned labels, renders the
+   * labels and merges the chosen context into the host-authored panel
+   * context — never interpreting the business meaning.
    */
   options_action?: string;
   /** When true, the host also offers the plugin's own saved connections as launch targets. */
@@ -1180,6 +1197,18 @@ export interface ExtensionInfo {
   schema?: string | null;
 }
 
+/** PostgreSQL event trigger metadata (`pg_event_trigger`). Database-level DDL trigger. */
+export interface EventTriggerInfo {
+  name: string;
+  event: string;
+  owner?: string | null;
+  function?: string | null;
+  enabled?: string | null;
+  tags?: string[] | null;
+  comment?: string | null;
+  source?: string | null;
+}
+
 export interface OwnerInfo {
   object_name: string;
   object_type: string;
@@ -1267,8 +1296,13 @@ export interface QueryResult {
   execution_time_ms: number;
   /** OceanBase SQL Audit EXECUTE_TIME for a completed statement, in microseconds. */
   server_execute_time_us?: number;
-  /** Desktop wait from query request dispatch to the complete result payload; summed across appended pages. OceanBase Oracle query tabs only. */
+  /** Desktop wait from query request dispatch to the complete result payload; summed across appended pages. Completed query/command requests only. */
   client_request_wait_ms?: number;
+  /** Measured phases; totals overlap. Missing phases were not measured. */
+  query_timings_ms?: Record<string, number>;
+  client_prepare_ms?: number;
+  client_result_ms?: number;
+  timing_page_count?: number;
   /** Whether a backend-reported result total is exact. */
   total_is_exact?: boolean;
   truncated?: boolean;
@@ -1280,7 +1314,13 @@ export interface QueryResult {
    *  this carries the raw HTTP response body so the UI can toggle between
    *  the tabular view and the original JSON. */
   elasticsearch_raw_body?: string;
+  /** Preformatted Redis command output retained alongside the default grid rows. */
+  redis_console_output?: string;
   sourceLabel?: string;
+  /** 结果集来源的库名 / schema（与 sourceLabel 同时写入），供结果集页签按设置决定是否展示。 */
+  sourceQualifier?: string;
+  /** 结果集来源的对象名（通常为表名），关闭“结果集名称包含数据库名”时用于展示短名称。 */
+  sourceName?: string;
   sourceStatement?: string;
   /** Absolute offsets in the editor document at execution time. */
   sourceFrom?: number;
@@ -1346,8 +1386,19 @@ export interface QueryResultRun {
   createdAt: number;
   /** Keeps this result from being replaced by an ordinary query execution. */
   pinned?: boolean;
+  /**
+   * 标题是否由用户/多库执行显式指定（重命名或按目标库命名）。
+   * 为假时 title 只是系统默认的 `Run N`，结果标签应改用来源名显示。
+   */
+  customTitle?: boolean;
   /** Distinguishes successive result payloads that reuse the same run slot. */
   resultGridRevision?: string;
+  /**
+   * 结果来源（库名.表名 / 表名），随批次一起保存。
+   * 非活动批次的结果 payload 会被回收，因此结果标签命名不能依赖 payload。
+   */
+  sourceLabel?: string;
+  sourceName?: string;
   /**
    * Logical-result identity for the tab-switch view snapshot cache. Distinct
    * from `resultGridRevision` (the grid remount key): this one changes on every
@@ -1499,9 +1550,11 @@ export type TreeNodeType =
   | "group-packages"
   | "group-partitions"
   | "group-extensions"
+  | "group-event-triggers"
   | "group-tablespaces"
   | "group-datafiles"
   | "extension"
+  | "event-trigger"
   | "object-browser"
   | "user-admin"
   | "dameng-users"
@@ -1628,11 +1681,19 @@ export interface TreeNode {
   vgroupId?: string;
   /** 投影时盖章的分组类别（tables/views/…），供拖拽落点 O(1) 类别判定。 */
   vgroupKind?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | EventTriggerInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
   loadMore?: {
     parentId: string;
     offset: number;
     pageSize: number;
+    /**
+     * Identity of the row that was expected to open this page: the peek row the
+     * previous page fetched but did not display. Offset paging is not snapshot
+     * consistent, so when objects are created or dropped above the window the
+     * same offset points at a different row; comparing against this anchor lets
+     * the page notice that and re-read the window instead of leaving a gap.
+     */
+    anchor?: string;
   };
 }
 
@@ -1767,11 +1828,15 @@ export interface QueryPageJumpProgress {
 
 export type TabOutputView = "result" | "summary" | "explain" | "chart" | "messages" | "profile";
 
+export type RedisResultViewMode = "grid" | "console";
+
 export type TabPageUiState = Record<string, unknown>;
 
 /** UI-only state that must survive an inactive tab's component being unmounted. */
 export interface TabUiState {
   activeOutputView?: TabOutputView;
+  /** Redis query results default to grid; a per-tab override selects command-line output. */
+  redisResultViewMode?: RedisResultViewMode;
   resultPaneOpen?: boolean;
   /** Small JSON-compatible snapshots owned by special-page components. */
   page?: Record<string, TabPageUiState>;
@@ -1933,6 +1998,8 @@ export interface QueryTab {
     | "plugin-workbench"
     | "plugin-filesystem";
   pluginWorkbench?: {
+    /** Host command that created this tab; distinct commands can share a workbench. */
+    commandId?: string;
     pluginId: string;
     contributionId: string;
     context?: Record<string, unknown>;

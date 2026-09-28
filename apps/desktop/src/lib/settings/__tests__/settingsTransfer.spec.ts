@@ -68,6 +68,18 @@ describe("settingsTransfer", () => {
     expect(result.error.detail).toContain("updateDownloadSource");
   });
 
+  it("round-trips table completion schema qualification as an editor setting", () => {
+    const result = parseSettingsTransferFile(fileWith({ tableCompletionSchemaQualification: "always" }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.editorSettings.tableCompletionSchemaQualification).toBe("always");
+    expect(result.value.categories).toEqual(["editor"]);
+
+    const invalid = parseSettingsTransferFile(fileWith({ tableCompletionSchemaQualification: "sometimes" }));
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok) expect(invalid.error.detail).toContain("tableCompletionSchemaQualification");
+  });
+
   it("rejects out-of-range numbers that the normalizer clamps", () => {
     const result = parseSettingsTransferFile(fileWith({ sidebarIndent: 99999 }));
     expect(result.ok).toBe(false);
@@ -106,6 +118,21 @@ describe("settingsTransfer", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) return;
     expect(result.error.detail).toContain("wordWrap");
+  });
+
+  it("transfers the column header hover tooltip preference as a data setting", () => {
+    expect(transferCategoryForKey("showColumnHeaderTooltips")).toBe("data");
+
+    const result = parseSettingsTransferFile(fileWith({ showColumnHeaderTooltips: false }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.editorSettings.showColumnHeaderTooltips).toBe(false);
+    expect(result.value.categories).toContain("data");
+
+    const rejected = parseSettingsTransferFile(fileWith({ showColumnHeaderTooltips: "no" }));
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) return;
+    expect(rejected.error.detail).toContain("showColumnHeaderTooltips");
   });
 
   it("rejects toolbar items whose known keys are not booleans", () => {

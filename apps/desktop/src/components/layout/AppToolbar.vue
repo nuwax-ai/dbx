@@ -2,18 +2,15 @@
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, PlugZap, FileDown, FolderTree, Pin, PinOff } from "@lucide/vue";
+import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, PlugZap, FileDown, FolderTree, Pin, PinOff, CalendarClock, Waypoints } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import LightDropdown from "@/components/ui/LightDropdown.vue";
+import LightDropdown, { type LightDropdownItem } from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
 import ToolbarUpdateIcon from "@/components/layout/ToolbarUpdateIcon.vue";
+import PluginShortcutToolbar from "@/components/plugins/PluginShortcutToolbar.vue";
 import { MAC_TRAFFIC_LIGHT_X, macTrafficLightInsetPaddingForScale, shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
-import { useToast } from "@/composables/useToast";
-import PluginIcon from "@/components/plugins/PluginIcon.vue";
-import { setDockVisible, usePluginBottomDock } from "@/lib/plugins/pluginBottomDock";
-import { usePluginToolbarCommands, type PluginToolbarCommandEntry } from "@/lib/plugins/pluginCommandRegistry";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 const props = defineProps<{
@@ -60,32 +57,12 @@ const emit = defineEmits<{
   "open-sql-file": [];
   "open-schema-diff": [];
   "open-data-compare": [];
+  "open-backups": [];
+  "open-mcp-settings": [];
 }>();
 
 const { t } = useI18n();
-const { toast } = useToast();
 
-// PR-A4 appToolbar surface (HOST_PLUGIN_UI_SPEC §5.1): plugin commands render as icons
-// surface (next to Settings/AI); clicking runs the command (presentation: panel -> the global bottom dock),
-// clicking again collapses an open dock command.
-const { entries: pluginCommandEntries, open: openPluginCommand } = usePluginToolbarCommands();
-const { entries: pluginDockEntries, visible: dockVisible } = usePluginBottomDock();
-// The toolbar icon toggles panel visibility (panel hide keeps the webviews
-// mounted, so sessions and height survive); with a hidden-but-populated dock
-// the first click just restores it, and only an empty dock runs the command
-// (otherwise "getting the panel back" would keep spawning new terminals).
-function togglePluginCommand(entry: PluginToolbarCommandEntry) {
-  if (dockVisible.value) {
-    setDockVisible(false);
-    return;
-  }
-  if (pluginDockEntries.value.length) {
-    setDockVisible(true);
-    return;
-  }
-  const result = openPluginCommand(entry);
-  if (result.error) toast(result.error, 5000);
-}
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
 const showToolbarUpdateEntry = computed(() => toolbarItems.value.checkUpdates || props.hasUpdateAvailable);
@@ -149,6 +126,8 @@ function onToolbarDblClick(e: MouseEvent) {
 const toolbarEl = ref<HTMLElement>();
 const newConnectionLabelEl = ref<HTMLElement>();
 const toolbarCollapsed = ref(false);
+const pluginCenterGroup = ref<HTMLElement | null>(null);
+const showPluginCenterShortcuts = computed(() => settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position === "plugin-center");
 const shouldReserveTrafficLightInset = computed(() => shouldReserveMacTrafficLightInset(isMac, isFullscreen.value, isDesktop));
 
 function checkToolbarWidth() {
@@ -395,11 +374,12 @@ onBeforeUnmount(() => {
 
 // ──────────── Left-side "More" items ────────────
 
-const moreItems = computed(() => {
-  const items: Array<{ value: string; label: string; icon: any; action: () => void; disabled: boolean }> = [];
+type ToolbarMenuItem = LightDropdownItem & { action: () => void };
 
-  // Hidden left-side items go into "More"
-  if (!toolbarItems.value.dataTransfer) {
+function buildToolbarMenuItems(includeVisiblePrimaryItems: boolean): ToolbarMenuItem[] {
+  const items: ToolbarMenuItem[] = [];
+
+  if (includeVisiblePrimaryItems || !toolbarItems.value.dataTransfer) {
     items.push({
       value: "transfer",
       label: t("transfer.dataTransfer"),
@@ -408,20 +388,18 @@ const moreItems = computed(() => {
       disabled: !props.hasConnections,
     });
   }
-  if (!toolbarItems.value.driverManager) {
+  if (includeVisiblePrimaryItems || !toolbarItems.value.driverManager) {
     items.push({
       value: "driver-store",
-      label: t("toolbar.driverManager"),
+      label: props.agentDriverUpdateCount > 0 ? `${t("toolbar.driverManager")} (${props.agentDriverUpdateCount})` : t("toolbar.driverManager"),
       icon: Package,
       action: () => emit("open-driver-store"),
       disabled: false,
     });
   }
-  if (!toolbarItems.value.pluginCenter) {
+  if (includeVisiblePrimaryItems || !toolbarItems.value.pluginCenter) {
     items.push({ value: "plugin-center", label: t("toolbar.pluginCenter"), icon: PlugZap, action: () => emit("open-plugin-center"), disabled: false });
   }
-
-  // "More" menu items (individually toggleable)
   if (toolbarItems.value.sqlFile) {
     items.push({
       value: "sql-file",
@@ -449,52 +427,39 @@ const moreItems = computed(() => {
       disabled: !props.hasConnections,
     });
   }
+  items.push({
+    value: "database-backups",
+    label: t("databaseBackup.title"),
+    icon: CalendarClock,
+    action: () => emit("open-backups"),
+    disabled: false,
+  });
+  items.push({
+    value: "mcp-settings",
+    label: t("settings.openMcpSettings"),
+    icon: Waypoints,
+    action: () => emit("open-mcp-settings"),
+    disabled: false,
+  });
 
-  // Append overflowed right-side items at the end
-  for (const ri of overflowRightMenuItems.value) {
+  for (const item of overflowRightMenuItems.value) {
     items.push({
-      value: `right-${ri.value}`,
-      label: ri.label,
-      icon: ri.icon,
-      action: ri.action,
-      disabled: ri.disabled,
+      value: `right-${item.value}`,
+      label: item.label,
+      icon: item.icon,
+      action: item.action,
+      disabled: item.disabled,
     });
   }
 
   return items;
-});
+}
+
+const moreItems = computed(() => buildToolbarMenuItems(false));
 
 const showMoreDropdown = computed(() => moreItems.value.length > 0);
 
-const collapsedItems = computed(() => {
-  const items: Array<{ value: string; label: string; icon: any; action: () => void; disabled: boolean }> = [];
-  if (toolbarItems.value.dataTransfer) {
-    items.push({
-      value: "transfer",
-      label: t("transfer.dataTransfer"),
-      icon: ArrowLeftRight,
-      action: () => emit("open-transfer"),
-      disabled: !props.hasConnections,
-    });
-  }
-  if (toolbarItems.value.driverManager) {
-    items.push({
-      value: "driver-store",
-      label: props.agentDriverUpdateCount > 0 ? `${t("toolbar.driverManager")} (${props.agentDriverUpdateCount})` : t("toolbar.driverManager"),
-      icon: Package,
-      action: () => emit("open-driver-store"),
-      disabled: false,
-    });
-  }
-  if (toolbarItems.value.pluginCenter) {
-    items.push({ value: "plugin-center", label: t("toolbar.pluginCenter"), icon: PlugZap, action: () => emit("open-plugin-center"), disabled: false });
-  }
-  // Always include moreItems (may contain hidden left-side items + overflowed right items)
-  if (moreItems.value.length > 0) {
-    items.push(...moreItems.value);
-  }
-  return items;
-});
+const collapsedItems = computed(() => buildToolbarMenuItems(true));
 
 function runMoreItem(value: string) {
   const item = moreItems.value.find((i) => i.value === value);
@@ -556,10 +521,13 @@ const toolbarStyle = computed(() => {
         <!-- 小圆点仅提示"有可更新驱动"，具体数量交给对话框内标签页红点展示，避免工具栏长期挂红数字。 -->
         <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-block h-2 w-2 rounded-full bg-red-500" :aria-label="t('toolbar.updatableDriverCount')" :title="t('toolbar.updatableDriverCount')" />
       </Button>
-      <Button v-if="toolbarItems.pluginCenter" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'bg-accent': showPluginCenter }]" @click="emit('open-plugin-center')">
-        <PlugZap class="h-3.5 w-3.5" />
-        <span :class="toolbarTextLabelClass">{{ t("toolbar.pluginCenter") }}</span>
-      </Button>
+      <div v-if="toolbarItems.pluginCenter || showPluginCenterShortcuts" ref="pluginCenterGroup" class="flex shrink-0 items-center rounded-md" :class="{ 'bg-accent': showPluginCenter }">
+        <Button v-if="toolbarItems.pluginCenter" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'rounded-r-none': showPluginCenterShortcuts }]" @click="emit('open-plugin-center')">
+          <PlugZap class="h-3.5 w-3.5" />
+          <span :class="toolbarTextLabelClass">{{ t("toolbar.pluginCenter") }}</span>
+        </Button>
+        <PluginShortcutToolbar v-if="showPluginCenterShortcuts" dropdown-only :menu-anchor="pluginCenterGroup" @layout-change="scheduleToolbarLayout" />
+      </div>
 
       <LightDropdown
         v-if="showMoreDropdown"
@@ -577,6 +545,7 @@ const toolbarStyle = computed(() => {
     </template>
 
     <template v-if="toolbarCollapsed">
+      <PluginShortcutToolbar v-if="showPluginCenterShortcuts" dropdown-only @layout-change="scheduleToolbarLayout" />
       <LightDropdown
         v-if="collapsedItems.length > 0"
         model-value=""
@@ -596,6 +565,7 @@ const toolbarStyle = computed(() => {
 
     <!-- Right-side items wrapped in overflow-aware container -->
     <div ref="rightWrapper" class="flex min-w-0 items-center gap-1 overflow-hidden">
+      <PluginShortcutToolbar v-if="settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position === 'toolbar'" @layout-change="scheduleToolbarLayout" />
       <template v-if="UPDATER_ENABLED && showToolbarUpdateEntry">
         <Tooltip>
           <TooltipTrigger as-child>
@@ -718,15 +688,6 @@ const toolbarStyle = computed(() => {
           </Button>
         </TooltipTrigger>
         <TooltipContent>AI</TooltipContent>
-      </Tooltip>
-      <Tooltip v-for="entry in pluginCommandEntries" :key="`${entry.pluginId}.${entry.commandId}`">
-        <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': dockVisible }" :aria-label="entry.label" @click="togglePluginCommand(entry)">
-            <PluginIcon :plugin-id="entry.pluginId" :icon="entry.icon" class="toolbar-action-icon h-4 w-4" />
-            <span v-if="dockVisible" class="toolbar-panel-status" aria-hidden="true" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>{{ entry.label }} · {{ entry.pluginName }}</TooltipContent>
       </Tooltip>
     </div>
     <!-- /rightWrapper -->

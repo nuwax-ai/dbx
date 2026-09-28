@@ -6,6 +6,7 @@ import type { CellValue } from "@/lib/dataGrid/cellValue";
 import { coerceDataGridCellValue, dataGridCellEditorText } from "@/lib/dataGrid/dataGridCellCoercion";
 import { focusDataGridEditorWithoutScrolling, preserveDataGridScrollPosition } from "@/lib/dataGrid/dataGridEditorFocus";
 import { normalizeDataGridSaveError } from "@/lib/dataGrid/dataGridSql";
+import { isOpaqueAggregateStateColumnType } from "@/lib/dataGrid/binaryCellDownload";
 import { rowStatusFilterAfterAddingRow, type RowStatusFilter } from "@/lib/dataGrid/gridRowStatus";
 import type { GridNewRowMeta, GridNewRowPlacement } from "@/lib/dataGrid/gridNewRowPlacement";
 import { supportsDataGridTransaction } from "@/lib/table/tableEditing";
@@ -80,15 +81,34 @@ export interface CustomSaveHandler {
   save: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; newRowMeta: GridNewRowMeta[]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<void>;
   applySavedChanges?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; columns: string[] }) => void;
   preview?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; newRowMeta: GridNewRowMeta[]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<string[]>;
+  /** Optional per-existing-row safety gate used before a deletion can be staged. */
+  canDeleteRow?: (sourceIndex: number, row: readonly CellValue[]) => boolean;
+  /** Selects an unconditional, statement-previewing confirmation before save. */
+  confirmation?: "influxdb-v1-delete";
+  /** Refresh after an execution error when a non-transactional batch may have partially succeeded. */
+  reloadOnFailure?: boolean;
   canInsert?: boolean;
+  canUpdate?: boolean;
   canDelete?: boolean;
   readonlyColumns?: string[];
   supportsInsert?: boolean;
   targetLabel?: string;
 }
 
+/** Summary handed to `confirmSaveRequest` for a final mutation review. */
+export interface DataGridSaveConfirmationRequest {
+  /** Rows with edited cells (one write per row). */
+  updates: number;
+  inserts: number;
+  deletes: number;
+  /** Save target name (table / sObject), when known. */
+  targetLabel?: string;
+  /** The SQL or pseudo-statements about to be executed. */
+  statements: string[];
+}
+
 export interface UseDataGridEditorOptions {
-  result: ComputedRef<{ columns: string[]; rows: CellValue[][] }>;
+  result: ComputedRef<{ columns: string[]; rows: CellValue[][]; column_types?: string[] }>;
   editable: ComputedRef<boolean | undefined>;
   databaseType: ComputedRef<DatabaseType | undefined>;
   connectionId: ComputedRef<string | undefined>;
@@ -119,6 +139,8 @@ export interface UseDataGridEditorOptions {
   rowStatusFilter: Ref<RowStatusFilter>;
   dataGridQuickEntryEnabled?: ComputedRef<boolean>;
   confirmDangerousRowDeletion?: ComputedRef<boolean>;
+  /** Optional operator review before a save is executed. Auto-save never bypasses it. */
+  confirmSaveRequest?: ComputedRef<((request: DataGridSaveConfirmationRequest) => Promise<boolean>) | undefined>;
   /** `生成 SQL 时包含数据库名` — qualify saved tables with their database. */
   includeDatabaseNameInSaveSql?: ComputedRef<boolean>;
   initialEditColumn?: ComputedRef<number>;
@@ -1310,7 +1332,10 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     return (columnIndex: number) => {
       const columnName = sourceColumns.value?.[columnIndex] ?? result.value.columns[columnIndex];
       if (columnName === undefined) return false;
-      return shouldClearClonedColumn(columnName, columnInfoByName.get(columnName.toLowerCase()));
+      const columnInfo = columnInfoByName.get(columnName.toLowerCase());
+      const resultType = result.value.column_types?.[columnIndex]?.trim();
+      if (isOpaqueAggregateStateColumnType(resultType || columnInfo?.data_type)) return true;
+      return shouldClearClonedColumn(columnName, columnInfo);
     };
   }
 
@@ -1901,17 +1926,47 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const shouldReloadAfterSqlSave = shouldReloadAfterSave || snapshot.dirtyRows.size > 0;
 
     if (customHandler) {
-      try {
-        await customHandler.save({
-          dirtyRows: snapshot.dirtyRows,
-          newRows: snapshot.newRows,
-          newRowMeta: snapshot.newRowMeta,
-          deletedRows: snapshot.deletedRows,
-          columns: result.value.columns,
-          rows: result.value.rows,
+      const customChanges = {
+        dirtyRows: snapshot.dirtyRows,
+        newRows: snapshot.newRows,
+        newRowMeta: snapshot.newRowMeta,
+        deletedRows: snapshot.deletedRows,
+        columns: result.value.columns,
+        rows: result.value.rows,
+      };
+      const confirmSaveRequest = options.confirmSaveRequest?.value;
+      if (confirmSaveRequest) {
+        if (saveOptions.autoSave) {
+          await finishInterruptedSaveChanges(snapshot);
+          return;
+        }
+        let statements: string[];
+        try {
+          if (!customHandler.preview) throw new Error("This data source cannot safely preview the pending changes.");
+          statements = await customHandler.preview(customChanges);
+          if (statements.length === 0) throw new Error("This data source did not produce a safe mutation preview.");
+        } catch (e: any) {
+          saveError.value = normalizeDataGridSaveError(databaseType.value, e);
+          await finishInterruptedSaveChanges(snapshot);
+          return;
+        }
+        const saveConfirmed = await confirmSaveRequest({
+          updates: snapshot.dirtyRows.size,
+          inserts: snapshot.newRows.length,
+          deletes: snapshot.deletedRows.size,
+          targetLabel: customHandler.targetLabel,
+          statements,
         });
+        if (!saveConfirmed) {
+          await finishInterruptedSaveChanges(snapshot);
+          return;
+        }
+      }
+      try {
+        await customHandler.save(customChanges);
       } catch (e: any) {
         saveError.value = normalizeDataGridSaveError(databaseType.value, e);
+        if (customHandler.reloadOnFailure && shouldReloadAfterSave) reloadCurrentData();
         await finishInterruptedSaveChanges(snapshot);
         return;
       }
@@ -1990,6 +2045,28 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
       });
       if (!confirmed) {
+        await finishInterruptedSaveChanges(snapshot);
+        return;
+      }
+    }
+    // Engines without transactional rollback (Salesforce: one REST call per record,
+    // a failure leaves earlier records applied) let the host review the operation
+    // list first. Auto-save never writes without that review, matching the
+    // production-database interlock above.
+    const confirmSaveRequest = options.confirmSaveRequest?.value;
+    if (confirmSaveRequest) {
+      if (saveOptions.autoSave) {
+        await finishInterruptedSaveChanges(snapshot);
+        return;
+      }
+      const saveConfirmed = await confirmSaveRequest({
+        updates: snapshot.dirtyRows.size,
+        inserts: snapshot.newRows.length,
+        deletes: snapshot.deletedRows.size,
+        targetLabel: tableMeta.value?.tableName,
+        statements: stmts,
+      });
+      if (!saveConfirmed) {
         await finishInterruptedSaveChanges(snapshot);
         return;
       }

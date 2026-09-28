@@ -113,6 +113,24 @@ function structuredSqlError(detail = "duplicate key") {
 }
 
 describe("queryStore multi-statement errors", () => {
+  it.each(["oracle", "oceanbase-oracle"])("preserves the intended offset timing scope for %s", async (dbType) => {
+    mocks.getConnectionConfig.mockReturnValue({ id: "timing-offset", name: "Timing", db_type: dbType, database: "APP", query_timeout_secs: 30 });
+    mocks.analyzeEditableQueryEditability.mockResolvedValue({ editable: false, reason: "complex-query" });
+    mocks.prepareQueryPaginationExecutionPlan.mockImplementation(async (options) => ({ sqlToExecute: options.sql, pageSql: options.sql, pageLimit: options.pagination.limit, pageOffset: options.pagination.offset, countSql: undefined, useAgentResultSession: true }));
+    const timed = true;
+    mocks.executeMulti
+      .mockResolvedValueOnce([{ columns: ["VALUE"], rows: [[1], [2]], affected_rows: 0, execution_time_ms: 12, session_id: "offset-page", has_more: true, ...(timed ? { query_timings_ms: { agent_total: 10 } } : {}) }])
+      .mockResolvedValueOnce([{ columns: ["VALUE"], rows: [[3], [4]], affected_rows: 0, execution_time_ms: 34, has_more: false, ...(timed ? { query_timings_ms: { agent_total: 30 } } : {}) }]);
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("timing-offset", "APP", "Query", "query", "APP");
+    await store.executeTabSql(tabId, "SELECT VALUE FROM T", { pagination: { limit: 2, offset: 2 } });
+    const result = store.tabs.find((item) => item.id === tabId)!.result!;
+    expect(result.rows).toEqual([[3], [4]]);
+    expect(result.execution_time_ms).toBe(timed ? 46 : 34);
+    expect(result.query_timings_ms).toEqual(timed ? { agent_total: 40 } : undefined);
+    expect(result.timing_page_count).toBe(timed ? 2 : undefined);
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.defaultAutoKeepResults = false;
@@ -160,7 +178,7 @@ describe("queryStore multi-statement errors", () => {
     });
   });
 
-  it.each(["oceanbase-oracle", "mysql"] as const)("measures complete result wait only for a single %s query result", async (databaseType) => {
+  it.each(["oceanbase-oracle", "oracle", "mysql", "postgres", "sqlite", "sqlserver", "db2"] as const)("measures complete result wait only for a single %s query result", async (databaseType) => {
     mocks.getConnectionConfig.mockReturnValue({
       id: "timing-1",
       name: "Timing",
@@ -183,7 +201,7 @@ describe("queryStore multi-statement errors", () => {
       await execution;
       const result = store.tabs.find((item) => item.id === tabId)?.result;
       expect(result?.execution_time_ms).toBe(12);
-      expect(result?.client_request_wait_ms).toBe(databaseType === "oceanbase-oracle" ? 45 : undefined);
+      expect(result?.client_request_wait_ms).toBe(45);
     } finally {
       vi.restoreAllMocks();
     }
@@ -320,6 +338,37 @@ describe("queryStore multi-statement errors", () => {
       completed: 2,
       items: [{ status: "success" }, { status: "error", error: "bad statement" }, { status: "skipped" }],
     });
+  });
+
+  it.each(["oracle", "postgres"])("skips the redundant health probe before a %s batch execution", async (dbType) => {
+    const sql = Array.from({ length: 20 }, (_, index) => `INSERT INTO users (id) VALUES (${index + 1});`).join("\n");
+    const blockedHealthProbe = deferred<void>();
+    mocks.ensureConnected.mockImplementation((_connectionId, options) => (options?.verifyHealth === false ? Promise.resolve() : blockedHealthProbe.promise));
+    const connectionId = `${dbType}-1`;
+    mocks.getConnectionConfig.mockReturnValue({
+      id: connectionId,
+      name: dbType,
+      db_type: dbType,
+      database: "app",
+      query_timeout_secs: 30,
+    });
+    mocks.executeMulti.mockResolvedValue(
+      Array.from({ length: 20 }, (_, statementIndex) => ({
+        columns: [],
+        rows: [],
+        affected_rows: 1,
+        execution_time_ms: 1,
+        statement_index: statementIndex,
+      })),
+    );
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab(connectionId, "app", "Query", "query", "public", sql);
+
+    await store.executeTabSql(tabId, sql, { sourceOffset: 0 });
+
+    expect(mocks.ensureConnected).toHaveBeenCalledWith(connectionId, { verifyHealth: false });
+    expect(mocks.executeMultiWithProgress).toHaveBeenCalledTimes(1);
   });
 
   it("skips a failed statement and continues the original batch without replaying successful statements", async () => {

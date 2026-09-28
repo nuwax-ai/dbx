@@ -123,6 +123,9 @@ pub struct ConnectionConfig {
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_system_schemas: bool,
+    /// Frontend navigation preference: exhaust the paginated Tables group when opened.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_auto_load_all_tables: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     /// SQL statements executed right after the connection is established
@@ -581,6 +584,8 @@ struct ConnectionConfigData {
     #[serde(default)]
     pub show_system_schemas: bool,
     #[serde(default)]
+    pub sidebar_auto_load_all_tables: bool,
+    #[serde(default)]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
     pub init_script: Option<String>,
@@ -691,6 +696,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             visible_database_patterns: data.visible_database_patterns,
             visible_schemas: data.visible_schemas,
             show_system_schemas: data.show_system_schemas,
+            sidebar_auto_load_all_tables: data.sidebar_auto_load_all_tables,
             attached_databases: data.attached_databases,
             init_script: data.init_script,
             color: data.color,
@@ -971,8 +977,14 @@ impl ConnectionConfig {
             || self.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("starrocks"))
     }
 
+    pub fn is_doris(&self) -> bool {
+        self.db_type == DatabaseType::Doris
+            || (self.db_type == DatabaseType::Mysql
+                && self.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("doris")))
+    }
+
     pub fn bare_mysql_supports_tls(&self) -> bool {
-        self.is_starrocks()
+        self.is_doris() || self.is_starrocks()
     }
 
     pub fn bare_mysql_uses_tls(&self) -> bool {
@@ -1129,6 +1141,7 @@ impl ConnectionConfig {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
+            DatabaseType::Salesforce => salesforce_instance_url(raw_host, self.ssl, port),
             DatabaseType::Dameng => format!("dm://{host}:{port}{db_part}"),
             DatabaseType::Kingbase => format!("kingbase://{host}:{port}{db_part}"),
             DatabaseType::Highgo => format!("highgo://{host}:{port}{db_part}"),
@@ -1318,6 +1331,7 @@ impl ConnectionConfig {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
+            DatabaseType::Salesforce => salesforce_instance_url(raw_host, self.ssl, port),
             DatabaseType::Dameng => {
                 format!("dm://{}:{}@{host}:{port}{db_part}", username, password)
             }
@@ -2631,6 +2645,19 @@ fn bracket_ipv6(host: &str) -> String {
     }
 }
 
+/// Salesforce connections store the org instance in `host`: either a full URL
+/// (`https://acme.my.salesforce.com`) or a bare hostname. The access token
+/// lives in the password field and never appears in the URL, so the redacted
+/// and full forms are identical.
+fn salesforce_instance_url(raw_host: &str, ssl: bool, port: u16) -> String {
+    let trimmed = raw_host.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    let scheme = if ssl { "https" } else { "http" };
+    format!("{scheme}://{}:{port}", bracket_ipv6(trimmed))
+}
+
 /// Returns `true` when `host` contains two or more comma-separated entries
 /// where each entry already embeds its own `:port` suffix.
 ///
@@ -2764,6 +2791,29 @@ mod tests {
         assert_eq!(serde_json::to_value(parsed).unwrap()["default_schema"], "archive");
     }
 
+    #[test]
+    fn sidebar_auto_load_all_tables_defaults_off_and_round_trips() {
+        let mut value = serde_json::json!({
+            "id": "id",
+            "name": "MariaDB",
+            "db_type": "mysql",
+            "host": "localhost",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "database": "app"
+        });
+        let legacy: ConnectionConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.sidebar_auto_load_all_tables);
+        let serialized_legacy = serde_json::to_value(legacy).unwrap();
+        assert!(serialized_legacy.get("sidebar_auto_load_all_tables").is_none());
+
+        value["sidebar_auto_load_all_tables"] = serde_json::json!(true);
+        let configured: ConnectionConfig = serde_json::from_value(value).unwrap();
+        assert!(configured.sidebar_auto_load_all_tables);
+        assert!(serde_json::to_value(configured).unwrap()["sidebar_auto_load_all_tables"].as_bool().unwrap());
+    }
+
     fn mysql_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
             docs_notes_path: None,
@@ -2785,6 +2835,7 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -3516,6 +3567,72 @@ mod tests {
             config.connection_url(),
             "mysql://root:secret@10.1.2.3:2883/analytics?connect_timeout=10&sessionVariables=query_timeout=60&enable_cleartext_plugin=true"
         );
+    }
+
+    #[test]
+    fn doris_database_type_preserves_mysql_tls_params_when_enabled() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.db_type = DatabaseType::Doris;
+        config.ssl = true;
+        config.ca_cert_path = "/tmp/doris-ca.pem".to_string();
+        config.url_params = Some("verify_ca=true&verify_identity=true".to_string());
+
+        assert!(config.bare_mysql_uses_tls());
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_ca=true&verify_identity=true&charset=utf8mb4&enable_cleartext_plugin=true"
+        );
+    }
+
+    #[test]
+    fn legacy_doris_profile_preserves_mysql_tls_params_when_enabled() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.driver_profile = Some("doris".to_string());
+        config.ssl = true;
+        config.ca_cert_path = "/tmp/doris-ca.pem".to_string();
+        config.url_params = Some("verify_ca=true&verify_identity=false".to_string());
+
+        assert!(config.bare_mysql_uses_tls());
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_ca=true&verify_identity=false&charset=utf8mb4&enable_cleartext_plugin=true"
+        );
+    }
+
+    #[test]
+    fn doris_explicit_disabled_mode_remains_plaintext() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.db_type = DatabaseType::Doris;
+        config.ssl = true;
+        config.url_params = Some("ssl-mode=disabled&verify_ca=true&verify_identity=true".to_string());
+
+        assert!(!config.bare_mysql_uses_tls());
+        assert_eq!(config.connection_url(), "mysql://root:secret@10.1.2.3:2883/analytics?enable_cleartext_plugin=true");
+    }
+
+    #[test]
+    fn selectdb_profile_does_not_gain_bare_mysql_tls_support() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.driver_profile = Some("selectdb".to_string());
+        config.ssl = true;
+        config.url_params = Some("require_ssl=true&verify_ca=true&verify_identity=true".to_string());
+
+        assert!(!config.bare_mysql_supports_tls());
+        assert!(!config.bare_mysql_uses_tls());
+        assert_eq!(config.connection_url(), "mysql://root:secret@10.1.2.3:2883/analytics?enable_cleartext_plugin=true");
+    }
+
+    #[test]
+    fn doris_profile_on_unrelated_database_type_does_not_gain_bare_mysql_tls_support() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.db_type = DatabaseType::Postgres;
+        config.driver_profile = Some("doris".to_string());
+        config.ssl = true;
+        config.url_params = Some("require_ssl=true&verify_ca=true&verify_identity=true".to_string());
+
+        assert!(!config.is_doris());
+        assert!(!config.bare_mysql_supports_tls());
+        assert!(!config.bare_mysql_uses_tls());
     }
 
     #[test]

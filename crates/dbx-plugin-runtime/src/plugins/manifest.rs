@@ -10,11 +10,15 @@ pub const SUPPORTED_PLUGIN_MANIFEST_VERSION: u32 = 1;
 /// 1.1 adds the plugin-initiated `host/requestUserInput` method (see
 /// `plugins/runtime.rs`). 1.2 adds the plugin-initiated plan Host API
 /// (`host.getPlanCapabilities` / `host.explainPlan`). 1.3 adds read-only table
-/// schema metadata (`host.getTableMetadata`). All are additive: older plugins
-/// keep working, and a plugin that wants either capability must check the
-/// advertised version (or the matching `capabilities` / `host.features`
-/// entry) before calling it.
-pub const SUPPORTED_PLUGIN_HOST_API_VERSION: &str = "1.3.0";
+/// schema metadata (`host.getTableMetadata` behind `host.schema:read`) and the
+/// plugin-initiated clipboard Host API (`host.clipboardRead` behind the
+/// `host.clipboard:read` permission; clipboard writes reuse the existing
+/// ungated `host.copy`). 1.4 adds consent-gated read-only data queries
+/// (`host.queryData` behind `host.data:read`). All are additive: older plugins
+/// keep working, and a plugin that wants a capability must check the
+/// advertised version (or the matching `capabilities` / `host.features` entry)
+/// before calling it.
+pub const SUPPORTED_PLUGIN_HOST_API_VERSION: &str = "1.4.0";
 /// Capabilities the host advertises to a plugin backend at `plugin/initialize`.
 pub const SUPPORTED_PLUGIN_HOST_FEATURES: &[&str] = &["host.requestUserInput"];
 pub const SUPPORTED_PLUGIN_PROTOCOL_VERSION: u32 = 1;
@@ -31,6 +35,8 @@ pub const SUPPORTED_PLUGIN_PERMISSIONS: &[&str] = &[
     "host.schema:read",
     "host.storage",
     "host.ai",
+    "host.clipboard:read",
+    "host.data:read",
 ];
 
 /// Cap the number of `host.network:<origin>` entries so a manifest cannot bloat
@@ -658,11 +664,30 @@ pub struct PluginWorkbenchContribution {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<PluginWorkbenchAiContribution>,
 }
 
-/// Native context-menu entry contributed to DBX surfaces. v1 targets the
-/// saved-connection and table sidebar menus; clicks are dispatched to the
-/// plugin backend as `contextMenu/<id>` requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkbenchAiContribution {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<PluginAiRecommendation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginAiRecommendation {
+    pub id: String,
+    pub label: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+}
+
+/// Native context-menu entry contributed to DBX surfaces. Legacy entries
+/// dispatch `contextMenu/<id>` to the plugin backend; declarative actions are
+/// handled directly by the host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginContextMenuContribution {
@@ -675,6 +700,24 @@ pub struct PluginContextMenuContribution {
     /// Menu surface the item belongs to: `connection` or `table`.
     #[serde(default)]
     pub menu: String,
+    /// Optional host-handled action. When absent, the legacy backend entrypoint is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<PluginContextMenuAction>,
+}
+
+/// Actions that the host can perform directly for a context-menu contribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum PluginContextMenuAction {
+    OpenWorkbench(PluginContextMenuOpenWorkbenchAction),
+}
+
+/// Narrow context-menu form of the shared `open-workbench` target contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginContextMenuOpenWorkbenchAction {
+    /// Workbench contribution of the SAME plugin (dangling references are rejected during validation).
+    pub workbench: String,
 }
 
 /// Plugin-rendered visualization surface for query results. Selecting the view
@@ -1229,6 +1272,7 @@ fn validate_contributions(
     let mut filesystem_provider_ids = HashSet::new();
     let mut workbench_references = Vec::new();
     let mut filesystem_references = Vec::new();
+    let mut context_menu_workbench_references = Vec::new();
     let mut command_ids = HashSet::new();
     let mut command_workbench_references = Vec::new();
     let mut menu_command_references = Vec::new();
@@ -1295,6 +1339,9 @@ fn validate_contributions(
                 if !has_ui {
                     errors.push(format!("Workbench contribution '{id}' requires a UI entrypoint"));
                 }
+                if let Some(ai) = &workbench.ai {
+                    validate_ai_recommendations(&ai.recommendations, id, errors);
+                }
             }
             PluginContribution::ResultView(result_view) => {
                 validate_required_text(&result_view.label, &format!("Result view '{id}' label"), errors);
@@ -1317,7 +1364,10 @@ fn validate_contributions(
                         menu.menu
                     ));
                 }
-                if !has_backend {
+                if let Some(PluginContextMenuAction::OpenWorkbench(action)) = &menu.action {
+                    validate_optional_reference(Some(action.workbench.as_str()), "workbench", id, errors);
+                    context_menu_workbench_references.push((id.to_string(), action.workbench.clone()));
+                } else if !has_backend {
                     errors.push(format!("Context menu contribution '{id}' requires a backend entrypoint"));
                 }
             }
@@ -1451,11 +1501,118 @@ fn validate_contributions(
             errors.push(format!("Menus contribution '{menus}' references missing command '{command}'"));
         }
     }
+    for (context_menu, workbench) in context_menu_workbench_references {
+        if !workbench_ids.contains(&workbench) {
+            errors.push(format!("Context menu '{context_menu}' references missing workbench '{workbench}'"));
+        }
+    }
     for (command, workbench) in command_workbench_references {
         if !workbench_ids.contains(&workbench) {
             errors.push(format!("Command '{command}' references missing workbench '{workbench}'"));
         }
     }
+}
+
+fn validate_ai_recommendations(
+    recommendations: &[PluginAiRecommendation],
+    workbench_id: &str,
+    errors: &mut Vec<String>,
+) {
+    if recommendations.len() > 5 {
+        errors.push(format!(
+            "Workbench '{workbench_id}' declares {} AI recommendations; at most 5 are allowed",
+            recommendations.len()
+        ));
+    }
+    let mut seen_ids = HashSet::new();
+    for recommendation in recommendations {
+        if !valid_identifier(&recommendation.id) {
+            errors.push(format!("Workbench '{workbench_id}' AI recommendation has an invalid id"));
+        } else if !seen_ids.insert(recommendation.id.as_str()) {
+            errors.push(format!(
+                "Workbench '{workbench_id}' declares duplicate AI recommendation id '{}'",
+                recommendation.id
+            ));
+        }
+        validate_required_text(
+            &recommendation.label,
+            &format!("Workbench '{workbench_id}' AI recommendation label"),
+            errors,
+        );
+        validate_required_text(
+            &recommendation.prompt,
+            &format!("Workbench '{workbench_id}' AI recommendation prompt"),
+            errors,
+        );
+        validate_ai_recommendation_template(&recommendation.label, workbench_id, &recommendation.id, "label", errors);
+        validate_ai_recommendation_template(&recommendation.prompt, workbench_id, &recommendation.id, "prompt", errors);
+        if recommendation.label.chars().count() > 200 {
+            errors.push(format!(
+                "Workbench '{workbench_id}' AI recommendation '{}' label exceeds 200 characters",
+                recommendation.id
+            ));
+        }
+        if recommendation.prompt.chars().count() > 32_000 {
+            errors.push(format!(
+                "Workbench '{workbench_id}' AI recommendation '{}' prompt exceeds 32000 characters",
+                recommendation.id
+            ));
+        }
+    }
+}
+
+/// Validate the only interpolation syntax supported by the workbench AI
+/// recommendation contract. Ordinary single braces remain valid prompt text;
+/// double braces must contain a safe dotted context path.
+fn validate_ai_recommendation_template(
+    value: &str,
+    workbench_id: &str,
+    recommendation_id: &str,
+    field: &str,
+    errors: &mut Vec<String>,
+) {
+    let mut offset = 0;
+    loop {
+        let remainder = &value[offset..];
+        let Some(open_relative) = remainder.find("{{") else {
+            if remainder.contains("}}") {
+                errors.push(format!("Workbench '{workbench_id}' AI recommendation '{recommendation_id}' {field} contains an unmatched placeholder close").to_string());
+            }
+            return;
+        };
+        if remainder[..open_relative].contains("}}") {
+            errors.push(format!("Workbench '{workbench_id}' AI recommendation '{recommendation_id}' {field} contains an unmatched placeholder close").to_string());
+            return;
+        }
+        let content_start = offset + open_relative + 2;
+        let Some(close_relative) = value[content_start..].find("}}") else {
+            errors.push(format!("Workbench '{workbench_id}' AI recommendation '{recommendation_id}' {field} contains an unterminated placeholder").to_string());
+            return;
+        };
+        let path = value[content_start..content_start + close_relative].trim();
+        if !valid_template_path(path) {
+            errors.push(format!("Workbench '{workbench_id}' AI recommendation '{recommendation_id}' {field} contains an invalid placeholder").to_string());
+        }
+        offset = content_start + close_relative + 2;
+    }
+}
+
+fn valid_template_path(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    value.split('.').enumerate().all(|(index, segment)| {
+        if index > 0 && segment.chars().all(|character| character.is_ascii_digit()) {
+            return !segment.is_empty();
+        }
+        let mut chars = segment.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        (first.is_ascii_alphabetic() || first == '_' || first == '$')
+            && chars.all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '$')
+            && !matches!(segment, "__proto__" | "prototype" | "constructor")
+    })
 }
 
 /// Sidecar method names look like `<domain>/<action>[/<sub>]` (lower-case
@@ -1811,11 +1968,12 @@ mod tests {
         SUPPORTED_PLUGIN_PERMISSIONS,
     };
 
-    fn context_menu_manifest(menu: &str) -> (tempfile::TempDir, PluginManifest) {
-        let dir = tempfile::tempdir().unwrap();
-        let executable = dir.path().join("bin").join("example");
-        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        std::fs::write(&executable, b"example").unwrap();
+    fn context_menu_manifest(menu: &str) -> Result<(tempfile::TempDir, PluginManifest), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let binary_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&binary_dir)?;
+        let executable = binary_dir.join("example");
+        std::fs::write(&executable, b"example")?;
         let manifest = serde_json::from_value(serde_json::json!({
             "manifest_version": 1,
             "id": "io.dbx.example",
@@ -1830,9 +1988,8 @@ mod tests {
                 "label": "Inspect",
                 "menu": menu
             }]
-        }))
-        .unwrap();
-        (dir, manifest)
+        }))?;
+        Ok((dir, manifest))
     }
 
     #[test]
@@ -1905,6 +2062,57 @@ mod tests {
             "type": "invoke-sidecar", "method": "x"
         }));
         assert!(rpc.is_err(), "RPC actions are outside the v1 contract");
+    }
+
+    #[test]
+    fn workbench_ai_recommendations_parse_as_an_additive_manifest_field() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "id": "io.dbx.example",
+            "name": "Example",
+            "version": "1.0.0",
+            "publisher": "example",
+            "engines": { "host_api": "^1.0" },
+            "entrypoints": { "ui": { "root": "ui", "entry": "ui/index.html" } },
+            "contributions": [{
+                "type": "workbench",
+                "id": "io.dbx.example.workbench",
+                "label": "Example",
+                "ai": { "recommendations": [{
+                    "id": "health",
+                    "label": "Inspect {{resource.name}}",
+                    "prompt": "Check {{resource.kind}}/{{resource.name}}",
+                    "order": 10
+                }] }
+            }]
+        }))
+        .unwrap();
+
+        let PluginContribution::Workbench(workbench) = &manifest.contributions[0] else {
+            panic!("expected workbench contribution");
+        };
+        let ai = workbench.ai.as_ref().expect("AI contribution");
+        assert_eq!(ai.recommendations[0].id, "health");
+        assert_eq!(ai.recommendations[0].order, Some(10));
+
+        let plugin_dir = std::env::temp_dir();
+        for invalid in ["Inspect {{resource..name}}", "Inspect {{resource.name", "Inspect resource.name}}"] {
+            let contribution = serde_json::from_value::<PluginContribution>(serde_json::json!({
+                "type": "workbench",
+                "id": "io.dbx.example.workbench",
+                "label": "Example",
+                "ai": { "recommendations": [{ "id": "health", "label": invalid, "prompt": "Check" }] }
+            }))
+            .unwrap();
+            let mut errors = Vec::new();
+            validate_contributions(std::slice::from_ref(&contribution), false, true, &plugin_dir, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains("invalid placeholder")
+                    || error.contains("unterminated")
+                    || error.contains("unmatched")),
+                "{invalid:?}: {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -2210,22 +2418,27 @@ mod tests {
         assert_eq!(declared, SUPPORTED_PLUGIN_PERMISSIONS.iter().map(|value| value.to_string()).collect::<Vec<_>>());
     }
 
-    /// The reason for the 1.3.0 bump: `engines.host_api` is how a plugin states
-    /// "I need the schema metadata API", so the advertised version has to
-    /// satisfy `^1.3` while a floor this host cannot meet stays rejected.
+    /// `engines.host_api` is how a plugin states "I need the schema metadata
+    /// API" / "I need clipboard reads" (1.3) or "I need data queries" (1.4), so
+    /// the advertised version has to satisfy each floor while a floor this host
+    /// cannot meet stays rejected.
     #[test]
     fn host_api_advertises_the_floor_a_schema_metadata_plugin_declares() {
         let advertised = semver::Version::parse(SUPPORTED_PLUGIN_HOST_API_VERSION)
             .expect("the advertised Host API version must be semver");
         assert!(
             semver::VersionReq::parse("^1.3").unwrap().matches(&advertised),
-            "the host must satisfy the schema metadata API floor it asks plugins to declare"
+            "the host must satisfy the schema metadata and clipboard-read floor it asks plugins to declare"
+        );
+        assert!(
+            semver::VersionReq::parse("^1.4").unwrap().matches(&advertised),
+            "the host must satisfy the data-query floor it asks plugins to declare"
         );
 
-        for requirement in ["^1.0", "^1.1", "^1.2", "^1.3", ">=1.1.0, <2.0.0"] {
+        for requirement in ["^1.0", "^1.1", "^1.2", "^1.3", "^1.4", ">=1.1.0, <2.0.0"] {
             assert!(host_api_requirement_errors(requirement).is_empty(), "{requirement} must be satisfiable");
         }
-        for requirement in [">=1.4.0", "^2.0"] {
+        for requirement in [">=1.5.0", "^2.0"] {
             assert!(!host_api_requirement_errors(requirement).is_empty(), "{requirement} must be rejected");
         }
     }
@@ -2251,22 +2464,153 @@ mod tests {
     }
 
     #[test]
-    fn accepts_connection_and_table_context_menu_targets() {
+    fn accepts_connection_and_table_context_menu_targets() -> Result<(), Box<dyn std::error::Error>> {
         for menu in ["connection", "table"] {
-            let (dir, manifest) = context_menu_manifest(menu);
+            let (dir, manifest) = context_menu_manifest(menu)?;
             let compatibility = manifest.compatibility(dir.path(), "0.1.0");
             assert!(compatibility.compatible, "{menu}: {:?}", compatibility.errors);
         }
+        Ok(())
     }
 
     #[test]
-    fn rejects_unsupported_context_menu_targets() {
-        let (dir, manifest) = context_menu_manifest("schema");
+    fn parses_and_accepts_declarative_context_menu_workbench_without_backend() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let plugin_dir = tempfile::tempdir()?;
+        let workbench: PluginContribution = serde_json::from_value(serde_json::json!({
+            "type": "workbench",
+            "id": "sample.main",
+            "label": "Sample"
+        }))?;
+        let context_menu: PluginContribution = serde_json::from_value(serde_json::json!({
+            "type": "context-menu",
+            "id": "sample.open",
+            "label": "Open Sample",
+            "menu": "connection",
+            "action": { "type": "open-workbench", "workbench": "sample.main" }
+        }))?;
+
+        let mut errors = Vec::new();
+        validate_contributions(&[workbench, context_menu], false, true, plugin_dir.path(), &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dangling_and_invalid_context_menu_actions() -> Result<(), Box<dyn std::error::Error>> {
+        let plugin_dir = tempfile::tempdir()?;
+        let dangling: PluginContribution = serde_json::from_value(serde_json::json!({
+            "type": "context-menu",
+            "id": "sample.open",
+            "label": "Open Missing",
+            "menu": "table",
+            "action": { "type": "open-workbench", "workbench": "sample.missing" }
+        }))?;
+        let mut errors = Vec::new();
+        validate_contributions(&[dangling], false, true, plugin_dir.path(), &mut errors);
+        assert!(errors.iter().any(|error| error.contains("Context menu 'sample.open' references missing workbench 'sample.missing'")), "{errors:?}");
+        assert!(!errors.iter().any(|error| error.contains("requires a backend entrypoint")), "{errors:?}");
+
+        let unknown_action = serde_json::from_value::<PluginContribution>(serde_json::json!({
+            "type": "context-menu",
+            "id": "sample.open",
+            "label": "Open",
+            "menu": "connection",
+            "action": { "type": "invoke-sidecar", "method": "contextMenu/sample.open" }
+        }));
+        assert!(unknown_action.is_err());
+
+        let command_only_fields = serde_json::from_value::<PluginContribution>(serde_json::json!({
+            "type": "context-menu",
+            "id": "sample.open",
+            "label": "Open",
+            "menu": "connection",
+            "action": { "type": "open-workbench", "workbench": "sample.main", "presentation": "panel" }
+        }));
+        assert!(command_only_fields.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_context_menu_still_requires_a_backend_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
+        let plugin_dir = tempfile::tempdir()?;
+        let legacy: PluginContribution = serde_json::from_value(serde_json::json!({
+            "type": "context-menu",
+            "id": "sample.legacy",
+            "label": "Legacy",
+            "menu": "connection"
+        }))?;
+
+        let mut errors = Vec::new();
+        validate_contributions(std::slice::from_ref(&legacy), false, false, plugin_dir.path(), &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "Context menu contribution 'sample.legacy' requires a backend entrypoint"),
+            "{errors:?}"
+        );
+
+        let mut errors = Vec::new();
+        validate_contributions(&[legacy], true, false, plugin_dir.path(), &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_context_menu_targets() -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, manifest) = context_menu_manifest("schema")?;
         let compatibility = manifest.compatibility(dir.path(), "0.1.0");
         assert!(!compatibility.compatible);
         assert!(compatibility.errors.iter().any(|error| {
             error == "Context menu 'io.dbx.example.inspect' declares unsupported menu 'schema'; only 'connection' and 'table' are available"
         }));
+        Ok(())
+    }
+
+    /// The runtime `PluginContribution` enum is the source of truth for
+    /// contribution `type` tags; the published schema's `contributions.oneOf`
+    /// must accept every one of them, or schema-validating tooling (CI,
+    /// editors) rejects manifests the host itself accepts. Adding a runtime
+    /// variant without extending the schema fails here.
+    #[test]
+    fn manifest_schema_lists_every_runtime_contribution_kind() {
+        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("plugins")
+            .join("manifest.schema.json");
+        let schema: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&schema_path).unwrap()).unwrap();
+        let referenced: Vec<String> = schema["properties"]["contributions"]["items"]["oneOf"]
+            .as_array()
+            .expect("contributions.items.oneOf must be an array")
+            .iter()
+            .map(|entry| {
+                entry["$ref"]
+                    .as_str()
+                    .expect("every oneOf entry must be a $ref")
+                    .trim_start_matches("#/$defs/")
+                    .to_string()
+            })
+            .collect();
+
+        // Mirrors the PluginContribution variants and their kebab-case serde
+        // tags; the schema def names append "Contribution".
+        let kinds = [
+            ("connection-provider", "connectionProviderContribution"),
+            ("workbench", "workbenchContribution"),
+            ("filesystem-provider", "filesystemProviderContribution"),
+            ("context-menu", "contextMenuContribution"),
+            ("result-view", "resultViewContribution"),
+            ("command", "commandContribution"),
+            ("menus", "menusContribution"),
+        ];
+        assert_eq!(referenced, kinds.iter().map(|(_, def)| def.to_string()).collect::<Vec<_>>());
+        for (tag, def) in kinds {
+            assert_eq!(
+                schema["$defs"][def]["properties"]["type"]["const"], tag,
+                "schema def {def} must pin the {tag:?} contribution type tag"
+            );
+        }
     }
 
     #[test]
@@ -2285,6 +2629,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(declared, ["connection", "table"]);
+        assert_eq!(
+            schema["$defs"]["contextMenuContribution"]["properties"]["action"]["$ref"],
+            "#/$defs/contextMenuAction"
+        );
+        assert_eq!(schema["$defs"]["contextMenuAction"]["properties"]["type"]["const"], "open-workbench");
+        assert_eq!(schema["$defs"]["contextMenuAction"]["required"], serde_json::json!(["type", "workbench"]));
     }
 
     #[test]

@@ -43,6 +43,7 @@ use crate::plugins::{
     PluginRuntimeEnv, PluginRuntimeProxy,
 };
 use crate::query_cancel::RunningQueries;
+use crate::salesforce_oauth::SfBrowserOpener;
 use crate::session_credentials::SessionCredentialStore;
 use crate::storage::{normalize_duckdb_worker_max_processes, Storage, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
 use crate::task_supervisor::TaskSupervisor;
@@ -118,6 +119,7 @@ pub enum PoolKind {
     Easysearch(db::easysearch_driver::EasysearchClient),
     Solr(db::solr_driver::SolrClient),
     Meilisearch(db::meilisearch_driver::MeilisearchClient),
+    Salesforce(db::salesforce_driver::SfClient),
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
@@ -367,6 +369,24 @@ struct SharedResourceBudget {
     semaphore: Arc<Semaphore>,
 }
 
+/// Cached Salesforce connected-user identity + org display name, serialized
+/// with camelCase field names for the frontend. `Deserialize` is derived too so
+/// the Web-mode MCP backend can decode the same JSON the desktop route emits.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesforceCurrentUser {
+    pub user_id: String,
+    pub name: String,
+    pub email: String,
+    pub organization_id: String,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_admin: Option<bool>,
+    pub org_name: String,
+}
+
 pub struct AppState {
     connections: Arc<RwLock<ConnectionPoolRegistry>>,
     task_supervisor: TaskSupervisor,
@@ -407,6 +427,7 @@ pub struct AppState {
     pub write_unlock_windows: crate::write_unlock::WriteUnlockWindows,
     metadata_gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     mongo_oidc_browser_opener: std::sync::RwLock<Option<MongoOidcBrowserOpener>>,
+    salesforce_browser_opener: std::sync::RwLock<Option<SfBrowserOpener>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
 }
@@ -1601,6 +1622,7 @@ impl AppState {
             write_unlock_windows: crate::write_unlock::WriteUnlockWindows::default(),
             metadata_gates: Arc::new(Mutex::new(HashMap::new())),
             mongo_oidc_browser_opener: std::sync::RwLock::new(None),
+            salesforce_browser_opener: std::sync::RwLock::new(None),
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
         }
@@ -1612,6 +1634,14 @@ impl AppState {
 
     pub fn mongo_oidc_browser_opener(&self) -> Option<MongoOidcBrowserOpener> {
         self.mongo_oidc_browser_opener.read().expect("MongoDB OIDC browser opener lock poisoned").clone()
+    }
+
+    pub fn set_salesforce_browser_opener(&self, opener: SfBrowserOpener) {
+        *self.salesforce_browser_opener.write().expect("Salesforce browser opener lock poisoned") = Some(opener);
+    }
+
+    pub fn salesforce_browser_opener(&self) -> Option<SfBrowserOpener> {
+        self.salesforce_browser_opener.read().expect("Salesforce browser opener lock poisoned").clone()
     }
 
     pub(crate) async fn acquire_metadata_permit(
@@ -2593,10 +2623,12 @@ impl AppState {
                 PoolKind::Postgres(pg_pool)
             }
             DatabaseType::Sqlite => {
-                if db::sqlite_worker::sqlite_ssh_worker_requested(&db_config) {
+                if db::sqlite_worker::sqlite_remote_worker_requested(&db_config) {
                     let transport_layers = self.resolved_transport_layers(&db_config).await?;
                     let worker = db::sqlite_worker::connect_sqlite_worker(
                         &self.tunnels,
+                        &self.proxy_tunnels,
+                        &self.http_tunnels,
                         &self.agent_manager,
                         self.storage.data_dir(),
                         connection_id,
@@ -2843,6 +2875,16 @@ impl AppState {
                 )?;
                 db::meilisearch_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::Meilisearch(client)
+            }
+            DatabaseType::Salesforce => {
+                let client = db::salesforce_driver::SfClient::from_config(
+                    &url,
+                    Some(&db_config.password),
+                    db_config.external_config.as_ref(),
+                    connect_timeout,
+                )?;
+                db::salesforce_driver::SfClient::test_connection(&client, connect_timeout).await?;
+                PoolKind::Salesforce(client)
             }
             DatabaseType::Hbase => {
                 let client = db::hbase_driver::HBaseClient::new(
@@ -3383,7 +3425,7 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<ConnectionEndpoint, String> {
         let transport_layers = self.resolved_transport_layers(config).await?;
-        if transport_layers.is_empty() || db::sqlite_worker::sqlite_ssh_worker_requested(config) {
+        if transport_layers.is_empty() || db::sqlite_worker::sqlite_remote_worker_requested(config) {
             return Ok(ConnectionEndpoint::direct(config.host.clone(), config.port));
         }
         if config.uses_oracle_tns() {
@@ -4210,6 +4252,17 @@ impl AppState {
                         Ok(()) => false,
                         Err(err) => {
                             log::warn!("Meilisearch connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Salesforce(client) => {
+                    let client = client.clone();
+                    let timeout = crate::db::connection_timeout();
+                    match db::salesforce_driver::SfClient::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("Salesforce connection pool '{pool_key}' is stale: {err}");
                             true
                         }
                     }
@@ -5197,6 +5250,8 @@ impl AppState {
         self.http_tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
         let sqlite_worker_prefix = db::sqlite_worker::sqlite_worker_chain_id(connection_id);
         self.tunnels.stop_tunnels_with_prefix(&sqlite_worker_prefix).await;
+        self.proxy_tunnels.stop_tunnels_with_prefix(&sqlite_worker_prefix).await;
+        self.http_tunnels.stop_tunnels_with_prefix(&sqlite_worker_prefix).await;
         db::transport_layer_tunnel::stop_transport_layers(
             connection_id,
             layer_count,
@@ -5247,6 +5302,38 @@ impl AppState {
             return Err("Connection pool is unhealthy".to_string());
         }
         Ok(())
+    }
+
+    /// Cached connected-user identity for a Salesforce connection. Returns a
+    /// camelCase-serializable struct for the frontend (identity badge, admin
+    /// warning). Errors when the connection is not Salesforce or has no pool.
+    pub async fn salesforce_current_user(&self, connection_id: &str) -> Result<SalesforceCurrentUser, String> {
+        let db_type = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).map(|c| c.db_type)
+        };
+        if db_type != Some(DatabaseType::Salesforce) {
+            return Err("Not a Salesforce connection".to_string());
+        }
+        let pool_key = base_pool_key_for(db_type, connection_id, None, false);
+        let pool = self.pool_handle(&pool_key).await.ok_or_else(|| "Connection not found".to_string())?;
+        match pool {
+            PoolKind::Salesforce(client) => {
+                let user = client.cached_current_user().await?;
+                let org_name = client.org_display_name().await;
+                Ok(SalesforceCurrentUser {
+                    user_id: user.user_id,
+                    name: user.name,
+                    email: user.email,
+                    organization_id: user.organization_id,
+                    username: user.username,
+                    profile_name: user.profile_name,
+                    is_admin: user.is_admin,
+                    org_name,
+                })
+            }
+            _ => Err("Not a Salesforce connection".to_string()),
+        }
     }
 
     /// Warm the driver/pool a tab is about to use, off the user's critical path.
@@ -5401,6 +5488,16 @@ impl AppState {
                         Ok(()) => true,
                         Err(e) => {
                             log::warn!("Meilisearch connection pool '{key}' is unhealthy: {e}");
+                            false
+                        }
+                    }
+                }
+                PoolKind::Salesforce(client) => {
+                    let client = client.clone();
+                    match db::salesforce_driver::SfClient::test_connection(&client, timeout).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("Salesforce connection pool '{key}' is unhealthy: {e}");
                             false
                         }
                     }
@@ -5796,6 +5893,7 @@ enum KeepaliveTarget {
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
     Easysearch(db::easysearch_driver::EasysearchClient),
+    Salesforce(db::salesforce_driver::SfClient),
     Solr(db::solr_driver::SolrClient),
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
@@ -5898,6 +5996,7 @@ fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Opt
         PoolKind::SqlServer(client) => Some(KeepaliveTarget::SqlServer(client.clone())),
         PoolKind::Elasticsearch(client) => Some(KeepaliveTarget::Elasticsearch(client.clone())),
         PoolKind::Easysearch(client) => Some(KeepaliveTarget::Easysearch(client.clone())),
+        PoolKind::Salesforce(client) => Some(KeepaliveTarget::Salesforce(client.clone())),
         PoolKind::Solr(client) => Some(KeepaliveTarget::Solr(client.clone())),
         PoolKind::HBase(client) => Some(KeepaliveTarget::HBase(client.clone())),
         PoolKind::VectorDb(client) => Some(KeepaliveTarget::VectorDb(client.clone())),
@@ -5946,6 +6045,9 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
         }
         KeepaliveTarget::Easysearch(client) => {
             db::easysearch_driver::test_connection(client, timeout).await.map_err(Into::into)
+        }
+        KeepaliveTarget::Salesforce(client) => {
+            db::salesforce_driver::SfClient::test_connection(client, timeout).await.map_err(Into::into)
         }
         KeepaliveTarget::Solr(client) => db::solr_driver::test_connection(client, timeout).await.map_err(Into::into),
         KeepaliveTarget::HBase(client) => {
@@ -6256,22 +6358,26 @@ fn session_scoped_pool_key_for(
 
 /// 两个运行态连接配置是否视为同一连接（用于决定是否销毁连接池）。
 ///
-/// 仅当双方都是 `save_password=false` 时才忽略 `password` 字段的差异：这类连接
-/// 在 connect 时运行态配置可能携带会话密码，持久化同步后为空，这种空值差异不应
-/// 触发池重建。若任一方 `save_password=true`，密码是真实的连接参数，任何密码变更
-/// （包括用户保存了新密码）都必须销毁旧池，否则旧池会继续用旧密码认证。
+/// 始终忽略只影响前端导航的表加载策略。仅当双方都是 `save_password=false` 时才忽略
+/// `password` 字段的差异：这类连接在 connect 时运行态配置可能携带会话密码，持久化
+/// 同步后为空，这种空值差异不应触发池重建。若任一方 `save_password=true`，密码是
+/// 真实的连接参数，任何密码变更（包括用户保存了新密码）都必须销毁旧池，否则旧池会
+/// 继续用旧密码认证。
 pub fn connection_configs_pool_equivalent(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
     if a == b {
         return true;
     }
+    let mut a = a.clone();
+    let mut b = b.clone();
+    // Sidebar paging is a presentation preference and cannot change an
+    // established database session.
+    a.sidebar_auto_load_all_tables = false;
+    b.sidebar_auto_load_all_tables = false;
     if !a.save_password && !b.save_password {
-        let mut a = a.clone();
         a.password.clear();
-        let mut b = b.clone();
         b.password.clear();
-        return a == b;
     }
-    false
+    a == b
 }
 
 /// Whether transient credentials can safely survive a persisted config update.
@@ -6291,6 +6397,7 @@ pub fn connection_configs_session_credentials_compatible(a: &ConnectionConfig, b
         config.visible_databases = None;
         config.visible_schemas = None;
         config.show_system_schemas = false;
+        config.sidebar_auto_load_all_tables = false;
         config.color = None;
         config.docs_notes_path = None;
         config.connect_timeout_secs = 0;
@@ -6370,6 +6477,7 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::Easysearch(client) => PoolKind::Easysearch(client.clone()),
         PoolKind::Solr(client) => PoolKind::Solr(client.clone()),
         PoolKind::Meilisearch(client) => PoolKind::Meilisearch(client.clone()),
+        PoolKind::Salesforce(client) => PoolKind::Salesforce(client.clone()),
         PoolKind::HBase(client) => PoolKind::HBase(client.clone()),
         PoolKind::VectorDb(client) => PoolKind::VectorDb(client.clone()),
         PoolKind::InfluxDb(client) => PoolKind::InfluxDb(client.clone()),
@@ -6432,6 +6540,9 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
             drop(client);
         }
         PoolKind::Meilisearch(client) => {
+            drop(client);
+        }
+        PoolKind::Salesforce(client) => {
             drop(client);
         }
         PoolKind::HBase(client) => {
@@ -6534,6 +6645,7 @@ fn base_pool_key_for_with_catalog(
                         | DatabaseType::Milvus
                         | DatabaseType::Weaviate
                         | DatabaseType::ChromaDb
+                        | DatabaseType::Salesforce
                 ));
         is_single && (!database_capabilities::is_agent_type(db_type) || shares_database_pool_with_connection(db_type))
     });
@@ -6822,7 +6934,6 @@ mod tests {
     };
     use crate::query;
     use crate::schema;
-    use crate::storage::Storage;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -6847,6 +6958,7 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -6943,6 +7055,16 @@ mod tests {
     }
 
     #[test]
+    fn connection_configs_pool_equivalent_ignores_sidebar_table_loading_preference() {
+        let a = mysql_config(None);
+        let mut b = a.clone();
+        b.sidebar_auto_load_all_tables = true;
+
+        assert!(connection_configs_pool_equivalent(&a, &b));
+        assert!(connection_configs_pool_equivalent(&b, &a));
+    }
+
+    #[test]
     fn connection_configs_pool_equivalent_detects_saved_password_change() {
         let mut a = mysql_config(None);
         a.save_password = true;
@@ -7036,7 +7158,7 @@ mod tests {
     async fn apply_session_credential_injects_saved_password_only_for_no_save_connections() {
         let dir = std::env::temp_dir().join(format!("dbx-core-session-cred-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let _ = state.session_credentials.set("", "conn-a", "s3cret");
 
@@ -7070,7 +7192,7 @@ mod tests {
     async fn apply_session_credential_reads_owner_scoped_credentials_only() {
         let dir = std::env::temp_dir().join(format!("dbx-core-session-cred-owner-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
 
         let mut config = mysql_config(None);
@@ -7102,7 +7224,7 @@ mod tests {
     async fn pool_credential_owner_mismatch_prevents_cross_session_pool_reuse() {
         let dir = std::env::temp_dir().join(format!("dbx-core-pool-owner-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
 
         let mut config = mysql_config(None);
@@ -7307,6 +7429,7 @@ mod tests {
             affected_rows: 0,
             execution_time_ms: 1,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
@@ -7716,7 +7839,7 @@ mod tests {
     async fn test_app_state() -> (AppState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("dbx-core-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         (AppState::new(storage), dir)
     }
 
@@ -7960,7 +8083,7 @@ mod tests {
     async fn app_state_uses_explicit_agent_dir() {
         let dir = std::env::temp_dir().join(format!("dbx-core-agent-dir-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let agent_dir = dir.join("agents");
 
         let state = AppState::new_with_plugin_and_agent_dir_and_app_version(
@@ -8225,7 +8348,7 @@ mod tests {
     async fn jdbc_plugin_env_uses_managed_jre_when_installed() {
         let dir = std::env::temp_dir().join(format!("dbx-core-jdbc-managed-jre-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_and_agent_dir_and_app_version(
             storage,
             dir.join("plugins"),
@@ -8245,7 +8368,7 @@ mod tests {
     async fn jdbc_plugin_env_keeps_wrapper_fallback_when_managed_jre_is_missing() {
         let dir = std::env::temp_dir().join(format!("dbx-core-jdbc-missing-jre-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_and_agent_dir_and_app_version(
             storage,
             dir.join("plugins"),
@@ -8263,7 +8386,7 @@ mod tests {
     async fn jdbc_plugin_env_uses_custom_java_runtime() {
         let dir = std::env::temp_dir().join(format!("dbx-core-jdbc-custom-jre-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_and_agent_dir_and_app_version(
             storage,
             dir.join("plugins"),
@@ -8995,6 +9118,20 @@ mod tests {
             assert!(!uses_tcp_probe(&config, "192.0.2.10", config.port), "{db_type:?} ip");
             assert!(uses_tcp_probe(&config, "127.0.0.1", 54000), "{db_type:?} forwarded");
         }
+    }
+
+    #[test]
+    fn salesforce_connections_never_use_a_tcp_probe() {
+        // Salesforce reaches a cloud HTTPS endpoint through one pooled client, so the
+        // manifest sets skipTcpProbe: a raw TCP pre-flight is meaningless even for a
+        // forwarded local endpoint.
+        let mut config = mysql_config(Some("app"));
+        config.db_type = DatabaseType::Salesforce;
+        config.host = "acme.my.salesforce.com".to_string();
+        config.port = 443;
+
+        assert!(!uses_tcp_probe(&config, "acme.my.salesforce.com", 443), "instance url");
+        assert!(!uses_tcp_probe(&config, "127.0.0.1", 54000), "forwarded");
     }
 
     #[test]

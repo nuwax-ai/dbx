@@ -1,11 +1,13 @@
 // @vitest-environment happy-dom
 
 import { readFileSync } from "node:fs";
-import { nextTick } from "vue";
+import { createApp, defineComponent, h, nextTick } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createPinia, setActivePinia } from "pinia";
 import { dispatch, findAll, findOne, hostText, mountComponent } from "./vueHostHarness";
 import type { DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 
+const settingsMock = vi.hoisted(() => ({ store: null as any }));
 const mocks = vi.hoisted(() => ({
   editor: { create: vi.fn(), destroy: vi.fn(), setValue: vi.fn(), openSearch: vi.fn() },
   updateSettings: vi.fn(),
@@ -16,40 +18,15 @@ const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
 }));
 
-vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
+vi.mock("vue-i18n", () => ({
+  useI18n: () => ({ t: (key: string) => key, locale: { value: "en" } }),
+  // DataGrid.vue's import graph reaches @/i18n, which builds a real i18n instance at module scope.
+  createI18n: () => ({ install: () => {}, global: { t: (key: string) => key, locale: { value: "en" } } }),
+}));
 vi.mock("@lucide/vue", async () => {
   const { createPassthroughStub } = await import("./vueHostHarness");
   const icon = createPassthroughStub("Icon", "i");
-  return {
-    Check: icon,
-    CaseSensitive: icon,
-    ChevronDown: icon,
-    ChevronUp: icon,
-    ChevronLeft: icon,
-    ChevronRight: icon,
-    ChevronsLeft: icon,
-    ChevronsRight: icon,
-    Download: icon,
-    ChevronsDown: icon,
-    Filter: icon,
-    Focus: icon,
-    FileDiff: icon,
-    Loader2: icon,
-    FileUp: icon,
-    Upload: icon,
-    Search: icon,
-    X: icon,
-    Code2: icon,
-    Copy: icon,
-    Eye: icon,
-    EyeOff: icon,
-    GripVertical: icon,
-    Info: icon,
-    Pencil: icon,
-    Plus: icon,
-    RotateCcw: icon,
-    Trash2: icon,
-  };
+  return new Proxy({}, { get: (_target, key) => (key === "__esModule" ? false : icon), has: () => true });
 });
 
 vi.mock("@/components/ui/button", async () => ({ Button: (await import("./vueHostHarness")).createPassthroughStub("Button", "button") }));
@@ -72,7 +49,7 @@ vi.mock("@/components/ui/dropdown-menu", async () => {
 });
 vi.mock("@/components/ui/popover", async () => {
   const { createPassthroughStub } = await import("./vueHostHarness");
-  return { Popover: createPassthroughStub("Popover"), PopoverContent: createPassthroughStub("PopoverContent"), PopoverTrigger: createPassthroughStub("PopoverTrigger") };
+  return { Popover: createPassthroughStub("Popover"), PopoverAnchor: createPassthroughStub("PopoverAnchor"), PopoverContent: createPassthroughStub("PopoverContent"), PopoverTrigger: createPassthroughStub("PopoverTrigger") };
 });
 vi.mock("@/components/ui/tooltip", async () => {
   const { createPassthroughStub } = await import("./vueHostHarness");
@@ -90,8 +67,24 @@ vi.mock("@/components/ui/LightTooltip.vue", async () => ({ default: (await impor
 vi.mock("@/components/grid/TemporalCellEditor.vue", async () => ({ default: (await import("./vueHostHarness")).createPassthroughStub("TemporalCellEditor") }));
 vi.mock("@/components/grid/DataGridValueTransform.vue", async () => ({ default: (await import("./vueHostHarness")).createPassthroughStub("DataGridValueTransform") }));
 vi.mock("@/composables/useCellDetailEditor", () => ({ useCellDetailEditor: () => mocks.editor }));
-vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: { value: false }, themePalette: { value: {} } }) }));
-vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: { cellDetailJsonFormatted: true, theme: "default", fontSize: 13, fontFamily: "monospace" }, updateEditorSettings: mocks.updateSettings }) }));
+vi.mock("@/composables/useTheme", async () => {
+  const { ref } = await import("vue");
+  // Real refs: DataGrid.vue both watches isDark and binds it to a Boolean prop.
+  const isDark = ref(false);
+  const themePalette = ref({});
+  return { useTheme: () => ({ isDark, themePalette }) };
+});
+vi.mock("@/stores/settingsStore", async () => {
+  const actual = await vi.importActual<typeof import("@/stores/settingsStore")>("@/stores/settingsStore");
+  const { reactive } = await import("vue");
+  // Reactive and complete: DataGrid.vue reads dozens of editor settings and must
+  // re-render when a test flips one.
+  settingsMock.store = {
+    editorSettings: reactive({ ...actual.DEFAULT_EDITOR_SETTINGS, cellDetailJsonFormatted: true, theme: "default", fontSize: 13, fontFamily: "monospace" }),
+    updateEditorSettings: mocks.updateSettings,
+  };
+  return { ...actual, useSettingsStore: () => settingsMock.store };
+});
 vi.mock("@/lib/dataGrid/geometryPreview", () => ({ isHexGeometry: () => false, renderWktOnCanvas: mocks.renderWkt }));
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: mocks.copyToClipboard }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
@@ -107,8 +100,10 @@ vi.mock("@/composables/useDataGridCellDetail", async () => {
 
 import DataGridCellDetailDialog from "@/components/grid/DataGridCellDetailDialog.vue";
 import DataGridCellDetailPanel from "@/components/grid/DataGridCellDetailPanel.vue";
+import DataGrid from "@/components/grid/DataGrid.vue";
 import DataGridColumnHeader from "@/components/grid/DataGridColumnHeader.vue";
 import DataGridCopyColumnNamesDialog from "@/components/grid/DataGridCopyColumnNamesDialog.vue";
+import DataGridDistinctValuePopover from "@/components/grid/DataGridDistinctValuePopover.vue";
 import DataGridFilterBuilder from "@/components/grid/DataGridFilterBuilder.vue";
 import DataGridFilterWorkbench from "@/components/grid/DataGridFilterWorkbench.vue";
 import DataGridTextFilterWorkbench from "@/components/grid/DataGridTextFilterWorkbench.vue";
@@ -119,6 +114,14 @@ import DataGridSearchBar from "@/components/grid/DataGridSearchBar.vue";
 const cellDetailPanelSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailPanel.vue", "utf8");
 const cellDetailDialogSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailDialog.vue", "utf8");
 const binaryTextPreviewSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailTextPreview.vue", "utf8");
+const dataGridSource = readFileSync("apps/desktop/src/components/grid/DataGrid.vue", "utf8");
+
+describe("DataGrid opaque aggregate-state safety", () => {
+  it("blocks cell edits and keyless row deletion through the centralized gates", () => {
+    expect(dataGridSource).toMatch(/function canEditCellItem[\s\S]*isOpaqueAggregateStateColumnType\(allColumnTypes\.value\[columnIndex\]\)/);
+    expect(dataGridSource).toMatch(/function canDeleteRowItem[\s\S]*canUseKeylessRowPredicate[\s\S]*hasUnsafeOpaqueAggregateStatePredicate\(allColumnTypes\.value, item\.data\)/);
+  });
+});
 
 function detail(patch: Partial<DataGridCellDetail> = {}): DataGridCellDetail {
   return {
@@ -627,6 +630,41 @@ describe("DataGridFilterBuilder", () => {
     expect(buttons()[0].props.disabled).toBe(true);
   });
 
+  it("labels panel rule actions and allows removing the final rule", async () => {
+    const updateRule = vi.fn();
+    const remove = vi.fn();
+    const mounted = mountComponent(DataGridFilterBuilder, {
+      rules: [{ id: "r1", columnName: "id", mode: "equals", rawValue: "7", rawEndValue: "", conjunction: "AND" }],
+      columns: ["id"],
+      filteredColumns: ["id"],
+      modeOptions: [{ value: "equals", labelKey: "equals" }],
+      columnSearch: "",
+      layout: "panel",
+      showApplyOnly: true,
+      onUpdateRule: updateRule,
+      onRemove: remove,
+    });
+
+    const tooltips = () => findAll(mounted.root, (node) => node.props["data-stub"] === "LightTooltip");
+    const tooltipTexts = () => tooltips().map((node) => node.props.text);
+    const applyOnlyButton = findOne(mounted.root, (node) => node.props["aria-label"] === "grid.filterBuilderApplyOnly");
+    const toggleButton = findOne(mounted.root, (node) => node.props["aria-label"] === "grid.filterBuilderDisableRule");
+    const removeButton = findOne(mounted.root, (node) => node.props["aria-label"] === "common.remove");
+
+    expect(tooltipTexts()).toEqual(["grid.filterBuilderApplyOnly", "grid.filterBuilderDisableRule", "common.remove"]);
+    expect(tooltips().every((tooltip) => tooltip.props.side === "top")).toBe(true);
+    expect(removeButton.props.disabled).toBeFalsy();
+    dispatch(toggleButton, "click");
+    dispatch(removeButton, "click");
+    expect(updateRule).toHaveBeenCalledWith("r1", { disabled: true });
+    expect(remove).toHaveBeenCalledWith("r1");
+
+    await mounted.setProps({ rules: [{ id: "r1", columnName: "id", mode: "equals", rawValue: "7", rawEndValue: "", conjunction: "AND", disabled: true }] });
+    expect(findOne(mounted.root, (node) => node.props["aria-label"] === "grid.filterBuilderEnableRule")).toBeTruthy();
+    expect(tooltipTexts()).toEqual(["grid.filterBuilderApplyOnly", "grid.filterBuilderEnableRule", "common.remove"]);
+    expect(applyOnlyButton.props["aria-label"]).toBe("grid.filterBuilderApplyOnly");
+  });
+
   it("renders a compact text rule without framed form controls", async () => {
     const updateRule = vi.fn();
     const add = vi.fn();
@@ -1104,6 +1142,50 @@ describe("DataGridQueryControls", () => {
     expect(popoverContent.props["collision-padding"]).toBe(8);
   });
 
+  it("forwards database value suggestions in the quick filter popover", () => {
+    const openValueSuggestions = vi.fn();
+    const closeValueSuggestions = vi.fn();
+    const mounted = mountComponent(DataGridQueryControls, {
+      whereInput: "",
+      orderByInput: "",
+      columns: ["status"],
+      conditionColumns: ["status"],
+      historyScope: {},
+      canUseWhereSearch: true,
+      compact: false,
+      leadingBorder: false,
+      filterBuilderOpen: true,
+      filterEditorView: "quick",
+      filterButtonActive: false,
+      filterButtonCount: 0,
+      hasLocalColumnFilters: false,
+      localFilterCount: 0,
+      localFilterSummaries: [],
+      rules: [{ id: "r1", columnName: "status", mode: "equals", rawValue: "", rawEndValue: "", conjunction: "AND" }],
+      filteredColumns: ["status"],
+      modeOptions: [{ value: "equals", labelKey: "equals" }],
+      columnSearch: "",
+      valueSuggestions: { search: "", options: [], loading: false, error: "", limited: false, limit: 1000, selectedKeys: new Set<string>() },
+      applyWhere: vi.fn(),
+      applyOrderBy: vi.fn(),
+      clearOrderBy: vi.fn(),
+      onOpenValueSuggestions: openValueSuggestions,
+      onCloseValueSuggestions: closeValueSuggestions,
+    });
+
+    expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(1);
+    const suggestionPopover = findOne(mounted.root, (node) => node.props["data-stub"] === "Popover" && node.props.open === false);
+    const openHandler = suggestionPopover.props["onUpdate:open"];
+    for (const callback of Array.isArray(openHandler) ? openHandler : [openHandler]) callback(true);
+
+    expect(openValueSuggestions).toHaveBeenCalledWith("r1", "value");
+
+    const quickFilterPopover = findOne(mounted.root, (node) => node.props["data-stub"] === "Popover" && node.props.open === true);
+    const closeHandler = quickFilterPopover.props["onUpdate:open"];
+    for (const callback of Array.isArray(closeHandler) ? closeHandler : [closeHandler]) callback(false);
+    expect(closeValueSuggestions).toHaveBeenCalledOnce();
+  });
+
   it("keeps filter actions available in the popover", () => {
     const addRule = vi.fn();
     const clearFilters = vi.fn();
@@ -1215,7 +1297,121 @@ describe("DataGridQueryControls", () => {
   });
 });
 
+describe("DataGridDistinctValuePopover", () => {
+  it("renders counts and distinct loading, error, and limit states", async () => {
+    const mounted = mountComponent(DataGridDistinctValuePopover, {
+      open: true,
+      search: "",
+      options: [{ key: "str:open", label: "open", count: 12, value: "open" }],
+      loading: true,
+      error: "",
+      limited: false,
+      limit: 1000,
+    });
+    expect(hostText(mounted.root)).toContain("grid.loadingValues");
+    expect(hostText(mounted.root)).toContain("open");
+    expect(hostText(mounted.root)).toContain("12");
+
+    await mounted.setProps({ loading: false, error: "query failed", options: [] });
+    expect(hostText(mounted.root)).toContain("query failed");
+    expect(hostText(mounted.root)).not.toContain("grid.noSearchResults");
+
+    await mounted.setProps({ error: "", limited: true });
+    expect(hostText(mounted.root)).toContain("grid.serverValuesLimited");
+  });
+
+  it("selects all displayed candidates and matches the database-value filter checkbox state", async () => {
+    const toggleAll = vi.fn();
+    const options = [
+      { key: "str:open", label: "open", count: 12, value: "open" },
+      { key: "str:closed", label: "closed", count: 4, value: "closed" },
+    ];
+    const mounted = mountComponent(DataGridDistinctValuePopover, {
+      open: true,
+      search: "",
+      options,
+      loading: false,
+      error: "",
+      limited: false,
+      limit: 1000,
+      multiple: true,
+      selectedKeys: new Set<string>(),
+      onToggleAll: toggleAll,
+    });
+    const findSelectAll = () => findOne(mounted.root, (node) => node.props["data-distinct-value-select-all"] === "");
+
+    expect(findSelectAll().props["aria-checked"]).toBe(false);
+    dispatch(findSelectAll(), "click");
+    expect(toggleAll).toHaveBeenCalledOnce();
+
+    await mounted.setProps({ selectedKeys: new Set(["str:open"]) });
+    expect(findSelectAll().props["aria-checked"]).toBe(false);
+
+    await mounted.setProps({ selectedKeys: new Set(options.map((option) => option.key)) });
+    expect(findSelectAll().props["aria-checked"]).toBe(true);
+  });
+});
+
 describe("DataGridFilterWorkbench", () => {
+  it("shows database value suggestions only for enabled value rules in the conditions panel", async () => {
+    const openSuggestions = vi.fn();
+    const valueSuggestions = {
+      ruleId: undefined,
+      target: undefined,
+      search: "",
+      options: [],
+      loading: false,
+      error: "",
+      limited: false,
+      limit: 1000,
+      selectedKeys: new Set<string>(),
+    };
+    const mounted = mountComponent(DataGridFilterWorkbench, {
+      sqlPreview: "",
+      rules: [{ id: "r1", columnName: "status", mode: "equals", rawValue: "", rawEndValue: "", conjunction: "AND" }],
+      columns: ["status"],
+      filteredColumns: ["status"],
+      modeOptions: [
+        { value: "equals", labelKey: "equals" },
+        { value: "is-null", labelKey: "is-null" },
+      ],
+      columnSearch: "",
+      valueSuggestions,
+      onOpenValueSuggestions: openSuggestions,
+    });
+
+    expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(1);
+    const openHandler = findOne(mounted.root, (node) => node.props["data-stub"] === "Popover").props["onUpdate:open"];
+    for (const callback of Array.isArray(openHandler) ? openHandler : [openHandler]) callback(true);
+    expect(openSuggestions).toHaveBeenCalledWith("r1", "value");
+
+    await mounted.setProps({ rules: [{ id: "r1", columnName: "status", mode: "equals", rawValue: "", rawEndValue: "", conjunction: "AND", disabled: true }] });
+    expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(0);
+
+    await mounted.setProps({ rules: [{ id: "r1", columnName: "status", mode: "is-null", rawValue: "", rawEndValue: "", conjunction: "AND" }] });
+    expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(0);
+
+    await mounted.setProps({ rules: [{ id: "r1", columnName: "status", mode: "between", rawValue: "", rawEndValue: "", conjunction: "AND" }] });
+    expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(2);
+
+    await mounted.setProps({ rules: [{ id: "r1", columnName: "status", mode: "in", rawValue: "", rawEndValue: "", conjunction: "AND" }] });
+    expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(1);
+  });
+
+  it("exposes value suggestions in the reusable popover builder when provided", () => {
+    const mounted = mountComponent(DataGridFilterBuilder, {
+      rules: [{ id: "r1", columnName: "status", mode: "equals", rawValue: "", rawEndValue: "", conjunction: "AND" }],
+      columns: ["status"],
+      filteredColumns: ["status"],
+      modeOptions: [{ value: "equals", labelKey: "equals" }],
+      columnSearch: "",
+      layout: "popover",
+      valueSuggestions: { search: "", options: [], loading: false, error: "", limited: false, limit: 1000, selectedKeys: new Set<string>() },
+    });
+
+    expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(1);
+  });
+
   it("scrolls to the newest rule when a condition is added", async () => {
     const requestAnimationFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
       callback(0);
@@ -1341,6 +1537,57 @@ describe("DataGridFilterWorkbench", () => {
 });
 
 describe("DataGridTextFilterWorkbench", () => {
+  it("shows and forwards database value suggestions in the text filter panel", async () => {
+    const openValueSuggestions = vi.fn();
+    const closeValueSuggestions = vi.fn();
+    const valueSuggestions = {
+      ruleId: undefined,
+      target: undefined,
+      search: "",
+      options: [],
+      loading: false,
+      error: "",
+      limited: false,
+      limit: 1000,
+      selectedKeys: new Set<string>(),
+    };
+    const mounted = mountComponent(DataGridTextFilterWorkbench, {
+      height: 168,
+      sqlPreview: "",
+      rules: [{ id: "r1", columnName: "status", mode: "equals", rawValue: "", rawEndValue: "", conjunction: "AND" }],
+      columns: ["status"],
+      filteredColumns: ["status"],
+      modeOptions: [
+        { value: "equals", labelKey: "equals" },
+        { value: "between", labelKey: "between" },
+        { value: "in", labelKey: "in" },
+      ],
+      columnSearch: "",
+      valueSuggestions,
+      onOpenValueSuggestions: openValueSuggestions,
+      onCloseValueSuggestions: closeValueSuggestions,
+    });
+
+    const suggestionButtons = () => findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter");
+    expect(suggestionButtons()).toHaveLength(1);
+    expect(String(suggestionButtons()[0].props.class)).toContain("h-6");
+
+    const suggestionPopover = findOne(mounted.root, (node) => node.props["data-stub"] === "Popover" && node.props.open === false);
+    const openHandler = suggestionPopover.props["onUpdate:open"];
+    for (const callback of Array.isArray(openHandler) ? openHandler : [openHandler]) callback(true);
+    expect(openValueSuggestions).toHaveBeenCalledWith("r1", "value");
+
+    await mounted.setProps({ rules: [{ id: "r1", columnName: "status", mode: "between", rawValue: "", rawEndValue: "", conjunction: "AND" }] });
+    expect(suggestionButtons()).toHaveLength(2);
+
+    await mounted.setProps({ rules: [{ id: "r1", columnName: "status", mode: "in", rawValue: "", rawEndValue: "", conjunction: "AND" }] });
+    expect(suggestionButtons()).toHaveLength(1);
+    expect(findAll(mounted.root, (node) => node.props["data-distinct-value-select-all"] === "")).toHaveLength(1);
+
+    mounted.unmount();
+    expect(closeValueSuggestions).toHaveBeenCalledOnce();
+  });
+
   it("exposes a persisted keyboard-resizable text filter panel", async () => {
     const ensureRule = vi.fn();
     const updateHeight = vi.fn();
@@ -1868,5 +2115,46 @@ describe("DataGridCopyColumnNamesDialog", () => {
     findOne(mounted.root, (node) => node.props["data-stub"] === "Select").props["onUpdate:modelValue"]("bogus");
     await nextTick();
     expect(previewText(mounted)).toBe("id\ttype");
+  });
+});
+
+describe("DataGrid column header tooltips", () => {
+  // The rest of this file drives leaf components through the host renderer, but
+  // DataGrid.vue touches the DOM directly (querySelector/observers), so this
+  // case mounts it into happy-dom instead.
+  function mountDataGrid() {
+    setActivePinia(createPinia());
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp(defineComponent({ setup: () => () => h(DataGrid, { result: { columns: ["id", "name"], rows: [[1, "a"]] } }) }));
+    app.mount(host);
+    return {
+      host,
+      // `disabled` is not one of Vue's special boolean attributes, so binding it
+      // on the LightTooltip stub's <div> renders the literal "true"/"false".
+      headerTooltipsDisabled: () => [...host.querySelectorAll('[data-grid-column-index] [data-stub="LightTooltip"]')].map((node) => node.getAttribute("disabled") === "true"),
+      destroy() {
+        app.unmount();
+        host.remove();
+      },
+    };
+  }
+
+  it("follows the showColumnHeaderTooltips preference", async () => {
+    const grid = mountDataGrid();
+    await nextTick();
+
+    expect(settingsMock.store.editorSettings.showColumnHeaderTooltips).toBe(true);
+    expect(grid.headerTooltipsDisabled()).toEqual([false, false]);
+
+    settingsMock.store.editorSettings.showColumnHeaderTooltips = false;
+    await nextTick();
+    expect(grid.headerTooltipsDisabled()).toEqual([true, true]);
+
+    settingsMock.store.editorSettings.showColumnHeaderTooltips = true;
+    await nextTick();
+    expect(grid.headerTooltipsDisabled()).toEqual([false, false]);
+
+    grid.destroy();
   });
 });

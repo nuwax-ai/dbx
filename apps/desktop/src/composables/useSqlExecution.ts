@@ -424,10 +424,11 @@ export function useSqlExecution(deps: {
       return;
     }
     const statementCount = splitSqlStatementRanges(sql, executionDatabaseType, sqlStatementParameterOptionsForCompatibility(executionDatabaseType, executionDatabaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(tab.connectionId, tab.database) : undefined)).length;
+    const redisConsoleSelected = executionDatabaseType === "redis" && tab.uiState?.redisResultViewMode === "console";
     // Output-view switching belongs to the tab the user is looking at — both
     // when the query starts and when it finishes.
     if (deps.activeTab.value?.id === executionTabId) {
-      deps.activeOutputView.value = statementCount > 1 ? settingsStore.editorSettings.multiStatementDefaultView : "result";
+      deps.activeOutputView.value = redisConsoleSelected ? "result" : statementCount > 1 ? settingsStore.editorSettings.multiStatementDefaultView : "result";
     }
     const connName = executionConnection?.name || "";
     const start = Date.now();
@@ -981,7 +982,7 @@ export function supportsSqlTemplateParameters(connection: Pick<ConnectionConfig,
   if (!connection) return false;
   if (connection.db_type === "meilisearch" || connection.db_type === "solr") return false;
   if (connection.db_type === "elasticsearch" || connection.db_type === "easysearch") return !isElasticsearchRestRequestText(sql);
-  return connection.db_type !== "redis" && connection.db_type !== "mongodb" && connection.db_type !== "victoriametrics";
+  return connection.db_type !== "redis" && connection.db_type !== "mongodb" && connection.db_type !== "victoriametrics" && connection.db_type !== "salesforce";
 }
 
 export function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionConfig | undefined, _sql = ""): boolean {

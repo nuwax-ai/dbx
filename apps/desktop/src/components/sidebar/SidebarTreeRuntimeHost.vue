@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, watch, onBeforeUnmount, inject, reactive, ref, shallowRef } from "vue";
-import { createRoutedSidebarDialogController } from "./sidebarDialogControllerRouting";
+import { computed, nextTick, watch, onBeforeUnmount, onScopeDispose, inject, reactive, ref, shallowRef } from "vue";
+import { createRoutedSidebarDialogController, routedCanSetCreateDatabaseCharset } from "./sidebarDialogControllerRouting";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useSidebarDataOpenRuntime } from "@/composables/useSidebarDataOpenRuntime";
 import { useSidebarConnectionMutationRuntime } from "@/composables/useSidebarConnectionMutationRuntime";
@@ -34,6 +34,7 @@ import {
   Eye,
   Upload,
   FileCode,
+  FileText,
   Network,
   PencilRuler,
   Search,
@@ -72,8 +73,9 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { useToast } from "@/composables/useToast";
 import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
-import { buildPluginTableContextMenuInvocation } from "@/lib/plugins/pluginContext";
-import type { InstalledPlugin } from "@/types/database";
+import { activatePluginContextMenuItem, buildPluginConnectionContextMenuInvocation, buildPluginTableContextMenuInvocation } from "@/lib/plugins/pluginContext";
+import type { PluginContextMenuInvocation } from "@/lib/plugins/pluginContext";
+import type { InstalledPlugin, PluginContextMenuContribution } from "@/types/database";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
 import * as api from "@/lib/backend/api";
@@ -85,7 +87,18 @@ import { canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTr
 import { sidebarConnectionVisibleFilterMenu } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { supportsSidebarObjectNameFilter } from "@/lib/sidebar/sidebarObjectNameFilter";
 import { connectionGroupDestinationRows } from "@/lib/sidebar/sidebarLayout";
-import { hasTableVGroupEntries, isTableVGroupContainerNode, isTableVGroupGroupableRowType, resolveTableVGroupScopeFromNode, selectedTableVGroupMoveTargets, tableVGroupDestinationRows, tableVGroupPathForTable, tableVGroupScopeKey, tableVGroupsEnabled } from "@/lib/table/tableVGroup";
+import {
+  hasTableTreeLoadMore,
+  hasTableVGroupEntries,
+  isTableVGroupContainerNode,
+  isTableVGroupGroupableRowType,
+  resolveTableVGroupScopeFromNode,
+  selectedTableVGroupMoveTargets,
+  tableVGroupDestinationRows,
+  tableVGroupPathForTable,
+  tableVGroupScopeKey,
+  tableVGroupsEnabled,
+} from "@/lib/table/tableVGroup";
 import { objectTypesForGroupNode } from "@/lib/table/tableTree";
 import { loadSidebarObjectGroup } from "@/lib/sidebar/sidebarObjectGroupRouting";
 import { requestObjectBrowserSearchFocus } from "@/lib/tabs/objectBrowserSearchFocus";
@@ -112,6 +125,7 @@ import {
   supportsAiAssistantContext,
   supportsFieldLineage,
   supportsObjectBrowserTreeNode,
+  supportsDataDictionary,
   supportsSchemaDiagram,
   supportsSqlFileExecution,
   supportsTableImport,
@@ -374,12 +388,22 @@ const { toast } = useToast();
 const installedPlugins = ref<InstalledPlugin[]>([]);
 const sidebarPluginRegistry = computed(() => createFrontendPluginRegistry(installedPlugins.value, appLocale.value));
 
-void api.listPlugins().then(
-  (plugins) => {
+async function refreshInstalledPlugins() {
+  try {
+    const plugins = await api.listPlugins();
     installedPlugins.value = plugins.filter((plugin) => plugin.compatibility.compatible);
-  },
-  () => {},
-);
+  } catch {
+    // Keep the previous list: an empty registry would drop live plugin context-menu entries.
+  }
+}
+
+// Plugin install/update/uninstall from the Plugin Center broadcasts this event;
+// without it the sidebar registry keeps the mount-time snapshot and the Table /
+// Connection context menus stay empty until DBX restarts.
+const onPluginsChanged = () => void refreshInstalledPlugins();
+window.addEventListener("dbx:plugins-changed", onPluginsChanged);
+onScopeDispose(() => window.removeEventListener("dbx:plugins-changed", onPluginsChanged));
+void refreshInstalledPlugins();
 
 const { highlight } = useSqlHighlighter();
 
@@ -433,6 +457,7 @@ const {
   openDataCompare,
   openDatabaseExport,
   openDatabaseSearch,
+  openDataDictionary,
   openDiagram,
   openDocs,
   openFieldLineage,
@@ -477,6 +502,7 @@ const emit = defineEmits<{
   "open-dialog-controller": [controller: Record<string, any> | null];
   "open-install-extension": [node: TreeNode];
   "open-extension-details": [node: TreeNode];
+  "open-event-trigger-details": [node: TreeNode];
 }>();
 
 const {
@@ -675,7 +701,7 @@ function routeTreeItemDialogController() {
     },
   });
   routedController.pasteTableDataCopySupported = pasteTableDataCopySupported.value;
-  routedController.canSetCreateDatabaseCharset = canSetCreateDatabaseCharset.value;
+  routedController.canSetCreateDatabaseCharset = routedCanSetCreateDatabaseCharset(canSetCreateDatabaseCharset.value, canSetCreateDatabaseLocale.value);
   routedController.canEditDatabaseCharsetCollation = canEditDatabaseCharsetCollation.value;
   routedController.canEditDatabaseComment = canEditDatabaseComment.value;
   emit("open-dialog-controller", routedController);
@@ -747,6 +773,7 @@ const groupTypes: Set<TreeNodeType> = new Set([
   "group-types",
   "group-partitions",
   "group-extensions",
+  "group-event-triggers",
   "group-tablespaces",
   "group-datafiles",
 ]);
@@ -867,7 +894,8 @@ async function toggle(requestId = beginNavigationRequest()) {
   // particular, schema-level trigger/type groups have no tableName, so they
   // must use the generic object loader rather than the table-trigger loader.
   const databaseObjectGroup = !!objectTypesForGroupNode(node.type);
-  if (databaseObjectGroup && connectionStore.canUseLoadedTreeNodeToggle(node)) {
+  const needsConfiguredTablePageDrain = node.type === "group-tables" && connectionStore.getConfig(node.connectionId || "")?.sidebar_auto_load_all_tables === true && hasTableTreeLoadMore(node.children ?? []);
+  if (databaseObjectGroup && connectionStore.canUseLoadedTreeNodeToggle(node) && !needsConfiguredTablePageDrain) {
     node.isExpanded = !node.isExpanded;
     if (wasExpanded && shouldReleaseCollapsedTreeNodeChildren()) connectionStore.releaseCollapsedTreeNodeChildren(node.id);
     emitNodeToggled(node, wasExpanded);
@@ -886,7 +914,7 @@ async function toggle(requestId = beginNavigationRequest()) {
     return;
   }
 
-  if (node.type === "group-extensions" && connectionStore.canUseLoadedTreeNodeToggle(node)) {
+  if ((node.type === "group-extensions" || node.type === "group-event-triggers") && connectionStore.canUseLoadedTreeNodeToggle(node)) {
     node.isExpanded = !node.isExpanded;
     if (wasExpanded && shouldReleaseCollapsedTreeNodeChildren()) connectionStore.releaseCollapsedTreeNodeChildren(node.id);
     emitNodeToggled(node, wasExpanded);
@@ -1096,6 +1124,8 @@ async function toggle(requestId = beginNavigationRequest()) {
       await connectionStore.loadSubpartitions(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-extensions" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       await connectionStore.refreshTreeNode(node);
+    } else if (node.type === "group-event-triggers" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
+      await connectionStore.refreshTreeNode(node);
     }
     emitNodeToggled(node, wasExpanded);
   } catch (e: any) {
@@ -1108,27 +1138,32 @@ async function toggle(requestId = beginNavigationRequest()) {
   }
 }
 
-function runRowClickAction(clickDetail: number, requestId: number) {
+function runRowClickAction(clickDetail: number) {
   const node = activeNode.value;
   if (node.type === "load-more") {
     if (clickDetail > 1) return;
+    beginNavigationRequest();
     void loadMoreObjectGroupChildren();
     return;
   }
   if (node.type === "object-browser") {
     if (clickDetail > 1) return;
+    beginNavigationRequest();
     void openObjectBrowser();
     return;
   }
   if (node.type === "mongo-gridfs") {
+    beginNavigationRequest();
     openMongoTreeData(node);
     return;
   }
   if (node.type === "event") {
+    beginNavigationRequest();
     void openObjectBrowser(false, true);
     return;
   }
   if (node.type === "group-events") {
+    beginNavigationRequest();
     void openObjectBrowser();
     return;
   }
@@ -1137,17 +1172,23 @@ function runRowClickAction(clickDetail: number, requestId: number) {
   // between adjacent rows. Nacos entries are idempotent navigation targets, so
   // do not mistake that rapid one-click switching for a double-click toggle.
   if (!shouldRunTreeNodeRowAction(action, clickDetail, isGroupLabel(node) || isRepeatableNavigationTreeNode(node.type))) return;
+  // A double click emits click(detail=2) before dblclick. Claim ownership only
+  // after that follow-up click has resolved to a real action, otherwise it
+  // makes the first click's pending connection/expansion request look stale.
+  const requestId = beginNavigationRequest();
   if (action === "open-data") {
     scheduleOpenData(node);
   } else if (action === "open-object-browser") {
     void openObjectBrowser(false, false, true);
   } else if (action === "open-object-browser-and-expand") {
     void openObjectBrowser(false, false, true);
-    if (!node.isExpanded) void toggle();
+    if (!node.isExpanded) void toggle(requestId);
   } else if (action === "open-source") {
     openObjectSourceDialog(false);
   } else if (action === "open-extension-details") {
     emit("open-extension-details", node);
+  } else if (action === "open-event-trigger-details") {
+    emit("open-event-trigger-details", node);
   } else if (action === "open-saved-sql") {
     void openSavedSqlFile();
   } else if (isDocumentBrowserTreeNode(node.type)) {
@@ -1531,21 +1572,27 @@ function requestDeleteSelectedNode(): boolean {
 function onDoubleClick(event: MouseEvent) {
   if (dataTabOpenModeFromTreeClick(activeNode.value.type, event, settingsStore.editorSettings.shortcuts.openDataInNewTab) === "new-tab") return;
   if (activeNode.value.type === "event") {
+    beginNavigationRequest();
     void openObjectBrowser(false, true);
     return;
   }
   if (activeNode.value.type === "group-events") {
+    beginNavigationRequest();
     void openObjectBrowser();
     return;
   }
   const action = treeNodeRowDoubleClickAction(activeNode.value.type, canOpenObjectBrowser.value, settingsStore.editorSettings.sidebarActivation, canExpand.value, currentDatabaseType(), canOpenConnectionDatabaseBrowser.value, settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation);
+  // In single-click mode the trailing dblclick normally has no action and must
+  // leave the first click's request ownership intact.
+  if (action === "none") return;
+  const requestId = beginNavigationRequest();
   if (action === "open-database-browser") {
     void openDatabaseBrowser();
   } else if (action === "open-object-browser") {
     void openObjectBrowser(false, false, true);
   } else if (action === "open-object-browser-and-expand") {
     void openObjectBrowser(false, false, true);
-    if (!activeNode.value.isExpanded) void toggle();
+    if (!activeNode.value.isExpanded) void toggle(requestId);
   } else if (action === "open-data") {
     openDataImmediately(activeNode.value);
   } else if (action === "activate-data") {
@@ -1554,12 +1601,14 @@ function onDoubleClick(event: MouseEvent) {
     openObjectSourceDialog(false);
   } else if (action === "open-extension-details") {
     emit("open-extension-details", activeNode.value);
+  } else if (action === "open-event-trigger-details") {
+    emit("open-event-trigger-details", activeNode.value);
   } else if (action === "open-saved-sql") {
     openSavedSqlFile();
   } else if (action === "toggle" && (activeNode.value.type === "mongo-gridfs" || isDocumentBrowserTreeNode(activeNode.value.type))) {
     openMongoTreeData(activeNode.value);
   } else if (action === "toggle") {
-    toggle();
+    void toggle(requestId);
   }
 }
 
@@ -4689,7 +4738,7 @@ const canOpenSqlFileExecution = computed(() => {
 const canExportAllDatabases = computed(() => {
   if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
   const dbType = connectionStore.getConfig(activeNode.value.connectionId)?.db_type;
-  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "solr", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos", "plugin"].includes(dbType || "");
+  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "solr", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos", "plugin", "salesforce"].includes(dbType || "");
 });
 
 const canOpenScheduledBackups = computed(() => {
@@ -4701,6 +4750,10 @@ const canOpenScheduledBackups = computed(() => {
 
 const canOpenDiagram = computed(() => {
   return !!activeNode.value.database && supportsSchemaDiagram(currentDatabaseType());
+});
+
+const canOpenDataDictionary = computed(() => {
+  return !!activeNode.value.connectionId && !!activeNode.value.database && supportsDataDictionary(currentDatabaseType());
 });
 
 const canOpenDatabaseSearch = computed(() => {
@@ -5264,7 +5317,7 @@ function databaseDialogCapabilities() {
   return {
     showCreateDatabaseDialog,
     createDatabaseName,
-    canSetCreateDatabaseCharset: canSetCreateDatabaseCharset.value || canSetCreateDatabaseLocale.value,
+    canSetCreateDatabaseCharset: routedCanSetCreateDatabaseCharset(canSetCreateDatabaseCharset.value, canSetCreateDatabaseLocale.value),
     createDatabaseCharset,
     createDatabaseCharsetOptions,
     createDatabaseCharsetLoading,
@@ -5439,7 +5492,10 @@ function exportDataSubmenu(includeSqlInsert = true): ContextMenuItem {
     { label: "CSV", action: () => exportData("csv") },
     { label: "JSON", action: () => exportData("json") },
   ];
-  if (includeSqlInsert) children.push({ label: "SQL INSERT", action: () => exportData("sql") });
+  if (includeSqlInsert) {
+    children.push({ label: "SQL INSERT", action: () => exportData("sql", "source") });
+    children.push({ label: t("contextMenu.standardSqlInsert"), action: () => exportData("sql", "standard") });
+  }
   children.push({ label: "XLSX", action: () => exportDataXlsx() });
   return {
     label: count > 1 ? t("contextMenu.exportDataMultiple", { count }) : t("contextMenu.exportData"),
@@ -5877,6 +5933,9 @@ function buildDatabaseSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     items.push({ label: t("diff.title"), action: openSchemaDiff, icon: ArrowRightLeft });
     items.push({ label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
     items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
+    if (canOpenDataDictionary.value) {
+      items.push({ label: t("dataDictionary.title"), action: openDataDictionary, icon: FileText });
+    }
     const destructiveActions: ContextMenuItem[] = [];
     if (canDropDatabase.value) {
       destructiveActions.push({
@@ -6150,6 +6209,12 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     return true;
   }
+  if (node.type === "event-trigger") {
+    items.push({ label: t("eventTrigger.viewDetails"), action: () => emit("open-event-trigger-details", node), icon: Info });
+    items.push({ label: "", separator: true });
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    return true;
+  }
   return false;
 }
 
@@ -6269,6 +6334,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     items.push(exportDataSubmenu());
     items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
     items.push({ label: t("contextMenu.exportStructure"), action: exportStructure, icon: FileCode });
+    if (canOpenDataDictionary.value) {
+      items.push({ label: t("dataDictionary.title"), action: openDataDictionary, icon: FileText });
+    }
     items.push(copyStructureAsSubmenu());
     if (isTableNotView.value) {
       items.push({ label: "", separator: true });
@@ -6732,6 +6800,15 @@ function treeItemMenuItems(): ContextMenuItem[] {
   return items;
 }
 
+function activateSidebarPluginContextMenuItem(pluginId: string, contribution: PluginContextMenuContribution, invocation: PluginContextMenuInvocation) {
+  void activatePluginContextMenuItem(pluginId, contribution, invocation, {
+    findWorkbench: (ownerPluginId, workbenchId) => !!sidebarPluginRegistry.value.findWorkbench(ownerPluginId, workbenchId),
+    openWorkbench: (ownerPluginId, workbenchId, options) => queryStore.openPluginWorkbench(ownerPluginId, workbenchId, options),
+    invokePlugin: (ownerPluginId, method, params) => api.invokePlugin(ownerPluginId, method, params),
+    toast,
+  });
+}
+
 /** Plugin-contributed native menu entries for saved connections. */
 function appendPluginConnectionMenuItems(items: ContextMenuItem[], node: TreeNode) {
   if (node.type !== "connection") return;
@@ -6739,26 +6816,19 @@ function appendPluginConnectionMenuItems(items: ContextMenuItem[], node: TreeNod
   if (pluginItems.length === 0) return;
   const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
   if (!config) return;
-  items.push({ label: "", separator: true });
-  for (const { plugin, contribution } of pluginItems) {
-    items.push({
-      label: contribution.label,
-      icon: PlugZap,
-      action: () => {
-        api
-          .invokePlugin(plugin.manifest.id, `contextMenu/${contribution.id}`, {
-            connection: { id: config.id, dbType: config.db_type, name: config.name, database: config.database || "" },
-          })
-          .then((result) => {
-            const message = (result as { message?: unknown } | null | undefined)?.message;
-            if (typeof message === "string" && message.trim()) toast(message, 4000);
-          })
-          .catch((error: unknown) => {
-            toast(String((error as Error)?.message || error), 5000);
-          });
+  const menuItems = pluginItems.flatMap(({ plugin, contribution }) => {
+    const invocation = buildPluginConnectionContextMenuInvocation(contribution.id, config);
+    if (!invocation) return [];
+    return [
+      {
+        label: contribution.label,
+        icon: PlugZap,
+        action: () => activateSidebarPluginContextMenuItem(plugin.manifest.id, contribution, invocation),
       },
-    });
-  }
+    ];
+  });
+  if (menuItems.length === 0) return;
+  items.push({ label: "", separator: true }, ...menuItems);
 }
 
 /** Plugin-contributed native menu entries for canonical table nodes. */
@@ -6774,17 +6844,7 @@ function appendPluginTableMenuItems(items: ContextMenuItem[], node: TreeNode) {
     tableItems.push({
       label: contribution.label,
       icon: PlugZap,
-      action: () => {
-        api
-          .invokePlugin(plugin.manifest.id, invocation.method, invocation.params)
-          .then((result) => {
-            const message = (result as { message?: unknown } | null | undefined)?.message;
-            if (typeof message === "string" && message.trim()) toast(message, 4000);
-          })
-          .catch((error: unknown) => {
-            toast(String((error as Error)?.message || error), 5000);
-          });
-      },
+      action: () => activateSidebarPluginContextMenuItem(plugin.manifest.id, contribution, invocation),
     });
   }
   if (tableItems.length === 0) return;
@@ -6861,9 +6921,8 @@ function buildContextMenu(node: TreeNode): ContextMenuItem[] {
 }
 
 function handleRowClick(node: TreeNode, clickDetail: number) {
-  const requestId = beginNavigationRequest();
   activateRuntimeNode(node);
-  runRowClickAction(clickDetail, requestId);
+  runRowClickAction(clickDetail);
 }
 
 function handleRowDoubleClick(node: TreeNode, event: MouseEvent) {
@@ -6875,7 +6934,6 @@ function handleRowDoubleClick(node: TreeNode, event: MouseEvent) {
     activateRuntimeNode(node);
     return;
   }
-  beginNavigationRequest();
   activateRuntimeNode(node);
   onDoubleClick(event);
 }

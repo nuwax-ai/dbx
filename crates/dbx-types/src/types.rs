@@ -145,6 +145,33 @@ pub struct ExtensionInfo {
     pub schema: Option<String>,
 }
 
+/// A PostgreSQL event trigger (`pg_event_trigger`). Event triggers fire on DDL
+/// commands at the database level, independent of any schema. This is distinct
+/// from MySQL events (`MysqlEventInfo`) and per-table triggers (`TriggerInfo`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTriggerInfo {
+    pub name: String,
+    /// DDL event: ddl_command_start | ddl_command_end | sql_drop | table_rewrite.
+    pub event: String,
+    /// Owner role name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// `schema.function(args)` executed by the trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    /// Session replica status char: O | A | R | D.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<String>,
+    /// Command tags in the WHEN clause (NULL = all tags).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// `pg_get_eventtriggerdef` reconstruction of the CREATE statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObjectStatistics {
     pub name: String,
@@ -249,6 +276,22 @@ pub struct ColumnInfo {
     pub collation: Option<String>,
     #[serde(skip)]
     pub metadata_capabilities: Option<ColumnMetadataCapabilities>,
+}
+
+/// Doris aggregate-state columns contain opaque engine serialization, not a
+/// value that DBX can safely edit or emit as an INSERT literal.
+pub fn is_opaque_aggregate_state_type(data_type: &str) -> bool {
+    let data_type = data_type.trim();
+    let Some(prefix) = data_type.get(.."agg_state".len()) else { return false };
+    if !prefix.eq_ignore_ascii_case("agg_state") {
+        return false;
+    }
+    let Some(arguments) =
+        data_type.get("agg_state".len()..).map(str::trim_start).and_then(|value| value.strip_prefix('<'))
+    else {
+        return false;
+    };
+    arguments.strip_suffix('>').is_some_and(|inner| !inner.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +406,20 @@ pub struct SpatialColumn {
     /// SRID shared by the column's geometry cells. `None` when unknown/absent
     /// (or SRID 0). A column reports the first non-null SRID it observes.
     pub srid: Option<u32>,
+}
+
+/// Stable identity for one column selected for SQL INSERT export.
+///
+/// `source_index` preserves duplicate result labels. `name` and
+/// `name_occurrence` let paginated exports recover the same identity when a
+/// driver reports later-page metadata in a different order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlExportColumnSelection {
+    pub source_index: usize,
+    pub name: String,
+    #[serde(default)]
+    pub name_occurrence: usize,
 }
 
 #[derive(Debug, Default)]
@@ -482,6 +539,9 @@ pub struct QueryResult {
     /// completed statement cannot be correlated to one audit row.
     #[serde(default)]
     pub server_execute_time_us: Option<u64>,
+    /// Optional measured query phases in milliseconds; absent on older agents.
+    #[serde(default)]
+    pub query_timings_ms: Option<std::collections::BTreeMap<String, f64>>,
     #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
@@ -523,6 +583,7 @@ impl Serialize for QueryResult {
             + usize::from(!self.spatial_values.is_empty())
             + usize::from(self.elasticsearch_raw_body.is_some())
             + usize::from(self.server_execute_time_us.is_some())
+            + usize::from(self.query_timings_ms.is_some())
             + usize::from(!self.messages.is_empty());
         let mut state = serializer.serialize_struct("QueryResult", field_count)?;
         state.serialize_field("columns", &self.columns)?;
@@ -539,6 +600,9 @@ impl Serialize for QueryResult {
         state.serialize_field("execution_time_ms", &self.execution_time_ms)?;
         if let Some(server_execute_time_us) = &self.server_execute_time_us {
             state.serialize_field("server_execute_time_us", server_execute_time_us)?;
+        }
+        if let Some(timings) = &self.query_timings_ms {
+            state.serialize_field("query_timings_ms", timings)?;
         }
         state.serialize_field("truncated", &self.truncated)?;
         state.serialize_field("session_id", &self.session_id)?;
@@ -1013,9 +1077,20 @@ pub struct CustomTypeDetails {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionAssistantCandidate, CompletionAssistantCandidateKind, ObjectInfo, ObjectSourceKind, QueryMessage,
-        SpatialColumn, SpatialColumnBuilder, TableInfo,
+        is_opaque_aggregate_state_type, CompletionAssistantCandidate, CompletionAssistantCandidateKind, ObjectInfo,
+        ObjectSourceKind, QueryMessage, SpatialColumn, SpatialColumnBuilder, TableInfo,
     };
+
+    #[test]
+    fn opaque_aggregate_state_type_is_narrow() {
+        assert!(is_opaque_aggregate_state_type("agg_state<group_concat(text)>"));
+        assert!(is_opaque_aggregate_state_type(" AGG_STATE <sum(int)> "));
+        assert!(!is_opaque_aggregate_state_type("agg_state"));
+        assert!(!is_opaque_aggregate_state_type("agg_state<"));
+        assert!(!is_opaque_aggregate_state_type("agg_state<>"));
+        assert!(!is_opaque_aggregate_state_type("😺agg_state<sum(int)>"));
+        assert!(!is_opaque_aggregate_state_type("varchar"));
+    }
 
     #[test]
     fn query_message_format_line_uppercases_severity() {
@@ -1252,6 +1327,7 @@ mod tests {
             affected_rows: 0,
             execution_time_ms: 0,
             server_execute_time_us: None,
+            query_timings_ms: None,
             truncated: false,
             session_id: None,
             has_more: false,
