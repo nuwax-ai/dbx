@@ -1030,7 +1030,6 @@ export interface EditorSettings {
 export interface ToolbarItems {
   dataTransfer: boolean;
   driverManager: boolean;
-  pluginCenter: boolean;
   sqlFile: boolean;
   schemaDiff: boolean;
   dataCompare: boolean;
@@ -1049,7 +1048,6 @@ export interface ToolbarItems {
 export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   dataTransfer: true,
   driverManager: true,
-  pluginCenter: true,
   sqlFile: true,
   schemaDiff: true,
   dataCompare: true,
@@ -1598,7 +1596,6 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
   return {
     dataTransfer: items.dataTransfer ?? defaults.dataTransfer,
     driverManager: items.driverManager ?? defaults.driverManager,
-    pluginCenter: items.pluginCenter ?? defaults.pluginCenter,
     sqlFile: items.sqlFile ?? defaults.sqlFile,
     schemaDiff: items.schemaDiff ?? defaults.schemaDiff,
     dataCompare: items.dataCompare ?? defaults.dataCompare,

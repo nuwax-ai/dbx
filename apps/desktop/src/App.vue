@@ -4204,7 +4204,6 @@ onUnmounted(() => {
           @open-github="openGitHub"
           @open-settings="openSettings(showMcpSettingsUpdateBadge ? 'mcp' : 'appearance')"
           @open-driver-store="openDriverStorePage"
-          @open-plugin-center="openPluginCenterPage()"
           @check-updates="handleToolbarUpdateClick"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"

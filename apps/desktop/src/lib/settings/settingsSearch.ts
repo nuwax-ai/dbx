@@ -1,6 +1,6 @@
 export type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "backups" | "tunnels" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "updates" | "security" | "about";
 
-const SETTINGS_CATEGORIES: readonly SettingsCategory[] = ["editor", "formatter", "appearance", "navigation", "data", "backups", "tunnels", "shortcuts", "snippets", "sync", "ai", "mcp", "updates", "security", "about"];
+const SETTINGS_CATEGORIES: readonly SettingsCategory[] = ["editor", "formatter", "appearance", "navigation", "data", "backups", "shortcuts", "snippets", "sync", "ai", "mcp", "updates", "security", "about"];
 
 /**
  * Maps retired settings tabs to their current home so saved links and external
@@ -50,7 +50,7 @@ export interface SettingsSearchRoute {
 
 export type Translate = (key: string) => string;
 
-type ToolbarVisibilityItemKey = "dataTransfer" | "driverManager" | "pluginCenter" | "sqlFile" | "schemaDiff" | "dataCompare" | "sqlLibrary" | "sqlFileTree" | "history" | "ai" | "alwaysOnTop";
+type ToolbarVisibilityItemKey = "dataTransfer" | "driverManager" | "sqlFile" | "schemaDiff" | "dataCompare" | "sqlLibrary" | "sqlFileTree" | "history" | "ai" | "alwaysOnTop";
 
 export type ToolbarVisibilityItem = ({ key: ToolbarVisibilityItemKey; titleKey: string; title?: never } | { key: ToolbarVisibilityItemKey; title: string; titleKey?: never }) & {
   /** The matching toolbar button can only exist in the desktop app, so the Web build hides the switch. */
@@ -65,7 +65,6 @@ export type ToolbarVisibilityItem = ({ key: ToolbarVisibilityItemKey; titleKey: 
 export const TOOLBAR_VISIBILITY_ITEMS: readonly ToolbarVisibilityItem[] = [
   { key: "dataTransfer", titleKey: "transfer.dataTransfer" },
   { key: "driverManager", titleKey: "toolbar.driverManager" },
-  { key: "pluginCenter", titleKey: "toolbar.pluginCenter" },
   { key: "sqlFile", titleKey: "sqlFile.title" },
   { key: "schemaDiff", titleKey: "diff.title" },
   { key: "dataCompare", titleKey: "dataCompare.title" },
@@ -257,7 +256,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "data-duckdb", category: "data", titleKey: "settings.duckDbWorkerProcessIsolation", descriptionKey: "settings.duckDbWorkerProcessIsolationDescription", targetId: "data", visible: desktopOnly },
   { id: "data-duckdb-process-limit", category: "data", titleKey: "settings.duckDbWorkerMaxProcesses", descriptionKey: "settings.duckDbWorkerMaxProcessesDescription", targetId: "data", visible: desktopOnly },
   { id: "backups", category: "backups", titleKey: "databaseBackup.title", targetId: "backups", visible: desktopOnly },
-  { id: "tunnels", category: "tunnels", titleKey: "settings.tunnelsTab", targetId: "tunnels" },
+  // nuwax fork: 隧道维护 tab 已删除
   { id: "shortcuts", category: "shortcuts", titleKey: "settings.shortcutsTab", targetId: "shortcuts" },
   { id: "sql-shortcuts", category: "shortcuts", titleKey: "settings.sqlShortcutsTitle", descriptionKey: "settings.sqlShortcutsDescription", targetId: "sql-shortcuts" },
   { id: "snippets", category: "snippets", titleKey: "settings.snippetsTab", descriptionKey: "settings.snippetsDescription", targetId: "snippets" },

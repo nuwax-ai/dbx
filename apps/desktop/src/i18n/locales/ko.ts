@@ -6939,7 +6939,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "JDBC 드라이버",
     securityTab: "보안",
-    aboutTab: "정보",
+    aboutTab: "버전 정보",
     fontFamily: "글꼴",
     dataGridFontFamily: "결과 그리드 글꼴",
     dataGridFontFamilyDescription: "쿼리 결과, 테이블 데이터, 컬럼 머리글 및 인라인 셀 편집기에 적용됩니다.",

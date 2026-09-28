@@ -4,7 +4,7 @@
 相对官方 main 保留少量刻意差异，本文档是这些差异的权威清单，合并官方更新时对照使用。
 
 > 快速定位所有定制点：前端搜 `UPDATER_ENABLED`、`startup.loading` 和注释 `nuwax`，Rust 侧搜 `nuwax`。
-> 最近的差异核验：2026-09-28（合并官方 e9b768285 / v0.6.26 之后）。
+> 最近的差异核验：2026-09-28（插件中心/隧道维护入口删除 + 关于我们改名之后）。
 
 ## 差异总览
 
@@ -13,11 +13,13 @@
 | 1 | 屏蔽工具栏「检查更新」入口 | `apps/desktop/src/components/layout/AppToolbar.vue` | `const UPDATER_ENABLED = false` 门控（**不删官方代码**） |
 | 2 | 删除工具栏主题切换按钮 | 同上 + `settingsStore.ts` + `settingsSearch.ts` | 整段删除 |
 | 3 | 删除工具栏 GitHub 图标 | 同上 | 整段删除 |
-| 4 | 「设置 → 关于我们」裁剪 | `apps/desktop/src/components/editor/EditorSettingsDialog.vue` | 删除社区链接卡片组 |
+| 4 | 「设置 → 关于我们」裁剪 + 改名「版本信息」 | `apps/desktop/src/components/editor/EditorSettingsDialog.vue` + 11 个 locale | 删除社区链接卡片组；`aboutTab` 全语言改为"版本信息"语义 |
 | 5 | 应用更新提醒默认关闭 | `apps/desktop/src/stores/settingsStore.ts` | 默认值 true → false |
 | 6 | PG 本地免密登录（unix socket） | `crates/dbx-core/src/local_pg.rs` 等 5 处 | 新增模块 + 启动钩子 |
 | 7 | Docker 构建加固 | `deploy/Dockerfile` | pip 镜像重试 + amd64 交叉库 |
 | 8 | 启动 loading 文案（「正在启动 DBX…」） | `apps/desktop/src/StartupGate.vue` | label 用 `startup.loading` 替代 `migration.checking`（连续加载方案已上游化） |
+| 9 | 删除「插件中心」入口（2026-09-28） | `AppToolbar.vue` + `settingsStore.ts` + `settingsSearch.ts` + `App.vue` | 删按钮/菜单项/设置开关；插件系统本身保留 |
+| 10 | 删除「隧道维护」设置 tab（2026-09-28） | `EditorSettingsDialog.vue` + `settingsSearch.ts` | 删导航项 + tab 内容 + 搜索条目 |
 
 ---
 
@@ -54,13 +56,19 @@ const UPDATER_ENABLED = false;
 **保留**：`useToast` 导入（官方插件命令功能在用）；App.vue 中 Welcome 页的 `@open-github`
 绑定属于另一组件，不动。官方新增的 `alwaysOnTop` 工具栏项**保留**。
 
-## 4. 「设置 → 关于我们」裁剪
+## 4. 「设置 → 关于我们」裁剪 + 改名「版本信息」
 
-**原因**：About 页的 QQ 群/Discord/微信群/飞书群/GitHub 仓库/官方文档卡片对自部署用户是噪音。
+**原因**：About 页的 QQ 群/Discord/微信群/飞书群/GitHub 仓库/官方文档卡片对自部署用户是噪音；
+裁剪后只剩支持信息和版本号，"关于我们"名字不再贴切。
 
 **保留**：支持信息卡片（about-support）、`SettingsTransferPanel`（配置导入与导出）、
 桌面端 `!isWeb` 的调试日志块（web 模式不可见）。
 **删除**：上述六张社区链接卡片（`grid gap-3 sm:grid-cols-3` 整块）及 `AppLogo` 导入。
+
+**改名**（2026-09-28）：`aboutTab` 的 locale 值在全部 11 种语言改为"版本信息"语义
+（zh-CN「版本信息」、zh-TW「版本資訊」、en "Version Info" 等；ja 本来就是
+「バージョン情報」未动）。设置搜索分类标签复用同一 key 自动跟随。
+官方若调整各语言 aboutTab 文案，合并时取 main 后需重套。
 
 ## 5. 应用更新提醒默认关闭
 
@@ -121,6 +129,42 @@ loading/error 组件 + 预载失败恢复。**合并时 StartupGate.vue 和 App.
 **附带注意**：AppToolbar 里 `useToast` 是否保留取决于官方剩余用法——2026-09-28 起
 官方唯一的 `toast(` 用法是主题按钮（fork 删除项），故 fork 侧连 import 一起删；若官方
 后续新增别的 toast 用法则恢复。
+
+## 9. 删除「插件中心」入口（2026-09-28）
+
+**原因**：自部署不使用插件市场，管理入口是多余的视觉噪音。
+
+**删除范围**（仅入口，**插件系统/市场/快捷方式全部保留**——官方在大力发展插件功能，动底层必撞）：
+
+- `AppToolbar.vue`：工具栏文字按钮、溢出菜单项、`open-plugin-center` emit、lucide `PlugZap` 导入；
+  按钮组 div 保留（仅当 `showPluginCenterShortcuts` 时渲染，作为插件快捷方式的锚点）
+- `App.vue`：AppToolbar 上的 `@open-plugin-center` 绑定
+- `settingsStore.ts`：`ToolbarItems.pluginCenter` 字段（类型/默认值/normalize 三处）
+- `settingsSearch.ts`：`ToolbarVisibilityItemKey` 与 `TOOLBAR_VISIBILITY_ITEMS` 中的 pluginCenter
+
+**保留的打开路径**：`dbx://` 插件安装深链（`openPluginInstallDeepLink`）仍可打开页面——页面本身
+未删，只是没有常规入口；标签栏的插件中心 tab 本就只在页面已打开时渲染（非常驻按钮），无需处理；
+更新中心内的入口被 UPDATER_ENABLED 门控挡住，不可达。
+
+**合并注意**：官方对 AppToolbar 菜单/按钮组的重构会与此冲突，按"入口全删、系统保留"重套。
+
+## 10. 删除「隧道维护」设置 tab（2026-09-28）
+
+**原因**：自部署不用 SSH 隧道，管理页多余；连接对话框里的临时隧道配置不受影响。
+
+**删除范围**：
+
+- `EditorSettingsDialog.vue`：`settingsCategoryNav` 中的 tunnels 项 + tab 内容
+  （`<section v-else-if="activeSettingsTab === 'tunnels'">` + `TunnelProfileManager` 及其 import）
+- `settingsSearch.ts`：tunnels 搜索条目 + `SETTINGS_CATEGORIES` 数组中的 "tunnels"
+  （`SettingsCategory` **类型**联合保留 "tunnels" 成员——settingsSearch.spec 的
+  `Record<SettingsCategory, string>` categoryLabels 仍需要它，且减少类型手术）
+
+**已知瑕疵**：连接对话框中"由共享隧道档案管理，请在 设置 > 隧道维护 中编辑"提示文案仍指向
+已删除的 tab（仅使用共享隧道档案的连接可见，自部署场景碰不到，故意不动 locale）。
+
+**合并注意**：官方若往 tunnels tab 加新设置，冲突时保持整块删除；`TunnelProfileManager` 组件
+本身保留（连接对话框的隧道选择仍在用共享档案数据）。
 
 ---
 

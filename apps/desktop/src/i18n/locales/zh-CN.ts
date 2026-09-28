@@ -7842,7 +7842,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "JDBC 驱动",
     securityTab: "安全",
-    aboutTab: "关于我们",
+    aboutTab: "版本信息",
     fontFamily: "字体",
     dataGridFontFamily: "查询结果网格字体",
     dataGridFontFamilyDescription: "用于查询结果、表数据、列标题和单元格内编辑器。",

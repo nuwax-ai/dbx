@@ -6447,7 +6447,7 @@ export default withEnglishFallback({
     aiSkillRootBrowse: "瀏覽",
     jdbcTab: "JDBC 驅動程式",
     securityTab: "安全",
-    aboutTab: "關於我們",
+    aboutTab: "版本資訊",
     dataTab: "資料",
     sqlFileSection: "SQL 檔案",
     tunnelsTab: "隧道維護",

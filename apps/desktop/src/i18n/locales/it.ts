@@ -7164,7 +7164,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "Driver JDBC",
     securityTab: "Sicurezza",
-    aboutTab: "Informazioni",
+    aboutTab: "Informazioni sulla versione",
     fontFamily: "Famiglia Carattere (Font)",
     dataGridFontFamily: "Font della griglia risultati",
     dataGridFontFamilyDescription: "Si applica ai risultati delle query, ai dati delle tabelle, alle intestazioni delle colonne e agli editor nelle celle.",

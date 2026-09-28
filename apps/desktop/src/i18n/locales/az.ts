@@ -7204,7 +7204,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "JDBC drayverləri",
     securityTab: "Təhlükəsizlik",
-    aboutTab: "Haqqında",
+    aboutTab: "Versiya məlumatı",
     fontFamily: "Şrift ailəsi",
     dataGridFontFamily: "Nəticə cədvəlinin şrifti",
     dataGridFontFamilyDescription: "Sorğu nəticələrinə, cədvəl verilənlərinə, sütun başlıqlarına və xanadaxili redaktorlara tətbiq olunur.",

@@ -7239,7 +7239,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "Drivers JDBC",
     securityTab: "Seguridad",
-    aboutTab: "Acerca de",
+    aboutTab: "Información de la versión",
     fontFamily: "Familia tipográfica",
     dataGridFontFamily: "Fuente de la cuadrícula de resultados",
     dataGridFontFamilyDescription: "Se aplica a resultados de consultas, datos de tablas, encabezados de columnas y editores dentro de las celdas.",

@@ -2,7 +2,7 @@
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, PlugZap, FileDown, FolderTree, Pin, PinOff, CalendarClock, Waypoints } from "@lucide/vue";
+import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, FolderTree, Pin, PinOff, CalendarClock, Waypoints } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown, { type LightDropdownItem } from "@/components/ui/LightDropdown.vue";
@@ -51,7 +51,6 @@ const emit = defineEmits<{
   "toggle-sql-file-panel": [];
   "open-settings": [];
   "open-driver-store": [];
-  "open-plugin-center": [];
   "check-updates": [];
   "open-transfer": [];
   "open-sql-file": [];
@@ -397,9 +396,7 @@ function buildToolbarMenuItems(includeVisiblePrimaryItems: boolean): ToolbarMenu
       disabled: false,
     });
   }
-  if (includeVisiblePrimaryItems || !toolbarItems.value.pluginCenter) {
-    items.push({ value: "plugin-center", label: t("toolbar.pluginCenter"), icon: PlugZap, action: () => emit("open-plugin-center"), disabled: false });
-  }
+  // nuwax fork: 插件中心入口移除（自部署不使用插件市场）；插件系统本身保留
   if (toolbarItems.value.sqlFile) {
     items.push({
       value: "sql-file",
@@ -521,12 +518,9 @@ const toolbarStyle = computed(() => {
         <!-- 小圆点仅提示"有可更新驱动"，具体数量交给对话框内标签页红点展示，避免工具栏长期挂红数字。 -->
         <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-block h-2 w-2 rounded-full bg-red-500" :aria-label="t('toolbar.updatableDriverCount')" :title="t('toolbar.updatableDriverCount')" />
       </Button>
-      <div v-if="toolbarItems.pluginCenter || showPluginCenterShortcuts" ref="pluginCenterGroup" class="flex shrink-0 items-center rounded-md" :class="{ 'bg-accent': showPluginCenter }">
-        <Button v-if="toolbarItems.pluginCenter" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'rounded-r-none': showPluginCenterShortcuts }]" @click="emit('open-plugin-center')">
-          <PlugZap class="h-3.5 w-3.5" />
-          <span :class="toolbarTextLabelClass">{{ t("toolbar.pluginCenter") }}</span>
-        </Button>
-        <PluginShortcutToolbar v-if="showPluginCenterShortcuts" dropdown-only :menu-anchor="pluginCenterGroup" @layout-change="scheduleToolbarLayout" />
+      <!-- nuwax fork: 插件中心按钮已删；组仅保留作为插件快捷方式的锚点 -->
+      <div v-if="showPluginCenterShortcuts" ref="pluginCenterGroup" class="flex shrink-0 items-center rounded-md" :class="{ 'bg-accent': showPluginCenter }">
+        <PluginShortcutToolbar dropdown-only :menu-anchor="pluginCenterGroup" @layout-change="scheduleToolbarLayout" />
       </div>
 
       <LightDropdown

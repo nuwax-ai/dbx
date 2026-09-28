@@ -7086,7 +7086,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "JDBC Sürücüleri",
     securityTab: "Güvenlik",
-    aboutTab: "Hakkında",
+    aboutTab: "Sürüm bilgisi",
     fontFamily: "Yazı Tipi Ailesi",
     dataGridFontFamily: "Sonuç Tablosu Yazı Tipi",
     dataGridFontFamilyDescription: "Sorgu sonuçları, tablo verisi, sütun başlıkları ve satır içi hücre düzenleyicileri için geçerlidir.",

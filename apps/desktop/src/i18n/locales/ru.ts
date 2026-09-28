@@ -8382,7 +8382,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "Драйверы JDBC",
     securityTab: "Безопасность",
-    aboutTab: "О программе",
+    aboutTab: "Сведения о версии",
     fontFamily: "Семейство шрифтов",
     dataGridFontFamily: "Шрифт таблицы результатов",
     dataGridFontFamilyDescription: "Применяется к результатам запросов, данным таблиц, заголовкам столбцов и встроенным редакторам ячеек.",

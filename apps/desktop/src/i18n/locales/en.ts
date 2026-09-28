@@ -7876,7 +7876,7 @@ export default {
     mcpTab: "MCP",
     jdbcTab: "JDBC Drivers",
     securityTab: "Security",
-    aboutTab: "About",
+    aboutTab: "Version Info",
     fontFamily: "Font Family",
     dataGridFontFamily: "Result Grid Font",
     dataGridFontFamilyDescription: "Applies to query results, table data, column headers, and inline cell editors.",
