@@ -20,6 +20,7 @@
 | 8 | 启动 loading 文案（「正在启动 DBX…」） | `apps/desktop/src/StartupGate.vue` | label 用 `startup.loading` 替代 `migration.checking`（连续加载方案已上游化） |
 | 9 | 删除「插件中心」入口（2026-09-28） | `AppToolbar.vue` + `settingsStore.ts` + `settingsSearch.ts` + `App.vue` | 删按钮/菜单项/设置开关；插件系统本身保留 |
 | 10 | 删除「隧道维护」设置 tab（2026-09-28） | `EditorSettingsDialog.vue` + `settingsSearch.ts` | 删导航项 + tab 内容 + 搜索条目 |
+| 11 | 删除「更新管理」设置 tab（2026-09-28） | `EditorSettingsDialog.vue` + `settingsSearch.ts` | 删导航项 + tab 区块 + 搜索条目；更新设置字段/逻辑保留 |
 
 ---
 
@@ -165,6 +166,40 @@ loading/error 组件 + 预载失败恢复。**合并时 StartupGate.vue 和 App.
 
 **合并注意**：官方若往 tunnels tab 加新设置，冲突时保持整块删除；`TunnelProfileManager` 组件
 本身保留（连接对话框的隧道选择仍在用共享档案数据）。
+
+## 11. 删除「更新管理」设置 tab（2026-09-28）
+
+**原因**：dbx-web 容器部署无法自更新（与第 1/5 条同源）；工具栏入口早已门控，
+设置页里这个 tab 是更新功能最后一个可见入口。
+
+**删除范围**：
+
+- `EditorSettingsDialog.vue`：`settingsCategoryNav` 的 updates 项 + updates tab 的整个
+  `<section>`（应用/组件更新状态卡、自动更新开关、下载源选择、ChangelogPanel）+
+  `settingsTabsWithApplyFooter` 中的 "updates"
+- `settingsSearch.ts`：6 条 `category: "updates"` 搜索条目 + `SETTINGS_CATEGORIES`
+  数组项（`SettingsCategory` 类型成员保留，同 tunnels）
+
+**刻意保留的死代码（减少合并冲突）**：`else if (tab === "updates")` 重置分支、
+`editAutoUpdateApp` 等脚本状态、`check-updates` emit、相关 props、settingsStore 的
+更新字段与 normalize 逻辑——官方怎么改都不撞。**只有 vue-tsc TS6133 报出的未使用
+声明才删**（`ChangelogPanel` 导入、`hasAnyUpdate` computed、
+`onUpdateDownloadSourceChange` 函数）。
+
+**行为说明**：组件自动更新（驱动/JDBC/MCP/插件）按已保存设置继续工作（默认全开），
+只是没有 UI 入口；已存显式配置的实例不受影响。
+
+**注意**：更新中心弹层、工具栏更新图标本就被 `UPDATER_ENABLED` 门控，与此互补——
+更新功能的三个可见入口（工具栏/弹层/设置 tab）至此全部不可达。
+
+## 合并摩擦控制原则（2026-09-28 与用户确认）
+
+1. **只删 UI 入口（模板/导航项/搜索条目），官方 script 逻辑尽量原样保留**——死代码
+   留着不影响运行，官方怎么改都不冲突
+2. **vue-tsc TS6133 报出的未使用声明/导入必须删**（否则编译不过），这是唯一例外，删
+   时保持最小化
+3. 官方积极开发的区域（插件、更新）用"入口删除 + 系统保留"，不用门控常量也行——
+   入口行数少、冲突可控；UPDATER_ENABLED 式门控适合官方频繁重构内部实现的场景
 
 ---
 

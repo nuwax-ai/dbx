@@ -241,7 +241,6 @@ import {
 import { applySqlShortcutBodyToAllSelected, buildSqlShortcutBodiesForSave, clearSqlShortcutFormDatabaseTypes as clearSqlShortcutFormBodies, switchSqlShortcutEditingDatabaseType, toggleSqlShortcutFormDatabaseType, type SqlShortcutFormBodies } from "@/lib/sql/sqlShortcutFormBodies";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
-import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
 import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
 import McpResourceScopePicker from "@/components/settings/McpResourceScopePicker.vue";
 import McpDatabaseScopePicker from "@/components/settings/McpDatabaseScopePicker.vue";
@@ -468,7 +467,6 @@ const emit = defineEmits<{
   "ai-config-deep-link-handled": [];
 }>();
 
-const hasAnyUpdate = computed(() => Boolean(props.appUpdateAvailable || (props.driverUpdateCount || 0) > 0 || props.jdbcUpdateAvailable || props.mcpUpdateAvailable || (props.pluginUpdateCount || 0) > 0));
 const updateCheckItemKeys = ["app", "drivers", "jdbc", "mcp", "plugins"] as const;
 type UpdateCheckItem = (typeof updateCheckItemKeys)[number];
 const updateCheckLoading = ref<Record<UpdateCheckItem, boolean>>({ app: false, drivers: false, jdbc: false, mcp: false, plugins: false });
@@ -2857,10 +2855,6 @@ function onUiScaleChange(value: unknown) {
   editUiScale.value = next;
 }
 
-function onUpdateDownloadSourceChange(v: any) {
-  if (v === "official" || v === "cnb") editUpdateDownloadSource.value = v;
-}
-
 function setSidebarObjectDisplay(value: "grouped" | "simple") {
   editSidebarObjectDisplay.value = value;
 }
@@ -3071,11 +3065,11 @@ const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[
   { value: "sync", label: t("settings.syncTab") },
   { value: "ai", label: t("settings.aiTab") },
   { value: "mcp" as const, label: t("settings.mcpTab") },
-  { value: "updates" as const, label: t("settings.updatesTab") },
+  // nuwax fork: 更新管理 tab 已删除（dbx-web 容器部署无法自更新；组件更新按默认值继续工作）
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
   { value: "about", label: t("settings.aboutTab") },
 ]);
-const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "shortcuts", "snippets", "updates"]);
+const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "shortcuts", "snippets"]);
 
 function hasSettingsApplyFooter(value: SettingsCategory): boolean {
   return settingsTabsWithApplyFooter.has(value);
@@ -10760,111 +10754,6 @@ LIMIT 100;</pre
                   </div>
                 </div>
               </Tabs>
-            </section>
-
-            <section v-else-if="activeSettingsTab === 'updates'" data-settings-search-id="updates" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('updates')]">
-              <div class="space-y-3 rounded-lg border bg-muted/20 p-4">
-                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div class="min-w-0 space-y-1">
-                    <Label>{{ t("settings.updateStatusTitle") }}</Label>
-                    <p class="text-sm text-muted-foreground">{{ t("settings.updateStatusDescription") }}</p>
-                  </div>
-                  <div class="flex shrink-0 items-center gap-2">
-                    <Button type="button" variant="outline" size="sm" class="h-8 min-w-20" :disabled="props.checkingUpdates || props.updatingAllUpdates" :aria-label="t('settings.checkUpdates')" @click="emit('check-updates')">
-                      <Loader2 v-if="props.checkingUpdates" class="h-3.5 w-3.5 animate-spin" />
-                      <span v-else>{{ t("settings.checkUpdates") }}</span>
-                    </Button>
-                    <Button v-if="hasAnyUpdate" type="button" size="sm" class="h-8" :disabled="props.checkingUpdates || props.updatingAllUpdates" @click="emit('update-all')">
-                      <Loader2 v-if="props.updatingAllUpdates" class="h-3.5 w-3.5 animate-spin" />
-                      <RefreshCw v-else class="h-3.5 w-3.5" />
-                      {{ t("settings.updateAll") }}
-                    </Button>
-                  </div>
-                </div>
-                <div class="grid gap-2 sm:grid-cols-2">
-                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
-                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-update-center')">
-                      <div class="font-medium">{{ t("settings.updateClient") }}</div>
-                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.app ? 'text-muted-foreground' : props.appUpdateAvailable ? 'text-primary' : 'text-muted-foreground'">
-                        <Loader2 v-if="updateCheckLoading.app" class="h-3 w-3 animate-spin" />
-                        <span>{{ updateCheckLoading.app ? t("updates.checking") : props.appUpdateAvailable ? props.appUpdateVersion || t("settings.updateAvailable") : t("settings.upToDate") }}</span>
-                      </div>
-                    </button>
-                    <div class="flex shrink-0 items-center gap-2">
-                      <Label for="auto-update-app" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
-                      <Switch id="auto-update-app" v-model="editAutoUpdateApp" :aria-label="t('settings.autoUpdateApp')" />
-                    </div>
-                  </div>
-                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
-                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-driver-store', 'agent')">
-                      <div class="font-medium">{{ t("settings.updateDrivers") }}</div>
-                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.drivers ? 'text-muted-foreground' : (props.driverUpdateCount || 0) > 0 ? 'text-primary' : 'text-muted-foreground'">
-                        <Loader2 v-if="updateCheckLoading.drivers" class="h-3 w-3 animate-spin" />
-                        <span>{{ updateCheckLoading.drivers ? t("updates.checking") : (props.driverUpdateCount || 0) > 0 ? t("settings.updateCount", { count: props.driverUpdateCount }) : t("settings.upToDate") }}</span>
-                      </div>
-                    </button>
-                    <div class="flex shrink-0 items-center gap-2">
-                      <Label for="auto-update-drivers" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
-                      <Switch id="auto-update-drivers" v-model="editAutoUpdateDrivers" :aria-label="t('settings.autoUpdateDrivers')" />
-                    </div>
-                  </div>
-                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
-                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-driver-store', 'jdbc')">
-                      <div class="font-medium">{{ t("settings.updateJdbc") }}</div>
-                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.jdbc ? 'text-muted-foreground' : props.jdbcUpdateAvailable ? 'text-primary' : 'text-muted-foreground'">
-                        <Loader2 v-if="updateCheckLoading.jdbc" class="h-3 w-3 animate-spin" />
-                        <span>{{ updateCheckLoading.jdbc ? t("updates.checking") : props.jdbcUpdateAvailable ? t("settings.updateAvailable") : t("settings.upToDate") }}</span>
-                      </div>
-                    </button>
-                    <div class="flex shrink-0 items-center gap-2">
-                      <Label for="auto-update-jdbc" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
-                      <Switch id="auto-update-jdbc" v-model="editAutoUpdateJdbc" :aria-label="t('settings.autoUpdateJdbc')" />
-                    </div>
-                  </div>
-                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
-                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-mcp-settings')">
-                      <div class="font-medium">{{ t("settings.updateMcp") }}</div>
-                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.mcp ? 'text-muted-foreground' : props.mcpUpdateAvailable ? 'text-primary' : 'text-muted-foreground'">
-                        <Loader2 v-if="updateCheckLoading.mcp" class="h-3 w-3 animate-spin" />
-                        <span>{{ updateCheckLoading.mcp ? t("updates.checking") : props.mcpUpdateAvailable ? t("settings.updateAvailable") : t("settings.upToDate") }}</span>
-                      </div>
-                    </button>
-                    <div class="flex shrink-0 items-center gap-2">
-                      <Label for="auto-update-mcp" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
-                      <Switch id="auto-update-mcp" v-model="editAutoUpdateMcp" :aria-label="t('settings.autoUpdateMcp')" />
-                    </div>
-                  </div>
-                  <div class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2.5 text-sm">
-                    <button type="button" class="min-w-0 space-y-0.5 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" @click="emit('open-plugin-center')">
-                      <div class="font-medium">{{ t("settings.updatePlugins") }}</div>
-                      <div class="flex items-center gap-1.5" :class="updateCheckLoading.plugins ? 'text-muted-foreground' : (props.pluginUpdateCount || 0) > 0 ? 'text-primary' : 'text-muted-foreground'">
-                        <Loader2 v-if="updateCheckLoading.plugins" class="h-3 w-3 animate-spin" />
-                        <span>{{ updateCheckLoading.plugins ? t("updates.checking") : (props.pluginUpdateCount || 0) > 0 ? t("settings.updateCount", { count: props.pluginUpdateCount }) : t("settings.upToDate") }}</span>
-                      </div>
-                    </button>
-                    <div class="flex shrink-0 items-center gap-2">
-                      <Label for="auto-update-plugins" class="text-xs font-normal text-muted-foreground">{{ t("settings.autoUpdate") }}</Label>
-                      <Switch id="auto-update-plugins" v-model="editAutoUpdatePlugins" :aria-label="t('settings.autoUpdatePlugins')" />
-                    </div>
-                  </div>
-                </div>
-                <p class="border-t pt-3 text-xs text-muted-foreground">{{ t("settings.updateRestartHint") }}</p>
-              </div>
-
-              <div class="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
-                <div class="min-w-0 space-y-1">
-                  <Label>{{ t("settings.updateDownloadSource") }}</Label>
-                  <p class="text-sm text-muted-foreground">{{ t("settings.updateDownloadSourceDescription") }}</p>
-                </div>
-                <Select :model-value="editUpdateDownloadSource" @update:model-value="onUpdateDownloadSourceChange">
-                  <SelectTrigger class="h-9 w-full sm:w-[180px]"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
-                    <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <ChangelogPanel :checking-updates="props.checkingUpdates" @check-updates="emit('check-updates')" />
             </section>
 
             <section v-else-if="activeSettingsTab === 'security' && isWeb" data-settings-search-id="security" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('security')]">
