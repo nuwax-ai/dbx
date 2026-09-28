@@ -114,6 +114,9 @@ LoginPage 渲染出来再卸载——用户看到密码输入界面一闪而过�
 - `StartupGate.vue`：`provide("dbxStartupAuthResolved", true)`——App 只会在认证通过后挂载，
   把结果直接传下去；新增 `appLoaded` ref，App 异步 chunk 加载期间保持同一张 loading 屏覆盖
   （z-[1000] overlay），Suspense `@resolve` 后才收起。全程只有一次视觉切换：loading → 主界面。
+  启动文案复用官方 `migration.launching`（"正在启动 DBX…"，28 种语言自带翻译）而非
+  `migration.checking`（"正在检查本地数据安全状态…"，措辞对最终用户偏生硬，且该 key 在
+  迁移向导内部语义正确需保留原值）。
 - `App.vue`：`inject("dbxStartupAuthResolved", false)` 后跳过重复的 auth 请求，
   `needsAuth`/`authenticated`/`authCheckPending` 初始即按已认证设置——免密模式下 LoginPage
   的渲染条件永远为假。`authCheckPending` 兜底门控保留（App 被直接挂载、无 inject 的场景，

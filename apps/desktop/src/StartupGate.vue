@@ -74,7 +74,9 @@ onMounted(initialize);
 </script>
 <template>
   <div v-if="checkingAuth || authFailed" class="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-background text-foreground" role="status">
-    <p>{{ t(authFailed ? "migration.authFailed" : "migration.checking") }}</p>
+    <!-- nuwax fork: neutral startup wording instead of migration.checking
+         (that key stays accurate inside the migration wizard itself). -->
+    <p>{{ t(authFailed ? "migration.authFailed" : "migration.launching") }}</p>
     <button v-if="authFailed" class="rounded border px-4 py-2" @click="initialize">{{ t("migration.retry") }}</button>
   </div>
   <LoginPage v-else-if="loginRequired" :setup-mode="setupRequired" @authenticated="authenticated" />
@@ -98,7 +100,7 @@ onMounted(initialize);
     <!-- nuwax fork: keep one continuous loading screen until the app mounted;
          without it the async App chunk load flashes intermediate states. -->
     <div v-if="!appLoaded" class="fixed inset-0 z-[1000] flex flex-col items-center justify-center gap-4 bg-background text-foreground" role="status">
-      <p>{{ t("migration.checking") }}</p>
+      <p>{{ t("migration.launching") }}</p>
     </div>
   </div>
 </template>
