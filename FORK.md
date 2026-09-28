@@ -104,12 +104,23 @@ autoUpdateApp: false,
 （migration gate + StartupGate 向导）；旧的 `storage.migrate_from_json()` 调用**不要加回**，
 JSON 迁移已归迁移门禁管。
 
-## 7. Docker 构建加固
+## 7. Docker 构建加固（国内网络）
 
-`deploy/Dockerfile` 两处 fork 修改（不影响上游层缓存）：
+`deploy/Dockerfile` 的 fork 修改（均不影响上游层缓存；用户通过 build-agent-docker 仓的
+`make build-dbx-fork` 构建本 fork——最终镜像只作抽取载体，`docker cp` 拿走
+`/usr/local/bin/dbx-web` + `/app/static`，镜像本身不部署、不关心体积）：
 
-- **ziglang pip 安装重试**：国内镜像偶发连接死掉，外层循环换新 TCP 连接重试 5 次，独立层隔离
+- **apt 阿里云镜像（backend 阶段）**：`rust:1-bookworm` 自带 curl，直接跑 LinuxMirrors
+  脚本换 `mirrors.aliyun.com`（参考 https://github.com/SuperManito/LinuxMirrors ）
+- **apt 阿里云镜像（runtime 阶段）**：`debian:bookworm-slim` 无 curl，先走一次官方源
+  装 curl（层缓存后仅首次付费），再跑同一脚本；后续 ~200MB openjdk 等全走阿里云
+- **ziglang pip 安装重试**：国内镜像偶发连接死掉，外层循环换新 TCP 连接重试 5 次，独立层隔离；
+  pip 源由 make 注入 `--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple`
 - **amd64 交叉编译库**：arm64 宿主（OrbStack/mac）交叉 amd64 时补装 fontconfig/freetype 的 amd64 dev 库
+
+**合并注意**：LinuxMirrors 脚本块插在 `FROM rust:1-bookworm` 的 WORKDIR/ARG 之后、
+官方第一条 apt 之前；runtime 阶段脚本块替换官方 `apt-get update && install` 的首行。
+官方若重构这两个 FROM 块，按"脚本紧跟 FROM、官方 apt 原样接续"重套。
 
 ## 8. 启动屏文案（「正在启动 DBX…」）
 

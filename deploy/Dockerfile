@@ -23,6 +23,18 @@ FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend
 ARG TARGETARCH
 WORKDIR /app
 ARG PIP_INDEX_URL=https://pypi.org/simple
+# nuwax fork: 使用 LinuxMirrors 一键配置阿里云 apt 镜像源（国内构建加速）
+# 参考: https://github.com/SuperManito/LinuxMirrors
+# rust:1-bookworm (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
+RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
+    --source mirrors.aliyun.com \
+    --protocol https \
+    --use-intranet-source false \
+    --install-epel false \
+    --backup false \
+    --upgrade-software false \
+    --clean-cache true \
+    --ignore-backup-tips
 RUN dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config perl python3-pip gcc-aarch64-linux-gnu \
@@ -138,6 +150,20 @@ RUN case "$TARGETARCH" in \
 # Stage 3: Final image
 FROM debian:bookworm-slim
 ARG TARGETPLATFORM
+# nuwax fork: runtime 阶段同样换阿里云 apt 镜像（本镜像仅作 dbx-web 二进制/静态资源
+# 的抽取载体,不关心体积——先装 curl 走一次官方源,再统一用 LinuxMirrors 脚本,
+# 后续 ~200MB 的 openjdk 等全走阿里云;curl 层有缓存,仅首次构建付官方源过路费）
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
+    --source mirrors.aliyun.com \
+    --protocol https \
+    --use-intranet-source false \
+    --install-epel false \
+    --backup false \
+    --upgrade-software false \
+    --clean-cache true \
+    --ignore-backup-tips \
+    && rm -rf /var/lib/apt/lists/*
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fontconfig \
