@@ -3,8 +3,8 @@ import { decode, encode } from "@msgpack/msgpack";
 import { toRaw } from "vue";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { apiUrl } from "@/lib/common/webPath";
+import { browserStorageScopeSuffix } from "@/lib/backend/workspaceStorageScope";
 
-const DB_NAME = "dbx-tab-runtime-cache";
 const DB_VERSION = 2;
 const RESULT_STORE = "resultSnapshots";
 const RESULT_METADATA_STORE = "resultSnapshotMetadata";
@@ -172,6 +172,12 @@ function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
   });
 }
 
+// nuwax fork: 结果缓存库按挂载路径加工作台后缀（见 workspaceStorageScope）——
+// 同源多工作台各自独立的库/配额/清理域，避免 prune 把别的工作台条目当孤儿误删。
+function scopedDbName(): string {
+  return `dbx-tab-runtime-cache${browserStorageScopeSuffix()}`;
+}
+
 let dbPromise: Promise<IDBDatabase | null> | undefined;
 const cacheKeyVersions = new Map<string, number>();
 
@@ -195,7 +201,7 @@ function openCacheDb(): Promise<IDBDatabase | null> {
   if (!idb) return Promise.resolve(null);
 
   dbPromise = new Promise((resolve) => {
-    const request = idb.open(DB_NAME, DB_VERSION);
+    const request = idb.open(scopedDbName(), DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(RESULT_STORE)) db.createObjectStore(RESULT_STORE);

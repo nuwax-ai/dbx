@@ -3,8 +3,8 @@
 本仓库是官方 [t8y2/dbx](https://github.com/t8y2/dbx) 的 fork，**核心用途是 dbx-web 模式的 Docker 自部署**。
 相对官方 main 保留少量刻意差异，本文档是这些差异的权威清单，合并官方更新时对照使用。
 
-> 快速定位所有定制点：前端搜 `UPDATER_ENABLED`、`startup.loading` 和注释 `nuwax`，Rust 侧搜 `nuwax`。
-> 最近的差异核验：2026-09-28（插件中心/隧道维护入口删除 + 关于我们改名之后）。
+> 快速定位所有定制点：前端搜 `UPDATER_ENABLED`、`startup.loading`、`browserStorageScopeSuffix` 和注释 `nuwax`，Rust 侧搜 `nuwax`。
+> 最近的差异核验：2026-09-29（浏览器存储工作台隔离之后）。
 
 ## 差异总览
 
@@ -21,6 +21,7 @@
 | 9 | 删除「插件中心」入口（2026-09-28） | `AppToolbar.vue` + `settingsStore.ts` + `settingsSearch.ts` + `App.vue` | 删按钮/菜单项/设置开关；插件系统本身保留 |
 | 10 | 删除「隧道维护」设置 tab（2026-09-28） | `EditorSettingsDialog.vue` + `settingsSearch.ts` | 删导航项 + tab 内容 + 搜索条目 |
 | 11 | 删除「更新管理」设置 tab（2026-09-28） | `EditorSettingsDialog.vue` + `settingsSearch.ts` | 删导航项 + tab 区块 + 搜索条目；更新设置字段/逻辑保留 |
+| 12 | 浏览器存储按挂载路径隔离工作台（2026-09-29） | `workspaceStorageScope.ts`（新）+ 3 个存储模块 | IndexedDB 库名/localStorage 兜底前缀追加 `browserStorageScopeSuffix()` 后缀 |
 
 ---
 
@@ -202,6 +203,50 @@ loading/error 组件 + 预载失败恢复。**合并时 StartupGate.vue 和 App.
 
 **注意**：更新中心弹层、工具栏更新图标本就被 `UPDATER_ENABLED` 门控，与此互补——
 更新功能的三个可见入口（工具栏/弹层/设置 tab）至此全部不可达。
+
+## 12. 浏览器存储按挂载路径隔离工作台（2026-09-29）
+
+**原因**：RCoder 以同源反代方式挂载多个 dbx 工作台
+（`/api/v1/userapp/proxy/dbx/{env}/{user_id}/{app_id}/`，代理剥前缀直连各容器内的 root 模式
+dbx-web）。浏览器 IndexedDB/localStorage 只按 origin 隔离，不按路径——dev/prod/不同 app 的
+标签（含 SQL 草稿）、编辑器位置、结果缓存会互相覆盖，且 A 工作台的 prune 会把 B 的缓存条目
+按孤儿规则误删（orphan 按 createdAt>24h 清理）。连接/元数据缓存在后端容器内，天然隔离，
+无需处理。
+
+**实现**：新增 `apps/desktop/src/lib/backend/workspaceStorageScope.ts`，以官方
+`dbxWebBasePath()`（运行时从 `location.pathname` 推断挂载前缀，`/login` 已剥除）生成后缀：
+
+```
+/api/v1/userapp/proxy/dbx/dev/1/197  →  :api-v1-userapp-proxy-dbx-dev-1-197
+```
+
+三个存储模块的库名/localStorage 兜底前缀追加该后缀：
+
+| 模块 | 库名 |
+|------|------|
+| `lib/backend/browserAppStateStorage.ts` | `dbx-app-state:<slug>`（open_tabs / saved_sql_editor_positions / editor_settings / transfer_task_library）|
+| `lib/tabs/tabResultCache.ts` | `dbx-tab-runtime-cache:<slug>`（每工作台独立 512MB 配额与 prune 域）|
+| `lib/nacos/nacosReplaceHistoryStorage.ts` | `dbx-nacos-replace-history:<slug>` |
+
+**兼容性**：桌面版（tauri 协议）与根路径部署（`/`）推导 base 为空 → 后缀为空串 →
+存储名与官方逐字节相同，存量用户零迁移，官方测试零适配（jsdom/happy-dom pathname 为 `/`）。
+
+**语义**：`editor_settings` 随工作台隔离（用户确认）——`transfer_task_library` 引用各容器
+连接 ID，共享本就是错的；"工作台=完全独立环境"更一致。主题/侧栏/语言等 UI 偏好仍走各自
+localStorage 直存键，同类同浏览器共享（100+ 调用点，刻意不动，避免合并摩擦）。
+
+**旧数据**：升级前共享时代的未加后缀条目原样留在库里、不再被读取（保留可查）；不做
+"复制进每个工作台"的迁移。legacy `dbx-open-tabs` localStorage 恢复路径维持官方现状：
+只有升级后第一个打开的工作台导入一次然后清除。
+
+**合并注意**：官方对这三个模块的重构若改到库名常量，保持"基础名 + `browserStorageScopeSuffix()`"
+的形态重套即可；`queryStore.database-open.spec` 等官方测试不需要任何适配。此问题为通用
+子路径反代部署问题，适合后续 PR 上游化。
+
+**测试**：`lib/backend/__tests__/workspaceStorageScope.spec.ts`（后缀推导 + 存储路由 +
+根路径字节兼容）。验证方式：本地起两个 dbx-web 后端 + 20 行 node 路径代理
+（`/ws/dev/`→4225、`/ws/prod/`→4226，剥前缀同 RCoder），确认 IndexedDB 出现
+`dbx-app-state:ws-{dev,prod}` 两套库、标签互不可见、刷新后各自恢复。
 
 ## 合并摩擦控制原则（2026-09-28 与用户确认）
 

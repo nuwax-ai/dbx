@@ -1,9 +1,17 @@
 import { safeLocalStorageGet, safeLocalStorageRemove, safeLocalStorageSet } from "@/lib/backend/safeStorage";
+import { browserStorageScopeSuffix } from "@/lib/backend/workspaceStorageScope";
 
-const DB_NAME = "dbx-app-state";
 const DB_VERSION = 1;
 const STORE_NAME = "state";
-const LOCAL_STORAGE_PREFIX = "dbx-app-state:";
+
+// nuwax fork: 库名/localStorage 兜底前缀按挂载路径加工作台后缀（见 workspaceStorageScope）。
+function scopedDbName(): string {
+  return `dbx-app-state${browserStorageScopeSuffix()}`;
+}
+
+function fallbackKey(key: string) {
+  return `dbx-app-state${browserStorageScopeSuffix()}:${key}`;
+}
 
 function indexedDb(): IDBFactory | undefined {
   return typeof globalThis.indexedDB === "undefined" ? undefined : globalThis.indexedDB;
@@ -32,7 +40,7 @@ function openDb(): Promise<IDBDatabase | null> {
   if (!idb) return Promise.resolve(null);
 
   dbPromise = new Promise((resolve) => {
-    const request = idb.open(DB_NAME, DB_VERSION);
+    const request = idb.open(scopedDbName(), DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME);
@@ -42,10 +50,6 @@ function openDb(): Promise<IDBDatabase | null> {
     request.onblocked = () => resolve(null);
   });
   return dbPromise;
-}
-
-function fallbackKey(key: string) {
-  return `${LOCAL_STORAGE_PREFIX}${key}`;
 }
 
 async function withStore<T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequest<T>): Promise<T | null> {

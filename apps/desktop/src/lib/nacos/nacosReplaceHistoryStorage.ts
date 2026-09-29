@@ -1,6 +1,6 @@
 import type { NacosReplaceHistoryEntry } from "./nacosReplaceHistory";
+import { browserStorageScopeSuffix } from "@/lib/backend/workspaceStorageScope";
 
-const DB_NAME = "dbx-nacos-replace-history";
 const KEY_ID = "encryption-key";
 interface EncryptedRow {
   id: string;
@@ -26,7 +26,8 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
 
 async function openDatabase(): Promise<IDBDatabase> {
   if (!globalThis.indexedDB || !globalThis.crypto?.subtle) throw new Error("nacos-history-storage-unavailable");
-  const request = indexedDB.open(DB_NAME, 1);
+  // nuwax fork: 库名按挂载路径加工作台后缀（见 workspaceStorageScope）。
+  const request = indexedDB.open(`dbx-nacos-replace-history${browserStorageScopeSuffix()}`, 1);
   request.onupgradeneeded = () => {
     const db = request.result;
     db.createObjectStore("keys");
