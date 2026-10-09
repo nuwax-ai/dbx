@@ -4,7 +4,7 @@
 相对官方 main 保留少量刻意差异，本文档是这些差异的权威清单，合并官方更新时对照使用。
 
 > 快速定位所有定制点：前端搜 `UPDATER_ENABLED`、`startup.loading`、`browserStorageScopeSuffix` 和注释 `nuwax`，Rust 侧搜 `nuwax`。
-> 最近的差异核验：2026-09-29（浏览器存储工作台隔离之后）。
+> 最近的差异核验：2026-10-09（合并官方 566 提交之后，逐文件核对 diff = 12 条定制）。
 
 ## 差异总览
 

@@ -693,6 +693,55 @@ describe("useDataGridEditor appendPastedRowsToNewRow", () => {
     mocks.getConfig.mockReturnValue({ id: "connection-1", db_type: "postgres" });
   });
 
+  it("pastes new rows without preallocating blanks and preserves existing edits in one undo step", () => {
+    const editor = createEditor(undefined, true, undefined, undefined, [["old", "keep", "last"]]);
+    editor.newRows.value = [["pending", null, null]];
+    editor.applyCellValue(0, 0, "edited");
+
+    const result = editor.appendPastedRowsAsNewRows(
+      [
+        ["Ada", "Lovelace"],
+        ["Grace", "Hopper"],
+      ],
+      [0, 2],
+    );
+
+    expect(result).toEqual({ ok: true, rowCount: 2 });
+    expect(editor.newRows.value).toEqual([
+      ["pending", null, null],
+      ["Ada", null, "Lovelace"],
+      ["Grace", null, "Hopper"],
+    ]);
+    expect(editor.dirtyRows.value.get(0)?.get(0)).toBe("edited");
+    editor.undoPendingChange();
+    expect(editor.newRows.value).toEqual([["pending", null, null]]);
+    expect(editor.dirtyRows.value.get(0)?.get(0)).toBe("edited");
+    editor.redoPendingChange();
+    expect(editor.newRows.value).toHaveLength(3);
+  });
+
+  it("aligns INSERT columns and clears generated keys without creating a placeholder row", () => {
+    const editor = createEditor(undefined, true, undefined, undefined, [], undefined, [
+      { name: "first", data_type: "integer", extra: "autoincrement" },
+      { name: "hidden", data_type: "varchar" },
+      { name: "last", data_type: "varchar" },
+    ]);
+    editor.newRows.value = [];
+
+    expect(editor.appendPastedRowsAsNewRows([["Lovelace", "42"]], [0, 2], ["last", "first"])).toEqual({ ok: true, rowCount: 1 });
+    expect(editor.newRows.value).toEqual([[null, null, "Lovelace"]]);
+  });
+
+  it("rejects empty or read-only pastes without leaving blank rows", () => {
+    const editor = createEditor(undefined, true, undefined, [0]);
+    editor.newRows.value = [];
+
+    expect(editor.appendPastedRowsAsNewRows([], [0, 2])).toEqual({ ok: false, reason: "empty-paste" });
+    expect(editor.appendPastedRowsAsNewRows([["Ada"]], [0])).toEqual({ ok: false, reason: "readonly-column" });
+    expect(editor.newRows.value).toEqual([]);
+    expect(editor.hasPendingChanges.value).toBe(false);
+  });
+
   it("fills the selected blank new row and appends remaining rows using visible columns", () => {
     const editor = createEditor();
 
@@ -711,6 +760,36 @@ describe("useDataGridEditor appendPastedRowsToNewRow", () => {
       ["Grace", null, "Hopper"],
     ]);
     expect(editor.hasPendingChanges.value).toBe(true);
+  });
+
+  it("aligns pasted INSERT values by column name regardless of visible order", () => {
+    const editor = createEditor(["first", "hidden", "last"]);
+
+    // Visible columns are [2, 0]: "last" first, "first" second. The INSERT
+    // column names must map values to the real grid columns, not positions.
+    const result = editor.appendPastedRowsToNewRow(-1, [["Lovelace", "Ada"]], [2, 0], ["last", "first"]);
+
+    expect(result).toEqual({ ok: true, rowCount: 1 });
+    expect(editor.newRows.value).toEqual([["Ada", null, "Lovelace"]]);
+  });
+
+  it("matches INSERT column names case-insensitively and ignores unknown names", () => {
+    const editor = createEditor(["first", "hidden", "last"]);
+
+    const result = editor.appendPastedRowsToNewRow(-1, [["Ada", "extra", "Lovelace"]], [0, 1, 2], ["FIRST", "not_here", "Last"]);
+
+    expect(result).toEqual({ ok: true, rowCount: 1 });
+    expect(editor.newRows.value).toEqual([["Ada", null, "Lovelace"]]);
+  });
+
+  it("rejects an INSERT paste when no column names match", () => {
+    const editor = createEditor(["first", "hidden", "last"]);
+
+    const result = editor.appendPastedRowsToNewRow(-1, [["x"]], [0, 1, 2], ["nope"]);
+
+    expect(result).toEqual({ ok: false, reason: "no-matching-columns" });
+    // The pre-seeded blank new row stays untouched.
+    expect(editor.newRows.value).toEqual([[null, null, null]]);
   });
 
   it("clears generated key columns instead of pasting the copied value", () => {

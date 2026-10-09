@@ -51,7 +51,7 @@ interface ConditionalUpdateExecution {
   outcome: ConditionalUpdateOutcome;
 }
 
-export type DataGridAppendPastedRowsResult = { ok: true; rowCount: number } | { ok: false; reason: "not-editable" | "invalid-target" | "target-not-empty" | "empty-paste" | "readonly-column" };
+export type DataGridAppendPastedRowsResult = { ok: true; rowCount: number } | { ok: false; reason: "not-editable" | "invalid-target" | "target-not-empty" | "empty-paste" | "readonly-column" | "no-matching-columns" };
 
 type CommitEditResult =
   | {
@@ -1240,33 +1240,62 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     return row.every((value) => value === null || (typeof value === "string" && value.trim() === ""));
   }
 
-  function appendPastedRowsToNewRow(targetRowId: number, pastedRows: readonly (readonly (string | null)[])[], columnIndexes: readonly number[]): DataGridAppendPastedRowsResult {
+  function appendPastedRowsAsNewRows(pastedRows: readonly (readonly (string | null)[])[], columnIndexes: readonly number[], columnNames?: readonly string[] | null): DataGridAppendPastedRowsResult {
+    return appendPastedRows(null, pastedRows, columnIndexes, columnNames);
+  }
+
+  function appendPastedRowsToNewRow(targetRowId: number, pastedRows: readonly (readonly (string | null)[])[], columnIndexes: readonly number[], columnNames?: readonly string[] | null): DataGridAppendPastedRowsResult {
+    return appendPastedRows(targetRowId, pastedRows, columnIndexes, columnNames);
+  }
+
+  // A null target appends populated rows directly, without a preparatory blank
+  // row or a second undo entry. Cell/row paste still validates its blank target.
+  function appendPastedRows(targetRowId: number | null, pastedRows: readonly (readonly (string | null)[])[], columnIndexes: readonly number[], columnNames?: readonly string[] | null): DataGridAppendPastedRowsResult {
     if (!editable.value) return { ok: false, reason: "not-editable" };
     if (pastedRows.every((row) => row.every((value) => value === ""))) {
       return { ok: false, reason: "empty-paste" };
     }
 
-    const target = getRowItem(targetRowId);
-    if ((!target?.isNew && !target?.isDraft) || target.isDeleted || isSavingNewRow(target)) {
+    const target = targetRowId === null ? undefined : getRowItem(targetRowId);
+    if (targetRowId !== null && ((!target?.isNew && !target?.isDraft) || target.isDeleted || isSavingNewRow(target))) {
       return { ok: false, reason: "invalid-target" };
     }
 
-    const targetIsDraft = target.isDraft === true;
+    const targetIsDraft = target?.isDraft === true;
     if (targetIsDraft) ensureQuickEntryDraftRow();
-    const targetNewIndex = target.newIndex;
+    const targetNewIndex = target?.newIndex;
     const targetRow = targetIsDraft ? quickEntryDraftRow.value : targetNewIndex === undefined ? undefined : newRows.value[targetNewIndex];
-    if (!targetRow || !isBlankNewRow(targetRow)) return { ok: false, reason: "target-not-empty" };
+    if (targetRowId !== null && (!targetRow || !isBlankNewRow(targetRow))) return { ok: false, reason: "target-not-empty" };
 
     const pastedColumnCount = Math.max(...pastedRows.map((row) => row.length));
     if (pastedColumnCount <= 0) return { ok: false, reason: "empty-paste" };
 
-    const targetColumns = columnIndexes.slice(0, pastedColumnCount);
-    if (targetColumns.some((columnIndex) => !canEditColumn(columnIndex))) return { ok: false, reason: "readonly-column" };
+    // With explicit column names (SQL INSERT), align pasted values by column
+    // name instead of visible position. Unknown names are ignored together
+    // with their values; if none of the pasted names matches this result's
+    // columns, reject the paste.
+    const valueTargets: Array<{ columnIndex: number; valueIndex: number }> = [];
+    if (columnNames?.length) {
+      const nameToColumnIndex = new Map<string, number>();
+      columnIndexes.forEach((columnIndex) => {
+        const name = sourceColumns.value?.[columnIndex] ?? result.value.columns[columnIndex];
+        if (name !== undefined && !nameToColumnIndex.has(name.toLowerCase())) nameToColumnIndex.set(name.toLowerCase(), columnIndex);
+      });
+      columnNames.forEach((name, valueIndex) => {
+        const columnIndex = nameToColumnIndex.get(name.toLowerCase());
+        if (columnIndex !== undefined) valueTargets.push({ columnIndex, valueIndex });
+      });
+      if (valueTargets.length === 0) return { ok: false, reason: "no-matching-columns" };
+    } else {
+      columnIndexes.slice(0, pastedColumnCount).forEach((columnIndex, valueIndex) => valueTargets.push({ columnIndex, valueIndex }));
+    }
+    if (valueTargets.length === 0) return { ok: false, reason: "no-matching-columns" };
+    if (valueTargets.some(({ columnIndex }) => !canEditColumn(columnIndex))) return { ok: false, reason: "readonly-column" };
 
     const nextRows = newRows.value.map((row) => [...row]);
     const nextMeta = cloneNewRowMeta(newRowMeta.value);
     let reusableNewRowCount = 0;
-    if (!targetIsDraft) {
+    if (targetNewIndex !== undefined) {
       for (let rowIndex = targetNewIndex!; rowIndex < nextRows.length && reusableNewRowCount < pastedRows.length; rowIndex++) {
         if (!isBlankNewRow(nextRows[rowIndex]!)) break;
         reusableNewRowCount++;
@@ -1275,24 +1304,24 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const shouldClearColumn = clonedColumnClearPredicate();
     const mappedRows = pastedRows.map((pastedRow, rowIndex) => {
       const nextRow = rowIndex < reusableNewRowCount ? nextRows[targetNewIndex! + rowIndex]! : emptyDraftRow();
-      for (let columnOffset = 0; columnOffset < Math.min(pastedRow.length, targetColumns.length); columnOffset++) {
-        const columnIndex = targetColumns[columnOffset]!;
+      for (const { columnIndex, valueIndex } of valueTargets) {
+        if (valueIndex >= pastedRow.length) continue;
         // Pasting a copied row into a new row must not reuse its generated key.
         if (shouldClearColumn(columnIndex)) {
           nextRow[columnIndex] = null;
           continue;
         }
-        const value = pastedRow[columnOffset];
+        const value = pastedRow[valueIndex];
         nextRow[columnIndex] = value === null ? null : coerceCellValue(value, nextRow[columnIndex], columnIndex);
       }
       return nextRow;
     });
 
     pushUndoSnapshot();
-    if (targetIsDraft) {
+    if (targetIsDraft || targetRowId === null) {
       nextRows.push(...mappedRows);
       for (let i = 0; i < mappedRows.length; i++) nextMeta.push(allocateNewRowMeta(null));
-      quickEntryDraftRow.value = emptyDraftRow();
+      if (targetIsDraft) quickEntryDraftRow.value = emptyDraftRow();
     } else {
       // Reused blank rows keep their original placement; rows added beyond the
       // reusable count append at the end (preserving existing paste behavior).
@@ -1592,6 +1621,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (!tableMeta.value) return null;
     return {
       databaseType: resolvedDatabaseType.value,
+      serverVersion: connectionStore.getConfig(connectionId.value ?? "")?.database_info?.productVersion,
       identifierQuote: connectionStore.connectionIdentifierQuote?.(connectionId.value),
       tableMeta: tableMeta.value,
       columns: result.value.columns,
@@ -2332,6 +2362,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     addRow,
     addRows,
     appendPastedRowsToNewRow,
+    appendPastedRowsAsNewRows,
     cloneRow,
     cloneRows,
     applyDeleteRows,

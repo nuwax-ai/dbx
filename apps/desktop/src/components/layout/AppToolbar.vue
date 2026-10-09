@@ -2,7 +2,7 @@
 import { computed, ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, FolderTree, Pin, PinOff, CalendarClock, Waypoints } from "@lucide/vue";
+import { ChevronsRight, DatabaseZap, FilePlus2, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, LogOut, CloudDownload, Package, FileDown, FolderTree, Pin, PinOff, CalendarClock, Waypoints, RefreshCw } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown, { type LightDropdownItem } from "@/components/ui/LightDropdown.vue";
@@ -10,8 +10,10 @@ import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
 import ToolbarUpdateIcon from "@/components/layout/ToolbarUpdateIcon.vue";
 import PluginShortcutToolbar from "@/components/plugins/PluginShortcutToolbar.vue";
+import AppLogo from "@/components/icons/AppLogo.vue";
 import { MAC_TRAFFIC_LIGHT_X, macTrafficLightInsetPaddingForScale, shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { formatShortcutTooltip } from "@/lib/editor/shortcutDisplay";
 
 const props = defineProps<{
   showSidebarExpand?: boolean;
@@ -39,6 +41,8 @@ const props = defineProps<{
   hasConnections: boolean;
   canNewQuery: boolean;
   hasSqlFileConnections: boolean;
+  immediateSyncing: boolean;
+  showLogout?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -58,12 +62,15 @@ const emit = defineEmits<{
   "open-data-compare": [];
   "open-backups": [];
   "open-mcp-settings": [];
+  "immediate-sync": [];
+  logout: [];
 }>();
 
 const { t } = useI18n();
 
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
+const webLogoPosition = computed(() => settingsStore.editorSettings.webLogoPosition ?? "left");
 const showToolbarUpdateEntry = computed(() => toolbarItems.value.checkUpdates || props.hasUpdateAvailable);
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, isAlwaysOnTop, minimize, toggleMaximize, toggleAlwaysOnTop, close } = useWindowControls();
 // The in-app updater misbehaves in this fork's Docker deployment; keep its toolbar entries hidden.
@@ -78,6 +85,10 @@ const updateTooltip = computed(() => {
   if (props.hasUpdateAvailable && props.updateReadyToInstall) return t("updates.downloadedReady", { version: props.updateVersion ?? "" });
   return t("updates.check");
 });
+const sidebarExpandTooltip = computed(() => formatShortcutTooltip(t("sidebar.expand"), settingsStore.editorSettings.shortcuts.toggleSidebar));
+const newQueryTooltip = computed(() => formatShortcutTooltip(t("toolbar.newQuery"), settingsStore.editorSettings.shortcuts.newQuery));
+const aiTooltip = computed(() => formatShortcutTooltip("AI", settingsStore.editorSettings.shortcuts.toggleAiPanel));
+const settingsTooltip = computed(() => (props.hasMcpUpdateAvailable ? t("toolbar.mcpUpdateAvailable") : formatShortcutTooltip(t("settings.title"), settingsStore.editorSettings.shortcuts.openSettings)));
 
 const sqlLibrarySaveFeedbackActive = ref(false);
 const SQL_LIBRARY_BOOKMARK_PATH = "M10 2 L10 10 L13 7 L16 10 L16 2";
@@ -166,6 +177,15 @@ const collapsibleRightItemDefs = computed(() => {
     disabled: boolean;
   }
   const items: ItemDef[] = [];
+  if (toolbarItems.value.immediateSync) {
+    items.push({
+      key: "immediateSync",
+      label: t("toolbar.immediateSync"),
+      icon: RefreshCw,
+      action: () => emit("immediate-sync"),
+      disabled: props.immediateSyncing,
+    });
+  }
   if (UPDATER_ENABLED && showToolbarUpdateEntry.value) {
     items.push({
       key: "checkUpdates",
@@ -337,6 +357,11 @@ function handleWindowResize() {
 
 watch(collapsibleRightItemDefs, () => scheduleToolbarLayout(), { flush: "post" });
 watch(
+  () => settingsStore.editorSettings.webLogoPosition,
+  () => scheduleToolbarLayout(),
+  { flush: "post" },
+);
+watch(
   () => props.showSidebarExpand,
   () => scheduleToolbarLayout(),
   { flush: "post" },
@@ -486,13 +511,25 @@ const toolbarStyle = computed(() => {
 
 <template>
   <div ref="toolbarEl" class="app-toolbar h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :style="toolbarStyle" data-tauri-drag-region @dblclick="onToolbarDblClick">
+    <a
+      v-if="!isDesktop && webLogoPosition === 'left'"
+      href="https://dbxio.com"
+      target="_blank"
+      rel="noopener noreferrer"
+      class="flex items-center gap-1.5 h-8 px-2 rounded-md hover:bg-muted/60 transition-colors shrink-0 select-none mr-0.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      title="DBX"
+      data-testid="web-brand-logo"
+    >
+      <AppLogo class="h-5 w-5 rounded shrink-0 pointer-events-none" />
+      <span class="font-bold text-xs tracking-tight text-foreground/90 translate-y-px">DBX</span>
+    </a>
     <Tooltip v-if="showSidebarExpand">
       <TooltipTrigger as-child>
         <Button variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('sidebar.expand')" @click="emit('expand-sidebar')">
           <ChevronsRight class="h-4 w-4" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent>{{ t("sidebar.expand") }}</TooltipContent>
+      <TooltipContent>{{ sidebarExpandTooltip }}</TooltipContent>
     </Tooltip>
     <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-connection')">
       <span class="inline-flex items-center gap-1">
@@ -501,10 +538,15 @@ const toolbarStyle = computed(() => {
       </span>
     </Button>
 
-    <Button v-if="canNewQuery" variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')">
-      <FilePlus2 class="h-3.5 w-3.5" />
-      <span :class="toolbarTextLabelClass">{{ t("toolbar.newQuery") }}</span>
-    </Button>
+    <Tooltip v-if="canNewQuery">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')">
+          <FilePlus2 class="h-3.5 w-3.5" />
+          <span :class="toolbarTextLabelClass">{{ t("toolbar.newQuery") }}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ newQueryTooltip }}</TooltipContent>
+    </Tooltip>
 
     <template v-if="!toolbarCollapsed">
       <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('open-transfer')" :disabled="!hasConnections">
@@ -583,6 +625,15 @@ const toolbarStyle = computed(() => {
           <TooltipContent>{{ updateTooltip }}</TooltipContent>
         </Tooltip>
       </template>
+
+      <Tooltip v-if="toolbarItems.immediateSync">
+        <TooltipTrigger as-child>
+          <Button v-show="isRightItemVisible('immediateSync')" variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('toolbar.immediateSync')" :aria-busy="immediateSyncing" :disabled="immediateSyncing" @click="emit('immediate-sync')">
+            <RefreshCw class="toolbar-action-icon h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.immediateSync") }}</TooltipContent>
+      </Tooltip>
 
       <Tooltip v-if="showAlwaysOnTopButton">
         <TooltipTrigger as-child>
@@ -681,10 +732,23 @@ const toolbarStyle = computed(() => {
             <span v-if="showAiPanel" class="toolbar-panel-status" aria-hidden="true" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>AI</TooltipContent>
+        <TooltipContent>{{ aiTooltip }}</TooltipContent>
       </Tooltip>
     </div>
     <!-- /rightWrapper -->
+
+    <a
+      v-if="!isDesktop && webLogoPosition === 'right'"
+      href="https://dbxio.com"
+      target="_blank"
+      rel="noopener noreferrer"
+      class="flex items-center gap-1.5 h-8 px-2 rounded-md hover:bg-muted/60 transition-colors shrink-0 select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      title="DBX"
+      data-testid="web-brand-logo"
+    >
+      <AppLogo class="h-5 w-5 rounded shrink-0 pointer-events-none" />
+      <span class="font-bold text-xs tracking-tight text-foreground/90 translate-y-px">DBX</span>
+    </a>
 
     <Tooltip>
       <TooltipTrigger as-child>
@@ -694,7 +758,16 @@ const toolbarStyle = computed(() => {
           <span v-if="hasMcpUpdateAvailable" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" :aria-label="t('toolbar.mcpUpdateAvailable')" :title="t('toolbar.mcpUpdateAvailable')" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent>{{ hasMcpUpdateAvailable ? t("toolbar.mcpUpdateAvailable") : t("settings.title") }}</TooltipContent>
+      <TooltipContent>{{ settingsTooltip }}</TooltipContent>
+    </Tooltip>
+
+    <Tooltip v-if="showLogout">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('auth.logout')" @click="emit('logout')">
+          <LogOut class="toolbar-action-icon h-4 w-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ t("auth.logout") }}</TooltipContent>
     </Tooltip>
 
     <WindowControls v-if="showControls" :is-maximized="isMaximized" @minimize="minimize" @toggle-maximize="toggleMaximize" @close="close" />
