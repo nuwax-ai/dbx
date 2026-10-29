@@ -3778,6 +3778,10 @@ mod tests {
         assert_eq!(super::normalize_postgres_url_params("SSLMODE=PREFERRED", false), "sslmode=prefer");
         // 未知值丢弃,由末尾默认注入兜底
         assert_eq!(super::normalize_postgres_url_params("sslmode=Bogus", false), "sslmode=prefer");
+        // 边界:空值、只有键无值同样走丢弃+兜底;百分号编码的键解码后同样命中
+        assert_eq!(super::normalize_postgres_url_params("sslmode=", false), "sslmode=prefer");
+        assert_eq!(super::normalize_postgres_url_params("sslmode", false), "sslmode=prefer");
+        assert_eq!(super::normalize_postgres_url_params("ssl%6Dode=DISABLE", false), "sslmode=disable");
     }
 
     #[test]
