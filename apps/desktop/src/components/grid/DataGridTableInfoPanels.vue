@@ -172,7 +172,7 @@ const overviewRows = computed(() => {
               <span v-if="index.index_type" class="rounded bg-muted px-1.5 py-0.5 text-muted-foreground">{{ index.index_type }}</span>
             </div>
             <div class="mt-2 font-mono text-[11px] text-muted-foreground break-all">
-              {{ index.columns.join(", ") }}
+              {{ index.columns.map((column, columnIndex) => column + (index.key_directions?.[columnIndex]?.toUpperCase() === "DESC" ? " DESC" : "")).join(", ") }}
             </div>
           </div>
           <Button v-if="props.canManageMongoIndexes && !props.isProtectedMongoIndex(index)" variant="ghost" size="sm" class="h-7 shrink-0 px-2 text-[11px] text-destructive hover:text-destructive" @click="emit('requestDropMongoIndex', index)">
@@ -240,12 +240,12 @@ const overviewRows = computed(() => {
       {{ t("grid.tableInfoEmpty") }}
     </div>
     <div v-else class="divide-y">
-      <div v-for="constraint in props.constraints" :key="constraint.name" class="p-3 text-xs" :class="constraint.enabled ? '' : 'opacity-60'">
+      <div v-for="constraint in props.constraints" :key="constraint.name" class="p-3 text-xs" :class="constraint.enabled === false ? 'opacity-60' : ''">
         <div class="flex flex-wrap items-center gap-1.5">
           <span class="font-medium truncate">{{ constraint.name }}</span>
           <span class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ constraint.constraint_type }}</span>
-          <span v-if="!constraint.enabled" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t("grid.tableInfoConstraintDisabled") }}</span>
-          <span v-else-if="!constraint.valid" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t("grid.tableInfoConstraintNotValidated") }}</span>
+          <span class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t(constraint.enabled === true ? "grid.tableInfoConstraintEnabled" : constraint.enabled === false ? "grid.tableInfoConstraintDisabled" : "grid.tableInfoConstraintEnabledUnknown") }}</span>
+          <span class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t(constraint.valid === true ? "grid.tableInfoConstraintValidated" : constraint.valid === false ? "grid.tableInfoConstraintNotValidated" : "grid.tableInfoConstraintValidationUnknown") }}</span>
         </div>
         <div v-if="constraint.columns.length" class="mt-1 font-mono text-[11px] text-muted-foreground break-all">{{ constraint.columns.join(", ") }}</div>
         <div v-if="constraint.ref_table" class="mt-1 font-mono text-[11px] text-muted-foreground break-all">-> {{ constraint.ref_schema ? `${constraint.ref_schema}.` : "" }}{{ constraint.ref_table }}{{ constraint.ref_columns.length ? `(${constraint.ref_columns.join(", ")})` : "" }}</div>

@@ -27,6 +27,90 @@ import java.util.Locale;
 import java.util.Map;
 
 class SqlServerLegacyAgentTest {
+    @Test
+    void autoCommitBatchesCollectEveryResultAndUpdateCountOnce() {
+        SqlServerLegacyAgent agent = new SqlServerLegacyAgent();
+        java.util.concurrent.atomic.AtomicInteger index = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger executions = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger drained = new java.util.concurrent.atomic.AtomicInteger();
+        ResultSet first = autoCommitRows(drained, 101, 102);
+        ResultSet last = autoCommitRows(new java.util.concurrent.atomic.AtomicInteger(), 303);
+        java.sql.Statement statement = proxy(java.sql.Statement.class, (method, args) -> {
+            switch (method.getName()) {
+                case "execute": executions.incrementAndGet(); return true;
+                case "setMaxRows": throw new AssertionError("Do not cap the server's batch execution");
+                case "getResultSet": return index.get() == 0 ? first : last;
+                case "getMoreResults": return index.incrementAndGet() == 2;
+                case "getUpdateCount": return index.get() == 1 ? 7 : -1;
+                default: return defaultValue(method.getReturnType());
+            }
+        });
+        TestSupport.setPrivateConnection(agent, proxy(Connection.class, (method, args) -> {
+            if (method.getName().equals("createStatement")) return statement;
+            if (method.getName().equals("getAutoCommit")) return true;
+            if (method.getName().equals("commit") || method.getName().equals("rollback")) {
+                throw new AssertionError("Auto-commit query must not commit/rollback implicitly");
+            }
+            return defaultValue(method.getReturnType());
+        }));
+
+        List<com.dbx.agent.QueryResult> results = agent.executeQueryResults(
+            "SELECT 101; UPDATE t SET n=7; SELECT 303", null, new com.dbx.agent.ExecuteQueryOptions(1, null, 5));
+        Assertions.assertEquals(1, executions.get());
+        Assertions.assertEquals(3, results.size());
+        Assertions.assertEquals(101, results.get(0).getRows().get(0).get(0));
+        Assertions.assertTrue(results.get(0).getTruncated());
+        Assertions.assertEquals(2, drained.get());
+        Assertions.assertEquals(7, results.get(1).getAffected_rows());
+        Assertions.assertEquals(303, results.get(2).getRows().get(0).get(0));
+        Assertions.assertTrue(agent.permitsAutomaticReconnect());
+    }
+
+    @Test
+    void autoCommitBatchPropagatesErrorsAfterTheFirstResult() {
+        SqlServerLegacyAgent agent = new SqlServerLegacyAgent();
+        java.util.concurrent.atomic.AtomicInteger executions = new java.util.concurrent.atomic.AtomicInteger();
+        java.sql.Statement statement = proxy(java.sql.Statement.class, (method, args) -> {
+            switch (method.getName()) {
+                case "execute": executions.incrementAndGet(); return true;
+                case "getResultSet": return autoCommitRows(new java.util.concurrent.atomic.AtomicInteger(), 101);
+                case "getMoreResults": throw new SQLException("late batch error");
+                default: return defaultValue(method.getReturnType());
+            }
+        });
+        TestSupport.setPrivateConnection(agent, proxy(Connection.class, (method, args) -> {
+            if (method.getName().equals("createStatement")) return statement;
+            if (method.getName().equals("getAutoCommit")) return true;
+            return defaultValue(method.getReturnType());
+        }));
+        RuntimeException error = Assertions.assertThrows(RuntimeException.class, () -> agent.executeQueryResults(
+            "SELECT 101; RAISERROR('late batch error',16,1)", null, new com.dbx.agent.ExecuteQueryOptions(1, null, 5)));
+        Assertions.assertTrue(error.getMessage().contains("late batch error"));
+        Assertions.assertEquals(1, executions.get());
+    }
+
+    private static ResultSet autoCommitRows(java.util.concurrent.atomic.AtomicInteger drained, int... values) {
+        java.sql.ResultSetMetaData metadata = proxy(java.sql.ResultSetMetaData.class, (method, args) -> {
+            switch (method.getName()) {
+                case "getColumnCount": return 1;
+                case "getColumnLabel": return "n";
+                case "getColumnType": return Types.INTEGER;
+                case "getColumnTypeName": return "int";
+                default: return defaultValue(method.getReturnType());
+            }
+        });
+        java.util.concurrent.atomic.AtomicInteger row = new java.util.concurrent.atomic.AtomicInteger(-1);
+        return proxy(ResultSet.class, (method, args) -> {
+            switch (method.getName()) {
+                case "next": if (row.incrementAndGet() >= values.length) return false; drained.incrementAndGet(); return true;
+                case "getMetaData": return metadata;
+                case "getObject":
+                case "getInt": return values[row.get()];
+                default: return defaultValue(method.getReturnType());
+            }
+        });
+    }
+
     private static final class ManualFixture {
         final SqlServerLegacyAgent agent = new SqlServerLegacyAgent();
         final java.util.concurrent.atomic.AtomicInteger count = new java.util.concurrent.atomic.AtomicInteger();
@@ -361,6 +445,27 @@ class SqlServerLegacyAgentTest {
     }
 
     @Test
+    void modernSqlServerColumnCommentsComeFromExtendedProperties() {
+        SqlServerLegacyAgent agent = new SqlServerLegacyAgent();
+        TestSupport.setPrivateConnection(agent, sqlServer2000CommentConnection(
+            null,
+            Arrays.asList(
+                Arrays.asList("NAME", "Display name", "MS_Description")
+            ),
+            null
+        ));
+        setSqlServer2000Mode(agent, false);
+
+        List<ColumnInfo> columns = agent.getColumns("dbo", "USERS");
+
+        // mssql-jdbc reports NULL REMARKS for every SQL Server column, so the
+        // MS_Description written by the structure editor must be merged in.
+        Assertions.assertEquals("Display name", columns.get(1).getComment());
+        Assertions.assertNull(columns.get(0).getComment());
+        Assertions.assertEquals("JDBC remark", columns.get(2).getComment());
+    }
+
+    @Test
     void sqlServer2000ColumnCommentsFailSoftWhenCatalogThrowsRuntimeError() {
         SqlServerLegacyAgent agent = new SqlServerLegacyAgent();
         TestSupport.setPrivateConnection(agent, sqlServer2000CommentConnection(
@@ -487,7 +592,7 @@ class SqlServerLegacyAgentTest {
     }
 
     @Test
-    void legacyTlsUrlHonorsExplicitProtocolAndRetainsEncryption() {
+    void legacyTlsUrlHonorsDisabledEncryptionAndSkipsSslProtocol() {
         ConnectParams params = new ConnectParams(
             "db.example.com",
             14330,
@@ -500,9 +605,29 @@ class SqlServerLegacyAgentTest {
         );
 
         Assertions.assertEquals(
-            "jdbc:sqlserver://db.example.com:14330;databaseName=appdb;applicationName=dbx;encrypt=true;trustServerCertificate=true;sslProtocol=TLSv1.2",
+            "jdbc:sqlserver://db.example.com:14330;databaseName=appdb;applicationName=dbx;encrypt=false;trustServerCertificate=true",
             SqlServerLegacyAgent.legacyTlsUrl(params)
         );
+    }
+
+    @Test
+    void legacyTlsUrlRejectsUnsupportedEncryptValueInsteadOfSilentDefault() {
+        ConnectParams params = new ConnectParams(
+            "db.example.com",
+            14330,
+            "appdb",
+            "sa",
+            "secret",
+            "applicationName=dbx;encrypt=strict",
+            "",
+            false
+        );
+
+        IllegalArgumentException error = Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> SqlServerLegacyAgent.legacyTlsUrl(params)
+        );
+        Assertions.assertTrue(error.getMessage().contains("Unsupported SQL Server encrypt value 'strict'"));
     }
 
     @Test
@@ -577,7 +702,7 @@ class SqlServerLegacyAgentTest {
         );
 
         Assertions.assertEquals(
-            "jdbc:sqlserver://db.example.com:1433;databaseName=custom;applicationName=dbx;encrypt=true;trustServerCertificate=true;sslProtocol=TLSv1.2",
+            "jdbc:sqlserver://db.example.com:1433;databaseName=custom;applicationName=dbx;encrypt=false;trustServerCertificate=true",
             SqlServerLegacyAgent.legacyTlsUrl(params)
         );
     }
@@ -641,6 +766,28 @@ class SqlServerLegacyAgentTest {
         Assertions.assertTrue(sql.contains("ep.minor_id = 0"));
         Assertions.assertTrue(sql.contains("ep.name = N'MS_Description'"));
         Assertions.assertTrue(sql.contains("s.name = ? AND t.name = ?"));
+    }
+
+    @Test
+    void legacyTableCommentFallbackUsesTheCompatibilityFunction() {
+        // #11606: sys.extended_properties is absent on SQL Server 2000, so the table comment
+        // reader falls back to ::fn_listextendedproperty, which answers on every version.
+        String sql = SqlServerLegacyAgent.sqlServer2000TableCommentSql();
+
+        Assertions.assertTrue(sql.contains("fn_listextendedproperty"));
+        Assertions.assertTrue(sql.contains("N'MS_Description'"));
+        Assertions.assertTrue(sql.contains("N'TABLE'"));
+    }
+
+    @Test
+    void columnCommentQueryReadsColumnExtendedPropertiesOnly() {
+        String sql = SqlServerLegacyAgent.columnCommentsSql();
+
+        Assertions.assertTrue(sql.contains("sys.extended_properties"));
+        Assertions.assertTrue(sql.contains("ep.class = 1"), "index comments share major_id/minor_id with columns");
+        Assertions.assertTrue(sql.contains("ep.minor_id = c.column_id"));
+        Assertions.assertTrue(sql.contains("ep.name = N'MS_Description'"));
+        Assertions.assertTrue(sql.contains("s.name = ? AND o.name = ?"));
     }
 
     @Test

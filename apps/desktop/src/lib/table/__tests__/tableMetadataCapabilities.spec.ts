@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { getTableMetadataCapabilities, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 
 describe("tableMetadataCapabilities", () => {
+  it.each(["oracle", "oceanbase-oracle", "dameng"] as const)("keeps legacy %s JDBC facets while hiding unsupported exact facets", (type) => {
+    const legacy = getTableMetadataCapabilities(type);
+    expect(getTableMetadataCapabilities(type, { connectionType: "jdbc" })).toEqual(legacy);
+    expect(getTableMetadataCapabilities(type, { connectionType: type, exactIdentity: true })).toEqual(legacy);
+    expect(getTableMetadataCapabilities(type, { connectionType: "jdbc", exactIdentity: true })).toEqual({ ...legacy, foreignKeys: false, constraints: false, triggers: false, partitions: false });
+  });
   it("exposes only collection indexes for MongoDB table information", () => {
     expect(getTableMetadataCapabilities("mongodb")).toEqual({
       columns: false,
@@ -31,6 +37,8 @@ describe("tableMetadataCapabilities", () => {
 
   it("exposes structured constraints only for dialects that implement list_constraints", () => {
     expect(getTableMetadataCapabilities("oracle").constraints).toBe(true);
+    expect(getTableMetadataCapabilities("oceanbase-oracle").constraints).toBe(true);
+    expect(getTableMetadataCapabilities("oceanbase-mysql").constraints).toBe(false);
     expect(getTableMetadataCapabilities("postgres").constraints).toBe(true);
     expect(getTableMetadataCapabilities("kingbase").constraints).toBe(true);
     expect(getTableMetadataCapabilities("vastbase").constraints).toBe(true);

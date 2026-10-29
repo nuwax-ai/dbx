@@ -1,7 +1,12 @@
 import { isMacShortcutPlatform, parseShortcutParts, parseShortcutStrokes, shortcutDisplayParts } from "@/lib/editor/shortcutDisplay";
+import { isModifierDoubleTapShortcut, matchesModifierDoubleTapShortcut } from "@/lib/editor/modifierDoubleTapShortcut";
 
 export type ShortcutActionId =
   | "executeSql"
+  | "executeAllSql"
+  | "stepInto"
+  | "stepOut"
+  | "stepOver"
   | "executeSqlInNewResultTab"
   | "explainSql"
   | "formatSql"
@@ -19,12 +24,17 @@ export type ShortcutActionId =
   | "deleteLine"
   | "moveLineUp"
   | "moveLineDown"
+  | "scrollLineUp"
+  | "scrollLineDown"
   | "copyLineUp"
   | "copyLineDown"
   | "undo"
   | "redo"
   | "selectAll"
   | "selectCurrentStatement"
+  | "previousStatement"
+  | "nextStatement"
+  | "statementStart"
   | "extendSelection"
   | "addNextSelectionOccurrence"
   | "selectAllSelectionOccurrences"
@@ -50,11 +60,17 @@ export type ShortcutActionId =
   | "newQuery"
   | "openSettings"
   | "closeTab"
+  | "reopenClosedTab"
   | "closeOtherTabs"
+  | "closeAllTabs"
+  | "saveAllTabs"
   | "closeWindow"
   | "focusSearch"
   | "quickOpen"
   | "globalSearch"
+  | "openConnectionPicker"
+  | "openDatabasePicker"
+  | "openSchemaPicker"
   | "toggleAiPanel"
   | "navigateTabHistoryBack"
   | "navigateTabHistoryForward"
@@ -89,10 +105,11 @@ export type ShortcutActionId =
   | "disconnectAllActiveConnections"
   | "openDataInNewTab"
   | "viewTableDdl"
+  | "editSidebarTableStructure"
   | "sendSelectionToAi"
   | "sqlIntentionActions";
 
-export type ShortcutScope = "global" | "editor" | "grid" | "search" | "sidebar";
+export type ShortcutScope = "global" | "debug" | "editor" | "grid" | "search" | "sidebar";
 
 export interface ShortcutDefinition {
   id: ShortcutActionId;
@@ -100,6 +117,7 @@ export interface ShortcutDefinition {
   scope: ShortcutScope;
   defaultShortcut: string;
   inputKind?: "keyboard" | "modifier-only";
+  supportsModifierDoubleTap?: boolean;
 }
 
 export type ShortcutSettings = Record<ShortcutActionId, string>;
@@ -175,11 +193,32 @@ const EDIT_TABLE_STRUCTURE_DEFAULT = "Mod+Shift+D";
 const TAB_NAVIGATION_HISTORY_ACTIONS: ShortcutActionId[] = ["navigateTabHistoryBack", "navigateTabHistoryForward"];
 
 export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
+  { id: "stepInto", labelKey: "plDebug.toolbar.stepIn", scope: "debug", defaultShortcut: "Mod+I" },
+  { id: "stepOut", labelKey: "plDebug.toolbar.stepOut", scope: "debug", defaultShortcut: "Mod+O" },
+  { id: "stepOver", labelKey: "plDebug.toolbar.stepOver", scope: "debug", defaultShortcut: "Mod+P" },
+  {
+    id: "scrollLineUp",
+    labelKey: "settings.shortcutScrollLineUp",
+    scope: "editor",
+    defaultShortcut: "Ctrl+ArrowUp",
+  },
+  {
+    id: "scrollLineDown",
+    labelKey: "settings.shortcutScrollLineDown",
+    scope: "editor",
+    defaultShortcut: "Ctrl+ArrowDown",
+  },
   {
     id: "executeSql",
     labelKey: "settings.shortcutExecuteSql",
     scope: "editor",
     defaultShortcut: "Mod+Enter",
+  },
+  {
+    id: "executeAllSql",
+    labelKey: "settings.shortcutExecuteAllSql",
+    scope: "editor",
+    defaultShortcut: "Alt+X",
   },
   {
     id: "executeSqlInNewResultTab",
@@ -318,6 +357,24 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutSelectCurrentStatement",
     scope: "editor",
     defaultShortcut: "Mod+Shift+E",
+  },
+  {
+    id: "previousStatement",
+    labelKey: "settings.shortcutPreviousStatement",
+    scope: "editor",
+    defaultShortcut: "Ctrl+Shift+ArrowUp",
+  },
+  {
+    id: "nextStatement",
+    labelKey: "settings.shortcutNextStatement",
+    scope: "editor",
+    defaultShortcut: "Ctrl+Shift+ArrowDown",
+  },
+  {
+    id: "statementStart",
+    labelKey: "settings.shortcutStatementStart",
+    scope: "editor",
+    defaultShortcut: "Alt+Home",
   },
   {
     id: "extendSelection",
@@ -470,10 +527,30 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+W",
   },
   {
+    id: "reopenClosedTab",
+    labelKey: "settings.shortcutReopenClosedTab",
+    scope: "global",
+    defaultShortcut: "Shift+Mod+T",
+  },
+  {
     id: "closeOtherTabs",
     labelKey: "contextMenu.closeOtherTabs",
     scope: "global",
     defaultShortcut: closeOtherTabsDefaultShortcut(),
+  },
+  {
+    // VS Code's close-all-tabs chord (Cmd/Ctrl+K W) needs chord support the
+    // registry doesn't have, so this action ships unbound and stays optional.
+    id: "closeAllTabs",
+    labelKey: "contextMenu.closeAllTabs",
+    scope: "global",
+    defaultShortcut: "",
+  },
+  {
+    id: "saveAllTabs",
+    labelKey: "contextMenu.saveAllTabs",
+    scope: "global",
+    defaultShortcut: "",
   },
   {
     id: "closeWindow",
@@ -489,15 +566,35 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   },
   {
     id: "quickOpen",
+    supportsModifierDoubleTap: true,
     labelKey: "settings.shortcutQuickOpen",
     scope: "global",
     defaultShortcut: "Mod+P",
   },
   {
     id: "globalSearch",
+    supportsModifierDoubleTap: true,
     labelKey: "settings.shortcutGlobalSearch",
     scope: "global",
     defaultShortcut: "Mod+Alt+F",
+  },
+  {
+    id: "openConnectionPicker",
+    labelKey: "settings.shortcutOpenConnectionPicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+C",
+  },
+  {
+    id: "openDatabasePicker",
+    labelKey: "settings.shortcutOpenDatabasePicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+D",
+  },
+  {
+    id: "openSchemaPicker",
+    labelKey: "settings.shortcutOpenSchemaPicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+S",
   },
   {
     id: "toggleAiPanel",
@@ -705,6 +802,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Shift+Mod+D",
   },
   {
+    id: "editSidebarTableStructure",
+    labelKey: "settings.shortcutEditSidebarTableStructure",
+    scope: "sidebar",
+    defaultShortcut: "F4",
+  },
+  {
     id: "sendSelectionToAi",
     labelKey: "settings.shortcutSendSelectionToAi",
     scope: "editor",
@@ -733,6 +836,7 @@ function hasExplicitShortcut(settings: Partial<ShortcutSettings> | undefined, ac
 }
 
 function shortcutsUseSameKeys(first: string, second: string, platform = globalThis.navigator?.platform || ""): boolean {
+  if (isModifierDoubleTapShortcut(first) || isModifierDoubleTapShortcut(second)) return matchesModifierDoubleTapShortcut(first, second, platform);
   const comparisonKey = (shortcut: string) =>
     formatShortcut(shortcut, platform)
       .trim()
@@ -749,6 +853,7 @@ function shortcutsUseSameKeys(first: string, second: string, platform = globalTh
 }
 
 function shortcutDefaultForPlatform(definition: ShortcutDefinition, platform: string): string {
+  if ((definition.id === "scrollLineUp" || definition.id === "scrollLineDown") && isMacShortcutPlatform(platform)) return definition.defaultShortcut.replace("Ctrl+", "Ctrl+Alt+");
   if (definition.id === "addNextSelectionOccurrence") return selectionOccurrenceDefaultShortcut("addNextSelectionOccurrence", platform);
   if (definition.id === "selectAllSelectionOccurrences") return selectionOccurrenceDefaultShortcut("selectAllSelectionOccurrences", platform);
   if (definition.id === "selectLineEnds") return selectLineEndsDefaultShortcut(platform);
@@ -981,4 +1086,29 @@ export function countShortcutConflictPairs(conflicts: Partial<Record<ShortcutAct
     }
   }
   return pairs.size;
+}
+
+/**
+ * 按当前搜索的可见行过滤冲突**展示**（不改变判定）。
+ *
+ * 冲突判定始终基于全局绑定（见上方两个 find*），但顶部徽章、组头摘要要与
+ * 列表同口径：只统计“可见行或其冲突对方”参与的冲突。取“或”是因为对方被
+ * 搜索过滤掉时，冲突本身仍然真实存在，不能从统计里消失——与 Eclipse/
+ * DBeaver Keys 偏好页一致：过滤器只作用于视图，冲突模型始终全局。
+ *
+ * 同时接受 L1（每行单个对方）与 L2（每行多个对方）两种形状，与
+ * `countShortcutConflictPairs` 的口径约定一致。空可见集返回空映射，
+ * 让徽章在“无搜索结果”时自然隐藏。
+ */
+export function filterShortcutConflictsByVisibleIds<T extends ShortcutActionId | ShortcutActionId[]>(conflicts: Partial<Record<ShortcutActionId, T>>, visibleIds: ReadonlySet<ShortcutActionId>): Partial<Record<ShortcutActionId, T>> {
+  if (visibleIds.size === 0) return {};
+  const filtered: Partial<Record<ShortcutActionId, T>> = {};
+  for (const [actionId, value] of Object.entries(conflicts)) {
+    if (!value) continue;
+    const others = (Array.isArray(value) ? value : [value]) as ShortcutActionId[];
+    if (visibleIds.has(actionId as ShortcutActionId) || others.some((other) => visibleIds.has(other))) {
+      filtered[actionId as ShortcutActionId] = value;
+    }
+  }
+  return filtered;
 }

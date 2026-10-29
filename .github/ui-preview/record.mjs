@@ -34,7 +34,10 @@ const MODEL = env("PLAN_MODEL", "deepseek-flash");
 const VIEW = { width: 1440, height: 900 };
 // never pressed: they delete the sandbox's own data or its setup
 const FORBIDDEN = /删除|清空|移除|卸载|重置|格式化|delete|remove|clear all|drop\b|truncate\b/i;
-const secrets = env("SECRETS", "").split("\n").map((s) => s.trim()).filter((s) => s.length >= 8);
+const secrets = env("SECRETS", "")
+  .split("\n")
+  .map((s) => s.trim())
+  .filter((s) => s.length >= 8);
 
 const log = (...a) => console.log("[ui-preview]", ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -46,7 +49,13 @@ const manifest = { summary: "", scenes: [], video: null, poster: null, errors: [
 function outline() {
   const lines = [];
   const MAX = 420;
-  const own = (e) => [...e.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent.trim()).join(" ").replace(/\s+/g, " ").slice(0, 70);
+  const own = (e) =>
+    [...e.childNodes]
+      .filter((n) => n.nodeType === 3)
+      .map((n) => n.textContent.trim())
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .slice(0, 70);
   const shown = (e) => {
     const r = e.getBoundingClientRect();
     if (!r.width || !r.height) return false;
@@ -58,9 +67,19 @@ function outline() {
     if (lines.length >= MAX || e.hasAttribute?.("data-ui-preview")) return;
     const tag = e.tagName.toLowerCase();
     if (["script", "style", "svg", "link", "meta", "noscript", "template"].includes(tag) || !shown(e)) return;
-    const cls = [...e.classList].slice(0, 4).map((c) => "." + c).join("");
-    const data = [...e.attributes].filter((a) => a.name.startsWith("data-") && a.value.length < 40).slice(0, 3).map((a) => `[${a.name}="${a.value}"]`).join("");
-    const aria = ["role", "aria-label", "title", "placeholder", "type"].map((k) => e.getAttribute(k) ? `${k}="${e.getAttribute(k).slice(0, 40)}"` : "").filter(Boolean).join(" ");
+    const cls = [...e.classList]
+      .slice(0, 4)
+      .map((c) => "." + c)
+      .join("");
+    const data = [...e.attributes]
+      .filter((a) => a.name.startsWith("data-") && a.value.length < 40)
+      .slice(0, 3)
+      .map((a) => `[${a.name}="${a.value}"]`)
+      .join("");
+    const aria = ["role", "aria-label", "title", "placeholder", "type"]
+      .map((k) => (e.getAttribute(k) ? `${k}="${e.getAttribute(k).slice(0, 40)}"` : ""))
+      .filter(Boolean)
+      .join(" ");
     const text = own(e);
     const r = e.getBoundingClientRect();
     const away = r.top >= fold ? " (below the fold)" : "";
@@ -75,8 +94,7 @@ function outline() {
 }
 
 async function screenText(page) {
-  return page.evaluate(() => document.documentElement.innerText + "\n" +
-    [...document.querySelectorAll("input, textarea")].map((e) => e.value).join("\n")).catch(() => "");
+  return page.evaluate(() => document.documentElement.innerText + "\n" + [...document.querySelectorAll("input, textarea")].map((e) => e.value).join("\n")).catch(() => "");
 }
 async function checkLeak(page, where) {
   if (!secrets.length) return;
@@ -91,21 +109,30 @@ async function checkLeak(page, where) {
   }
 }
 
-async function deepseek(messages) {
+// any OpenAI-compatible endpoint; PLAN_API_URL/PLAN_API_KEY/PLAN_MODEL move
+// it off DeepSeek (AtlasCloud and friends) without touching this file
+const API_URL = env("PLAN_API_URL", "https://api.deepseek.com/v1/chat/completions");
+const API_KEY = env("PLAN_API_KEY") || env("DEEPSEEK_API_KEY");
+
+async function askPlanner(messages) {
   // a reply cut short or not JSON is asked for again
   let last;
   for (let i = 0; i < 3; i++) {
-    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    const res = await fetch(API_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${env("DEEPSEEK_API_KEY")}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
       body: JSON.stringify({ model: MODEL, messages, response_format: { type: "json_object" }, max_tokens: 16000 }),
       signal: AbortSignal.timeout(240e3),
     });
-    if (!res.ok) throw new Error(`DeepSeek ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    if (!res.ok) throw new Error(`planner API ${res.status}: ${(await res.text()).slice(0, 300)}`);
     const j = await res.json();
     const text = j.choices?.[0]?.message?.content ?? "";
-    try { return JSON.parse(text.replace(/^```(?:json)?\s*|\s+```$/g, "")); }
-    catch (e) { last = new Error(`reply not JSON (${j.choices?.[0]?.finish_reason}): ${e.message}`); log(last.message, "— asking again"); }
+    try {
+      return JSON.parse(text.replace(/^```(?:json)?\s*|\s+```$/g, ""));
+    } catch (e) {
+      last = new Error(`reply not JSON (${j.choices?.[0]?.finish_reason}): ${e.message}`);
+      log(last.message, "— asking again");
+    }
   }
   throw last;
 }
@@ -136,16 +163,22 @@ async function readTree(root) {
 
 async function codeContext(diff, src) {
   if (!src) return "";
-  const changed = [...new Set([...diff.matchAll(/^diff --git a\/(\S+) b\/\1$/gm)].map((m) => m[1]))]
-    .filter((f) => /^apps\/desktop\/src\//.test(f) && !SKIP.test(f.slice("apps/desktop/src/".length - 1)) && !SKIP.test(f));
+  const changed = [...new Set([...diff.matchAll(/^diff --git a\/(\S+) b\/\1$/gm)].map((m) => m[1]))].filter((f) => /^apps\/desktop\/src\//.test(f) && !SKIP.test(f.slice("apps/desktop/src/".length - 1)) && !SKIP.test(f));
 
   // 1. the changed files
   let out = "";
   for (const f of changed.slice(0, 12)) {
     let body;
-    try { body = await fs.readFile(path.join(src, f), "utf8"); } catch { continue; }
+    try {
+      body = await fs.readFile(path.join(src, f), "utf8");
+    } catch {
+      continue;
+    }
     const chunk = `--- ${f}\n${body.length > 8000 ? body.slice(0, 8000) + "\n… (cut)" : body}\n`;
-    if (out.length + chunk.length > 20e3) { out += "… (cut)\n"; break; }
+    if (out.length + chunk.length > 20e3) {
+      out += "… (cut)\n";
+      break;
+    }
     out += chunk;
   }
 
@@ -165,16 +198,14 @@ async function codeContext(diff, src) {
   let entries = "";
   for (const name of components.slice(0, 6)) {
     const kebab = name.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase();
-    const re = new RegExp(
-      "import\\s+" + name + "\\b" +
-      "|from\\s+[\"'][^\"']*/" + name + "(\\.vue)?[\"']" +
-      "|import\\(\\s*[\"'][^\"']*/" + name + "(\\.vue)?[\"']\\s*\\)" +
-      "|<" + kebab + "[\\s>/]|<" + name + "[\\s>/]");
+    const re = new RegExp("import\\s+" + name + "\\b" + "|from\\s+[\"'][^\"']*/" + name + "(\\.vue)?[\"']" + "|import\\(\\s*[\"'][^\"']*/" + name + "(\\.vue)?[\"']\\s*\\)" + "|<" + kebab + "[\\s>/]|<" + name + "[\\s>/]");
     const flags = new Map(); // caller file -> Set of line numbers
     for (const p of files) {
       const t = await read(p);
       if (!t || rel(p).endsWith(`/${name}.vue`)) continue;
-      t.split("\n").forEach((l, i) => { if (re.test(l)) (flags.get(p) ?? flags.set(p, new Set()).get(p)).add(i); });
+      t.split("\n").forEach((l, i) => {
+        if (re.test(l)) (flags.get(p) ?? flags.set(p, new Set()).get(p)).add(i);
+      });
     }
     for (const [p, lines] of flags) {
       // a dynamic import renames the component (const X = defineAsyncComponent):
@@ -189,14 +220,19 @@ async function codeContext(diff, src) {
       }
       if (aliases.size > 1) {
         const tagRe = new RegExp("<(?:" + [...aliases].join("|") + "|" + [...aliases].map((a) => a.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase()).join("|") + ")[\\s>/]");
-        linesArr.forEach((l, i) => { if (tagRe.test(l)) lines.add(i); });
+        linesArr.forEach((l, i) => {
+          if (tagRe.test(l)) lines.add(i);
+        });
       }
       // the usage with its v-if/v-show/:open condition, and identifiers in it
       const span = [];
       for (const i of lines) span.push(linesArr.slice(Math.max(0, i - 6), i + 14).join("\n"));
       const cond = span.join("\n");
       const chunk = `--- ${rel(p)} renders ${name} (how it is shown):\n${cond.slice(0, 2500)}\n`;
-      if (entries.length + chunk.length > 9e3) { entries += "… (cut)\n"; break; }
+      if (entries.length + chunk.length > 9e3) {
+        entries += "… (cut)\n";
+        break;
+      }
       entries += chunk;
       // who flips those conditions: identifiers in v-if / :open / v-model near the usage
       const ids = [...new Set([...cond.matchAll(/(?:v-if|v-show|:open|v-model:open|:model-value)="\s*([A-Za-z_$][\w$.]*)/g)].map((m) => m[1]))].slice(0, 4);
@@ -225,7 +261,7 @@ async function codeContext(diff, src) {
 
 const GUIDE = `You plan a short screen recording of dbx, a database GUI (shown here in a browser at ${VIEW.width}x${VIEW.height}). It runs for real on a sandbox machine: the web build of the app against a dbx-web backend with password protection off, and made-up data beside it (seed.mjs) so the pages that need data have some. That data: two saved SQLite connections, "商店 Shop (SQLite)" (tables customers, products, orders, audit_log, a view v_daily_revenue, foreign keys and a trigger) and "分析 Analytics (SQLite)" (events with 5000 rows — the grid pages — and daily_stats with 90 days); a small sample.csv (name,category,price,stock) for import dialogs; a saved-SQL folder "常用查询" with three files; and query history over the last three days across both connections, real executions mixed with seeded entries, a few failures among them. The UI language is ${LOCALE}. What it doesn't have: any server database (MySQL, PostgreSQL, Redis, MongoDB… none are connected — connection dialogs can be opened but not completed), no AI provider configured, no plugins or JDBC drivers installed, no SSH tunnels.
 
-dbx is a single-page app with no URL routing: every recording starts from the page as it opens. The left sidebar lists the connections; opening one (double-click, or right-click → its menu) opens its tables and its tabs — the query editor, table data, structure, ER diagram; the toolbar above the editor runs the SQL; other panels (SQL 库, 查询历史, 全局搜索, 设置) open from the interface itself. Find your way from the outline you are given. Two ways of working that reach further than clicks:
+dbx is a single-page app with no URL routing: every recording starts from the page as it opens. The left sidebar is a tree that opens one level at a time: a click on a connection lists its databases (SQLite shows one, "main 默认库"), a click on that database node lists its tables, and a click on a table opens its data grid — the query editor, table data, structure, ER diagram are that connection's tabs. Tree rows are plain divs inside div.connection-tree-content — click them as div.connection-tree-content div with the node's text, never as buttons. A double-click on a connection instead opens a database-browser tab, so working down the tree is how a table is reached; the outline you are given shows the app at rest, connections collapsed, so a node the plan needs that isn't in it has to be expanded into view first, not looked for on other pages. The search box above the tree (placeholder 搜索...) can reveal a node without that clicking, but while it holds text it filters the tree — a blank tree with text in the box means no match, and its text survives everything else the plan does: clear it with the × at its right end before walking the tree by hand, and never plan other steps while it holds text. The toolbar above the editor runs the SQL; other panels (SQL 库, 查询历史, 全局搜索, 设置) open from the interface itself. Action buttons in toolbars and dialogs are elements carrying data-slot="button", not the button tag — a step targeting "button" matches both, and grid toolbar actions also carry data-toolbar-action (camelCase, e.g. addRow). An editable table's grid toolbar has a 新增行 action (data-toolbar-action="addRow") that adds one row on a click; the icon button beside it, carrying aria-label="新增行" and no label text, opens a menu whose 插入多行… entry opens the insert-rows dialog (title 新增多行, row-count input #insert-rows-count). Two ways of working that reach further than clicks:
 - The query editor runs any SQL against the sandbox's SQLite databases (they are throwaway — writes are fine): when a state needs data (a result with no columns, an empty table, a table of a shape), open a connection, type the SQL that produces it and run it, and show the state it makes.
 - A file picker can't be clicked through, but a step can set it: { "do": "upload", "target": "input[type=file]", "value": "sample.csv" } — seed.mjs puts sample.csv (a small product list: name,category,price,stock) beside the databases, for import and mapping dialogs.
 
@@ -265,9 +301,10 @@ async function glide(page, x, y) {
   const n = Math.max(8, Math.round(ms / 16));
   const from = { ...mouse };
   for (let i = 1; i <= n; i++) {
-    const t = i / n, e = t < .5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+    const t = i / n,
+      e = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
     // a slight arc, not a ruler line
-    const bend = Math.sin(Math.PI * t) * Math.min(40, d * .08);
+    const bend = Math.sin(Math.PI * t) * Math.min(40, d * 0.08);
     const nx = from.x + (x - from.x) * e - ((y - from.y) / (d || 1)) * bend;
     const ny = from.y + (y - from.y) * e + ((x - from.x) / (d || 1)) * bend;
     await page.mouse.move(nx, ny);
@@ -278,25 +315,63 @@ async function glide(page, x, y) {
 
 async function locate(page, step) {
   if (!step.target) throw new Error(`${step.do} needs a target`);
-  let loc = page.locator(step.target);
+  // dbx's UI kit renders its action buttons as elements carrying
+  // data-slot="button" rather than the button tag, so a plan that says
+  // "button" has to mean both
+  const target = /^button$/i.test(step.target.trim()) ? 'button, [data-slot="button"]' : step.target;
+  const all = page.locator(target);
   // a wish for text tucked into the selector ([aria-label="设置"], [title="Run"]):
   // take it out and treat it as the text filter, where the fallback can use it
   const attrText = /\[(?:aria-label|title|placeholder|data-slot|data-view)[*^$]?=~?"([^"]+)"/.exec(step.target)?.[1];
-  if (!step.text && attrText) {
-    step = { ...step, text: attrText };
-    loc = loc.filter({ hasText: attrText });
-  }
-  if (step.text) loc = loc.filter({ hasText: step.text });
+  const text = step.text || attrText || "";
   const visible = async (l) => {
+    // the deepest match, not the first: a text filter matches a container and
+    // everything inside it, and the click belongs on the innermost one — the
+    // row, the label — not on the wrapper whose middle is often blank space
     const n = await l.count();
+    let hit = null;
     for (let i = 0; i < n; i++) {
       const one = l.nth(i);
-      if (await one.isVisible()) return one;
+      if (await one.isVisible()) hit = one;
     }
-    return null;
+    return hit;
   };
-  const hit = await visible(loc);
-  if (hit) return hit;
+  const countVisible = async (l) => {
+    const n = await l.count();
+    let c = 0;
+    for (let i = 0; i < n; i++) if (await l.nth(i).isVisible()) c++;
+    return c;
+  };
+  // a text match is usually a container whose subtree carries the text: walk
+  // down while exactly one visible child still contains it, so the click
+  // lands on the row or the label, not on a wrapper whose middle is blank
+  const deepest = async (hit, text) => {
+    if (!hit || !text) return hit;
+    try {
+      const el = await hit.evaluateHandle((n, text) => {
+        for (;;) {
+          const kids = [...n.children].filter((c) => (c.textContent || "").includes(text) && c.getBoundingClientRect().width > 0);
+          if (kids.length === 1) n = kids[0];
+          else return n;
+        }
+      }, text);
+      return el.asElement() || hit;
+    } catch {
+      return hit;
+    }
+  };
+  let loc = text ? all.filter({ hasText: text }) : all;
+  let hit = await visible(loc);
+  // hasText matches an element's content, and a form field's content is its
+  // value — empty until typed into — so input[placeholder="搜索..."] filters
+  // itself out. The bare selector was right all along: trust it when exactly
+  // one visible element answers to it.
+  if (!hit && text && (await countVisible(all)) === 1) {
+    loc = all;
+    step = { ...step, text: "" };
+    hit = await visible(loc);
+  }
+  if (hit) return deepest(hit, text);
   // the selector guessed a role or structure this app doesn't use (a tab, a
   // menuitem, a tree node…): fall back to the one visible thing carrying the
   // text — only when exactly one is on screen, so a wrong guess fails loud
@@ -311,7 +386,7 @@ async function locate(page, step) {
     // at most two on screen (the same text in a parent and its child): take
     // the last, which in DOM order is the innermost; more means the wish for
     // the text is too vague — fail loud rather than click something wrong
-    if (seen.length >= 1 && seen.length <= 2) return seen.at(-1);
+    if (seen.length >= 1 && seen.length <= 2) return deepest(await seen.at(-1), step.text);
   }
   throw new Error(`nothing visible matches ${step.target}${step.text ? ` with "${step.text}"` : ""} (${await loc.count()} in the page)`);
 }
@@ -337,19 +412,22 @@ async function bringIntoView(page, loc) {
         const root = s === document.scrollingElement;
         const b = root ? clip : s.getBoundingClientRect();
         // what of it shows: inside the window and every view around it
-        let top = Math.max(b.top, 0), bottom = Math.min(b.bottom, innerHeight);
-        let left = Math.max(b.left, 0), right = Math.min(b.right, innerWidth);
+        let top = Math.max(b.top, 0),
+          bottom = Math.min(b.bottom, innerHeight);
+        let left = Math.max(b.left, 0),
+          right = Math.min(b.right, innerWidth);
         for (let p = s.parentElement; p && !root; p = p.parentElement) {
           if (!scrollers.includes(p) || p === document.scrollingElement) continue;
           const pb = p.getBoundingClientRect();
-          top = Math.max(top, pb.top); bottom = Math.min(bottom, pb.bottom);
-          left = Math.max(left, pb.left); right = Math.min(right, pb.right);
+          top = Math.max(top, pb.top);
+          bottom = Math.min(bottom, pb.bottom);
+          left = Math.max(left, pb.left);
+          right = Math.min(right, pb.right);
         }
         const room = bottom - top - 2 * PAD;
         const want = r.height <= room ? (r.top + r.bottom) / 2 - (top + bottom) / 2 : r.top - (top + PAD);
         const shown = r.top >= top + Math.min(PAD, Math.max(0, room - r.height) / 2) && (r.height <= room ? r.bottom <= bottom - PAD : r.top <= top + PAD * 2);
-        out.push({ shown, dy: Math.max(-s.scrollTop, Math.min(s.scrollHeight - s.clientHeight - s.scrollTop, want)),
-          x: (left + right) / 2, y: (top + bottom) / 2, seen: bottom - top > 20 && right - left > 20 });
+        out.push({ shown, dy: Math.max(-s.scrollTop, Math.min(s.scrollHeight - s.clientHeight - s.scrollTop, want)), x: (left + right) / 2, y: (top + bottom) / 2, seen: bottom - top > 20 && right - left > 20 });
       }
       return out;
     }, PAD);
@@ -375,7 +453,8 @@ async function pointAt(page, loc) {
   await bringIntoView(page, loc);
   const b = await loc.boundingBox();
   if (!b) throw new Error("the element has no box");
-  const x = b.x + Math.min(b.width / 2, 60), y = b.y + b.height / 2;
+  const x = b.x + Math.min(b.width / 2, 60),
+    y = b.y + b.height / 2;
   await glide(page, x, y);
   return b;
 }
@@ -384,10 +463,16 @@ async function pointAt(page, loc) {
 // the seeded connections painted in, is ready
 async function settle(page) {
   await page.waitForLoadState("load").catch(() => {});
-  await page.waitForFunction(() => {
-    const txt = document.body.innerText || "";
-    return txt.includes("新建连接") || txt.includes("New Connection") || document.querySelectorAll("button").length >= 6;
-  }, null, { timeout: 20000 }).catch(() => {});
+  await page
+    .waitForFunction(
+      () => {
+        const txt = document.body.innerText || "";
+        return txt.includes("新建连接") || txt.includes("New Connection") || document.querySelectorAll("button").length >= 6;
+      },
+      null,
+      { timeout: 20000 },
+    )
+    .catch(() => {});
   await sleep(1500);
 }
 
@@ -399,13 +484,18 @@ async function runStep(page, step, scene) {
   switch (step.do) {
     case "click": {
       const loc = await locate(page, step);
-      const label = (await loc.innerText().catch(() => "")) + " " + (await loc.getAttribute("title").catch(() => "") || "");
+      const label = (await loc.innerText().catch(() => "")) + " " + ((await loc.getAttribute("title").catch(() => "")) || "");
       if (FORBIDDEN.test(label)) throw new Error(`won't press "${label.trim().slice(0, 40)}"`);
       await pointAt(page, loc);
       await sleep(180);
       if (step.dblclick) {
-        await page.mouse.down(); await sleep(60); await page.mouse.up();
-        await sleep(120); await page.mouse.down(); await sleep(60); await page.mouse.up();
+        await page.mouse.down();
+        await sleep(60);
+        await page.mouse.up();
+        await sleep(120);
+        await page.mouse.down();
+        await sleep(60);
+        await page.mouse.up();
       } else {
         await page.mouse.down();
         await sleep(90);
@@ -424,7 +514,9 @@ async function runStep(page, step, scene) {
     case "type": {
       const loc = await locate(page, step);
       await pointAt(page, loc);
-      await page.mouse.down(); await sleep(80); await page.mouse.up();
+      await page.mouse.down();
+      await sleep(80);
+      await page.mouse.up();
       await loc.fill("");
       await page.keyboard.type(String(step.value ?? ""), { delay: 70 });
       await sleep(600);
@@ -476,7 +568,8 @@ async function runStep(page, step, scene) {
           if (b) {
             // the target with room around it, never so small that a button
             // is shown without where it is
-            const w = Math.min(VIEW.width, Math.max(560, b.width + 48)), h = Math.min(VIEW.height, Math.max(340, b.height + 48));
+            const w = Math.min(VIEW.width, Math.max(560, b.width + 48)),
+              h = Math.min(VIEW.height, Math.max(340, b.height + 48));
             const x = Math.min(VIEW.width - w, Math.max(0, b.x + b.width / 2 - w / 2));
             const y = Math.min(VIEW.height - h, Math.max(0, b.y + b.height / 2 - h / 2));
             clip = { x, y, width: w, height: h };
@@ -486,7 +579,9 @@ async function runStep(page, step, scene) {
       } finally {
         await page.evaluate(() => document.querySelector("[data-ui-preview]")?.style.removeProperty("visibility"));
       }
-      scene.shots.push({ file, caption: step.caption || step.name || "", width: 2 * (clip?.width ?? VIEW.width) });
+      // a shot taken after a failed step in its scene shows the state the
+      // plan actually reached, not the one the caption claims
+      scene.shots.push({ file, caption: step.caption || step.name || "", width: 2 * (clip?.width ?? VIEW.width), warn: scene.derailed || undefined });
       break;
     }
     default:
@@ -510,7 +605,9 @@ async function main() {
     await lp.goto(BASE);
     await settle(lp);
     outlines.app = await lp.evaluate(outline);
-  } catch (e) { outlines.app = `(failed to load: ${e.message})`; }
+  } catch (e) {
+    outlines.app = `(failed to load: ${e.message})`;
+  }
   await look.close();
 
   const MAXDIFF = 150e3;
@@ -518,13 +615,18 @@ async function main() {
   log(`code context: ${code.length} characters`);
   const ask = [
     { role: "system", content: GUIDE },
-    { role: "user", content: `PR title: ${env("PR_TITLE", "")}\n\nPR description:\n${body.slice(0, 6000)}\n\nDiff${diff.length > MAXDIFF ? " (cut)" : ""}:\n${diff.slice(0, MAXDIFF)}\n\n` +
-      `=== outline: app ===\n${outlines.app}` +
-      (code ? `\n\n=== the changed frontend files (the PR's version) ===\n${code}` : "") },
+    {
+      role: "user",
+      content: `PR title: ${env("PR_TITLE", "")}\n\nPR description:\n${body.slice(0, 6000)}\n\nDiff${diff.length > MAXDIFF ? " (cut)" : ""}:\n${diff.slice(0, MAXDIFF)}\n\n` + `=== outline: app ===\n${outlines.app}` + (code ? `\n\n=== the changed frontend files (the PR's version) ===\n${code}` : ""),
+    },
   ];
   let plan;
-  try { plan = env("PLAN_FILE") ? JSON.parse(await fs.readFile(env("PLAN_FILE"), "utf8")) : await deepseek(ask); }
-  catch (e) { plan = null; manifest.errors.push(`plan: ${e.message}`); }
+  try {
+    plan = env("PLAN_FILE") ? JSON.parse(await fs.readFile(env("PLAN_FILE"), "utf8")) : await askPlanner(ask);
+  } catch (e) {
+    plan = null;
+    manifest.errors.push(`plan: ${e.message}`);
+  }
   if (!plan || plan.ui_change === false || !plan.scenes?.length) {
     manifest.summary = plan?.summary || "";
     manifest.skipped = plan ? "no visible UI change found in the diff" : "no plan";
@@ -539,49 +641,101 @@ async function main() {
   if (plan.scenes.length) {
     const rec = await browser.newContext({ ...ctxOpts, recordVideo: { dir: path.join(OUT, "raw"), size: VIEW } });
     await rec.addInitScript({ path: path.join(here, "cursor.js") });
-    const page = await rec.newPage();
-    const began = Date.now();
-    let lead = 0, repairs = 0, interactive = false;
+    let repairs = 0,
+      interactive = false;
+    // one take per scene: every scene starts from the app as it opens, and
+    // its video keeps only what happens once the app has settled — the
+    // load never reaches the final cut, so a scene change reads as a cut,
+    // not as the app reloading out of nowhere
+    const takes = [];
     for (const s of plan.scenes.slice(0, 5)) {
-      const scene = { title: s.title || "", shots: [] };
+      const scene = { title: s.title || "", shots: [], derailed: false };
       manifest.scenes.push(scene);
+      const page = await rec.newPage();
+      const began = Date.now();
+      let ready = 0;
       try {
-        await caption(page, scene.title);
         await page.goto(BASE);
         await settle(page);
-        if (!lead) lead = Math.max(0, (Date.now() - began) / 1000 - 0.4);
         await page.evaluate(([x, y]) => window.__uiPreviewAt?.(x, y), [mouse.x, mouse.y]);
-      } catch (e) { manifest.errors.push(`${scene.title}: open: ${e.message}`); if (manifest.leak) break; continue; }
+        ready = Date.now();
+      } catch (e) {
+        manifest.errors.push(`${scene.title}: open: ${e.message}`);
+        await page.close().catch(() => {});
+        if (manifest.leak) break;
+        continue;
+      }
+      // the scene's title readable on the settled page for a beat, before
+      // the first step's caption replaces it
+      await caption(page, scene.title);
+      await sleep(1100);
       let steps = (s.steps || []).slice(0, 25);
       for (let i = 0; i < steps.length; i++) {
         const step = steps[i];
         if (["click", "hover", "type", "press", "scroll", "upload"].includes(step.do)) interactive = true;
-        try { await runStep(page, step, scene); }
-        catch (e) {
+        try {
+          await runStep(page, step, scene);
+        } catch (e) {
           if (manifest.leak) break;
           manifest.errors.push(`${scene.title} · ${step.do} ${step.target || step.name || ""}: ${e.message.split("\n")[0]}`);
           log("step failed:", e.message);
+          scene.derailed = true;
+          // whatever the failed step (or an earlier stray one) left open — a
+          // menu, a dropdown, a confirm dialog — swallows every click and
+          // shows up in the shots that follow: clear it before going on
+          await page.keyboard.press("Escape").catch(() => {});
+          await sleep(400);
+          // an active sidebar search keeps the tree filtered down to
+          // nothing, starving every later lookup of its targets: empty it
+          // the way a user would
+          try {
+            const box = page.locator(".connection-tree-search input").first();
+            if ((await box.isVisible().catch(() => false)) && (await box.inputValue().catch(() => ""))) {
+              await box.click({ timeout: 1500 });
+              await page.keyboard.press("ControlOrMeta+A");
+              await page.keyboard.press("Delete");
+              await sleep(300);
+            }
+          } catch {}
           if (repairs >= 3) continue;
           repairs++;
           // the page as it is now, and what went wrong: the rest of the scene again
           try {
-            const fix = await deepseek([...ask, { role: "assistant", content: JSON.stringify(plan) },
-              { role: "user", content: `Step ${i + 1} of scene "${scene.title}" failed: ${e.message.split("\n")[0]}\nThe page now:\n${await page.evaluate(outline)}\n\nIf the failed selector came from the diff, remember the changed-file paths above say which dialog, panel or component holds it — a different one may have to be opened (or closed) first, not just a different selector for this page. Reply with JSON {"steps": [...]}: the steps to do instead of that one and the ones after it in this scene.` }]);
-            if (Array.isArray(fix.steps)) { steps = [...steps.slice(0, i + 1), ...fix.steps.slice(0, 20)]; log("repaired:", JSON.stringify(fix.steps)); }
-          } catch (e2) { manifest.errors.push(`repair: ${e2.message}`); }
+            const fix = await askPlanner([
+              ...ask,
+              { role: "assistant", content: JSON.stringify(plan) },
+              {
+                role: "user",
+                content: `Step ${i + 1} of scene "${scene.title}" failed: ${e.message.split("\n")[0]}\nThe page now:\n${await page.evaluate(outline)}\n\nIf the failed selector came from the diff, remember the changed-file paths above say which dialog, panel or component holds it — a different one may have to be opened (or closed) first, not just a different selector for this page. Reply with JSON {"steps": [...]}: the steps to do instead of that one and the ones after it in this scene.`,
+              },
+            ]);
+            if (Array.isArray(fix.steps)) {
+              steps = [...steps.slice(0, i + 1), ...fix.steps.slice(0, 20)];
+              log("repaired:", JSON.stringify(fix.steps));
+            }
+          } catch (e2) {
+            manifest.errors.push(`repair: ${e2.message}`);
+          }
         }
       }
-      if (manifest.leak) break;
+      if (manifest.leak) {
+        await page.close().catch(() => {});
+        break;
+      }
       await caption(page, "");
       await sleep(600);
+      takes.push({ video: await page.video().path(), from: Math.max(0, (ready - began) / 1000 - 0.2) });
+      await page.close();
     }
-    const video = await page.video().path();
     await rec.close();
     manifest.interactive = interactive;
     // a video when there's something to watch: an interaction
-    if (!manifest.leak && interactive) {
-      execFileSync("ffmpeg", ["-y", "-loglevel", "error", "-ss", lead.toFixed(2), "-i", video, "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-r", "30", path.join(OUT, "preview.mp4")]);
+    if (!manifest.leak && interactive && takes.length) {
+      // the takes joined, each already trimmed of its load
+      const args = ["-y", "-loglevel", "error"];
+      const pins = takes.map((t, i) => (args.push("-ss", t.from.toFixed(2), "-i", t.video), `[${i}:v]`));
+      args.push("-filter_complex", `${pins.join("")}concat=n=${takes.length}:v=1:a=0[v]`, "-map", "[v]", "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-r", "30", path.join(OUT, "preview.mp4"));
+      execFileSync("ffmpeg", args);
       manifest.video = "preview.mp4";
       manifest.poster = await poster(browser);
     }
@@ -590,7 +744,8 @@ async function main() {
   await browser.close();
   if (manifest.leak) {
     for (const f of await fs.readdir(OUT)) await fs.rm(path.join(OUT, f), { recursive: true, force: true });
-    manifest.scenes = []; manifest.video = manifest.poster = null;
+    manifest.scenes = [];
+    manifest.video = manifest.poster = null;
   }
   await fs.writeFile(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 2));
   log("done:", JSON.stringify({ shots: manifest.scenes.reduce((n, s) => n + s.shots.length, 0), video: manifest.video, errors: manifest.errors.length, leak: manifest.leak }));

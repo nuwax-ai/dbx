@@ -17,6 +17,7 @@ const DataDictionaryDialog = defineAsyncComponent(() => import("@/components/doc
 const TableImportDialog = defineAsyncComponent(() => import("@/components/import/TableImportDialog.vue"));
 const MongoImportDialog = defineAsyncComponent(() => import("@/components/document/MongoImportDialog.vue"));
 const MongoDatabaseDumpDialog = defineAsyncComponent(() => import("@/components/document/MongoDatabaseDumpDialog.vue"));
+const DamengDumpDialog = defineAsyncComponent(() => import("@/components/document/DamengDumpDialog.vue"));
 const FieldLineageDialog = defineAsyncComponent(() => import("@/components/lineage/FieldLineageDialog.vue"));
 const ConfigPassphraseDialog = defineAsyncComponent(() => import("@/components/config/ConfigPassphraseDialog.vue"));
 const ConfigConnectionSelectDialog = defineAsyncComponent(() => import("@/components/config/ConfigConnectionSelectDialog.vue"));
@@ -25,6 +26,9 @@ const SshHostKeyPromptDialog = defineAsyncComponent(() => import("@/components/s
 const ConnectionPasswordPromptDialog = defineAsyncComponent(() => import("@/components/connection/ConnectionPasswordPromptDialog.vue"));
 const DatabaseExportDialog = defineAsyncComponent(() => import("@/components/export/DatabaseExportDialog.vue"));
 const DataGenerateDialog = defineAsyncComponent(() => import("@/components/generate/DataGenerateDialog.vue"));
+const PlDebugLaunchDialog = defineAsyncComponent(() => import("@/components/debug/PlDebugLaunchDialog.vue"));
+const PlDebugRecoveryDialog = defineAsyncComponent(() => import("@/components/debug/PlDebugRecoveryDialog.vue"));
+import { plDebugLaunchTarget, plDebugRecoveryConnectionId } from "@/components/debug/plDebugLaunch";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSqlExecutionDangerStore } from "@/stores/sqlExecutionDangerStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
@@ -159,6 +163,8 @@ watch(
 </script>
 
 <template>
+  <PlDebugLaunchDialog v-if="plDebugLaunchTarget" />
+  <PlDebugRecoveryDialog v-if="plDebugRecoveryConnectionId" />
   <ConnectionDialog
     v-if="shouldShowConnectionDialog"
     :open="shouldShowConnectionDialog"
@@ -278,6 +284,7 @@ watch(
     :prefill-connection-id="dialogs.diagramPrefillConnectionId.value"
     :prefill-database="dialogs.diagramPrefillDatabase.value"
     :prefill-schema="dialogs.diagramPrefillSchema.value"
+    :prefill-catalog="dialogs.diagramPrefillCatalog.value"
     :focus-table-name="dialogs.diagramFocusTableName.value"
     :focus-table-names="dialogs.diagramFocusTableNames.value"
     @open-target="emit('openDiagramTarget', $event)"
@@ -307,6 +314,7 @@ watch(
     :database="dialogs.mongoDatabaseDumpPrefillDatabase.value"
     :mode="dialogs.mongoDatabaseDumpMode.value"
   />
+  <DamengDumpDialog v-if="dialogs.showDamengDumpDialog.value" v-model:open="dialogs.showDamengDumpDialog.value" :connection-id="dialogs.damengDumpPrefillConnectionId.value" :database="dialogs.damengDumpPrefillDatabase.value" :mode="dialogs.damengDumpMode.value" />
   <DataGenerateDialog
     v-if="dialogs.showTableDataGenerateDialog.value"
     v-model:open="dialogs.showTableDataGenerateDialog.value"
@@ -320,6 +328,7 @@ watch(
     v-if="dialogs.showFieldLineageDialog.value"
     v-model:open="dialogs.showFieldLineageDialog.value"
     :prefill-connection-id="dialogs.lineagePrefillConnectionId.value"
+    :prefill-database-type="dialogs.lineagePrefillDatabaseType.value"
     :prefill-database="dialogs.lineagePrefillDatabase.value"
     :prefill-schema="dialogs.lineagePrefillSchema.value"
     :prefill-table="dialogs.lineagePrefillTable.value"

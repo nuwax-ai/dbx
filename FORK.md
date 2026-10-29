@@ -4,7 +4,7 @@
 相对官方 main 保留少量刻意差异，本文档是这些差异的权威清单，合并官方更新时对照使用。
 
 > 快速定位所有定制点：前端搜 `UPDATER_ENABLED`、`startup.loading`、`browserStorageScopeSuffix` 和注释 `nuwax`，Rust 侧搜 `nuwax`。
-> 最近的差异核验：2026-10-09（合并官方 566 提交之后，逐文件核对 diff = 12 条定制）。
+> 最近的差异核验：2026-10-29（合并官方 1227 提交至 v0.6.61 之后，逐文件核对 diff = 12 条定制）。
 
 ## 差异总览
 
@@ -265,7 +265,9 @@ localStorage 直存键，同类同浏览器共享（100+ 调用点，刻意不�
 
 | 文件 | 适配 |
 |------|------|
-| `apps/desktop/src/lib/settings/__tests__/settingsSearch.spec.ts` | webKeys 断言改为 `not.toContain("theme")` / `not.toContain("github")` |
+| `apps/desktop/src/lib/settings/__tests__/settingsSearch.spec.ts` | webKeys 断言改为 `not.toContain("theme")` / `not.toContain("github")`；官方 tunnels 条目 keyword 搜索用例（it.each）改用 backups 条目的 keywordKeys（2026-10-29） |
+| `apps/desktop/src/lib/settings/__tests__/settingsSearchCoverage.spec.ts` | 嵌套设置表单覆盖断言移除 `TunnelProfileManager.vue`（tunnels tab 已删，2026-10-29 新增） |
+| `apps/desktop/src/components/layout/__tests__/AppToolbar.updateEntry.spec.ts` | 官方新 spec 断言更新入口渲染（checkUpdates 开启时）；fork 侧反转为断言入口被 UPDATER_ENABLED 门控隐藏（2026-10-29 新增） |
 | `apps/desktop/src/components/layout/__tests__/AlwaysOnTopVisibilitySync.spec.ts` | 无关字段哨兵从 `toolbarItems.github` 换成 `toolbarItems.checkUpdates` |
 | `apps/desktop/src/stores/__tests__/settingsStore.spec.ts` | 更新默认值断言为 `false` |
 | `packages/app-tests/settingsStore.test.ts` | 同上（**注意此目录在 apps/desktop 之外，容易漏**） |
@@ -288,6 +290,9 @@ localStorage 直存键，同类同浏览器共享（100+ 调用点，刻意不�
 **已知坑**：官方 main 曾推送过自身测试编译失败的提交（2026-09-24 的 734503f4c 弄坏 dbx-core 测试编译，
 官方随后以 d58b3c6a2 修复，本 fork 已 cherry-pick）。遇到 `cargo check -p dbx-core --tests` 编不过，
 先在纯 main worktree 上复现确认是否上游问题。
+另：2026-10-29 起官方 dbx-web 测试二进制变大（链接器报 `__eh_frame section too large`），
+`routes::connection` 的 sqlite 加密用例在默认测试线程栈下会 stack overflow（SIGABRT），
+本机跑 `cargo nextest run -p dbx-web` 需前置 `RUST_MIN_STACK=33554432`（32MB）。
 
 ## 已上游化（勿再保留本地版）
 

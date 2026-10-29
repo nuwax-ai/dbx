@@ -1,6 +1,7 @@
 import type { ShallowRef } from "vue";
 import { RangeSet, RangeValue, type EditorState } from "@codemirror/state";
 import type { EditorView as EditorViewType, ViewPlugin as ViewPluginType } from "@codemirror/view";
+import { queryEditorStatementDatabaseType } from "@/lib/mongo/mongoSql";
 import { executableStatementRangeCacheForDoc, statementGutterStartIndexForCache, mapStatementGutterStartIndex, type ExecutableStatementRangeCache, type StatementGutterStartIndex } from "@/lib/sql/executableStatementRangeCache";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import type { QueryEditorProps } from "./queryEditorTypes";
@@ -23,6 +24,7 @@ interface QueryEditorStatementBoundariesOptions {
   cache: { value: ExecutableStatementRangeCache | null };
   runtime: QueryEditorCodeMirrorRuntime;
   driverProfile?: () => string | undefined;
+  syntaxDialect?: () => QueryEditorProps["syntaxDialect"];
 }
 
 export function useQueryEditorStatementBoundaries(options: QueryEditorStatementBoundariesOptions) {
@@ -85,15 +87,24 @@ export function useQueryEditorStatementBoundaries(options: QueryEditorStatementB
   function ensureStatementCache(state: EditorState): Promise<ExecutableStatementRangeCache | null> {
     if (pendingAnalysis?.doc === state.doc && pendingAnalysis.generation === statementBoundariesGeneration) return pendingAnalysis.result;
     const generation = statementBoundariesGeneration;
-    const result = analysisWorker.analyze({ sql: state.doc.toString(), databaseType: props.databaseType, parameterOptions: sqlStatementParameterOptions(), includeFolds: true, syntaxDialect: props.syntaxDialect ?? props.dialect, driverProfile: options.driverProfile?.() }).then((analysis) => {
-      const currentView = view.value ?? trackedView;
-      if (!analysis || generation !== statementBoundariesGeneration || currentView?.state.doc !== state.doc) return null;
-      const resolved = { ...analysis, doc: state.doc };
-      installStatementBoundaries(state, resolved, analysis.folds);
-      const refreshEffect = codeMirrorRuntime.statementBoundariesRefreshEffect;
-      if (refreshEffect) currentView.dispatch({ effects: refreshEffect.of(null) });
-      return resolved;
-    });
+    const result = analysisWorker
+      .analyze({
+        sql: state.doc.toString(),
+        databaseType: queryEditorStatementDatabaseType(props.databaseType, props.mongoQueryLanguage),
+        parameterOptions: sqlStatementParameterOptions(),
+        includeFolds: true,
+        syntaxDialect: options.syntaxDialect?.() ?? props.syntaxDialect ?? props.dialect,
+        driverProfile: options.driverProfile?.(),
+      })
+      .then((analysis) => {
+        const currentView = view.value ?? trackedView;
+        if (!analysis || generation !== statementBoundariesGeneration || currentView?.state.doc !== state.doc) return null;
+        const resolved = { ...analysis, doc: state.doc };
+        installStatementBoundaries(state, resolved, analysis.folds);
+        const refreshEffect = codeMirrorRuntime.statementBoundariesRefreshEffect;
+        if (refreshEffect) currentView.dispatch({ effects: refreshEffect.of(null) });
+        return resolved;
+      });
     pendingAnalysis = { doc: state.doc, generation, result };
     return result;
   }
@@ -102,7 +113,7 @@ export function useQueryEditorStatementBoundaries(options: QueryEditorStatementB
     if (shouldUseQueryEditorLargeDocumentModeForSize(state.doc.length, state.doc.lines)) {
       void ensureStatementCache(state);
     } else {
-      installStatementBoundaries(state, executableStatementRangeCacheForDoc(cache.value, state.doc, props.databaseType, sqlStatementParameterOptions()));
+      installStatementBoundaries(state, executableStatementRangeCacheForDoc(cache.value, state.doc, queryEditorStatementDatabaseType(props.databaseType, props.mongoQueryLanguage), sqlStatementParameterOptions()));
     }
   }
 

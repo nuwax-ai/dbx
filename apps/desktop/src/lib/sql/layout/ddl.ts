@@ -93,7 +93,7 @@ export function createTableLayout(statement: StatementNode, ctx: SqlLayoutContex
   const nameText = renderInline(ctx, [name], ctx.options.lineWidth - clause.nameKw.text.length - 1);
   if (!nameText) throw new Error("a CREATE TABLE table name must fit on one line");
 
-  writer.write(`${keywordText(clause.nameKw.text, ctx)} ${nameText}`);
+  writer.write(`${keywordText(clause.nameKw, ctx)} ${nameText}`);
   writer.newline(0);
   writer.write("(");
 
@@ -143,7 +143,10 @@ export function createTableLayout(statement: StatementNode, ctx: SqlLayoutContex
       if (endsWithLineComment(rest)) writer.markLineComment();
     }
   }
-  if (statement.hasSemicolon) writer.write(";");
+  if (statement.hasSemicolon) {
+    if (ctx.options.newlineBeforeSemicolon) writer.newline(0);
+    writer.write(";");
+  }
   return writer.toString();
 }
 
@@ -160,7 +163,7 @@ function emitDefinition(writer: Writer, nodes: AstNode[], indent: number, ctx: S
 
   const [first, second] = nodes;
   if (first?.type === "keyword" && second?.type === "identifier") {
-    writer.write(`${keywordText(first.text, ctx)} ${renderInline(ctx, [second], ctx.options.lineWidth) ?? second.text}`);
+    writer.write(`${keywordText(first, ctx)} ${renderInline(ctx, [second], ctx.options.lineWidth) ?? second.text}`);
     writer.newline(indent + ctx.options.indentWidth);
     writer.write(ctx.renderers.block(nodes.slice(2)).trim());
     if (endsWithLineComment(nodes.slice(2))) writer.markLineComment();

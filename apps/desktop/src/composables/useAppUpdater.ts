@@ -79,11 +79,36 @@ export function isUpdateIgnored(info: api.UpdateInfo | null, ignoredVersion: str
   return compareParsedUpdateVersions(parsedLatest, parsedIgnored) <= 0;
 }
 
+/**
+ * The update info as the UI should see it. An ignored version is hidden here
+ * rather than in each consumer: the dialog renders from `updateInfo` directly
+ * and only the toolbar badge consulted `isUpdateIgnored`, so "Ignore this
+ * version" cleared the badge but left the dialog still offering the release
+ * (#13626). A downloaded or prepared package is never hidden — the user
+ * already has it and the install action must stay reachable.
+ */
+export function effectiveUpdateInfo(info: api.UpdateInfo | null, ignoredVersion: string | undefined, hasPreparedUpdate: boolean): api.UpdateInfo | null {
+  if (!info || hasPreparedUpdate || !isUpdateIgnored(info, ignoredVersion)) return info;
+  return { ...info, update_available: false };
+}
+
 export function isNewerRemoteVersion(latest: string, cached: string): boolean {
   const parsedLatest = parseUpdateVersion(latest);
   const parsedCached = parseUpdateVersion(cached);
   if (!parsedLatest || !parsedCached) return normalizeUpdateVersion(latest) !== normalizeUpdateVersion(cached);
   return compareParsedUpdateVersions(parsedLatest, parsedCached) > 0;
+}
+
+/**
+ * A prepared package only stays meaningful while it is newer than the running
+ * build. Replacing the app outside this process (manual DMG/installer upgrade,
+ * or a bundle swapped by an external updater) leaves the old package in the
+ * update cache, and the badge then advertises a version the app already runs
+ * (#13562). An unknown version is never treated as obsolete.
+ */
+export function isPreparedUpdateObsolete(preparedVersion: string, currentVersion: string): boolean {
+  if (!preparedVersion || !currentVersion) return false;
+  return !isNewerRemoteVersion(preparedVersion, currentVersion);
 }
 
 export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDownloadSource {
@@ -131,6 +156,7 @@ export async function resolveUpdaterProxy(): Promise<string | undefined> {
 export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const { t } = useI18n();
   const settingsStore = useSettingsStore();
+  const updaterDisabled = import.meta.env.VITE_DBX_DISABLE_UPDATER === "1";
   type Phase = "idle" | "checking" | "downloading" | "ready" | "preparing" | "installing" | "restart";
   const phase = ref<Phase>("idle");
   const downloaded = ref<api.DownloadedUpdate | null>(null);
@@ -143,16 +169,24 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const checkingUpdates = computed(() => phase.value === "checking");
   const isDownloadingUpdate = computed(() => phase.value === "downloading");
   const updateDownloaded = computed(() => downloaded.value !== null);
+  const updateDownloadedVersion = computed(() => downloaded.value?.version ?? "");
   const isPreparingUpdate = computed(() => phase.value === "preparing");
   const isInstallingUpdate = computed(() => phase.value === "installing" || isPreparingUpdate.value);
   const updateReady = computed(() => phase.value === "restart");
   const activeTaskCount = computed(() => Math.max(0, Math.trunc(options.getActiveTaskCount?.() ?? 0)));
   const autoUpdateEnabled = computed(() => settingsStore.editorSettings.autoUpdateApp !== false);
+  // Hiding the toolbar update entry opts the app out of background update
+  // nagging (#11041): silent startup/hourly/retry checks stop, while the
+  // explicit "Check for updates" action in settings keeps working.
+  const updateEntryVisible = computed(() => settingsStore.editorSettings.toolbarItems?.checkUpdates !== false);
   const hasUpdateAvailable = computed(() => (updateDownloaded.value || updateReady.value || updateInfo.value?.update_available === true) && !isUpdateIgnored(updateInfo.value, settingsStore.editorSettings.ignoredUpdateVersion));
+  /** What the update dialog renders: an ignored release stops offering itself. */
+  const visibleUpdateInfo = computed(() => effectiveUpdateInfo(updateInfo.value, settingsStore.editorSettings.ignoredUpdateVersion, updateDownloaded.value || updateReady.value));
   const latestReleaseUrl = "https://github.com/t8y2/dbx/releases/latest";
   let generation = 0;
   let activeDownload: Promise<void> | undefined;
   let automaticDownload = false;
+  let silentCheck = false;
   let cancellation: Promise<void> | undefined;
   let cancelOperation: Promise<void> | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -223,13 +257,15 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     return t("updates.installFailed", { error: message });
   }
   async function checkUpdates(checkOptions: { silent?: boolean } = {}) {
-    if (disposed || isIgnoringUpdate.value) return;
+    if (updaterDisabled || disposed || isIgnoringUpdate.value) return;
+    if (checkOptions.silent && !updateEntryVisible.value) return;
     if (!checkOptions.silent) showUpdateDialog.value = true;
     // A downloaded-but-uninstalled update keeps the app in the ready phase; checks
     // continue so a newer release can replace the cached package.
     if (phase.value !== "idle" && phase.value !== "ready") return;
     clearRetry();
     const token = ++generation;
+    silentCheck = checkOptions.silent === true;
     phase.value = "checking";
     clearError();
     try {
@@ -245,7 +281,19 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
       // Installation may have started while the check was in flight; only restore
       // the phase this check itself owns.
       if (phase.value === "checking") phase.value = downloaded.value ? "ready" : "idle";
-      if (!info.update_available) updateCheckMessage.value = t("updates.upToDate", { version: info.current_version });
+      if (!info.update_available) {
+        updateCheckMessage.value = t("updates.upToDate", { version: info.current_version });
+        // The remote no longer offers a newer release, but a package from an
+        // earlier download can still sit in the cache. Drop it once the running
+        // build already satisfies it, otherwise the update badge never clears
+        // and the dialog claims an update is downloaded with no way to install
+        // it (#13562).
+        const prepared = downloaded.value;
+        if (prepared && isPreparedUpdateObsolete(prepared.version, info.current_version)) {
+          await discardSupersededUpdate(prepared);
+          if (token !== generation || disposed) return;
+        }
+      }
       if (canDownloadAndInstallUpdate(info, isTauriRuntime()) && !isUpdateIgnored(info, settingsStore.editorSettings.ignoredUpdateVersion)) {
         const cached = downloaded.value;
         if (cached && !isNewerRemoteVersion(info.latest_version, cached.version)) {
@@ -281,7 +329,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
   }
   async function downloadUpdateInBackground(automatic = false) {
-    if (disposed || isIgnoringUpdate.value || phase.value !== "idle" || downloaded.value || !canDownloadAndInstallUpdate(updateInfo.value, isTauriRuntime())) return;
+    if (updaterDisabled || disposed || isIgnoringUpdate.value || phase.value !== "idle" || downloaded.value || !canDownloadAndInstallUpdate(updateInfo.value, isTauriRuntime())) return;
     if (automatic && !autoUpdateEnabled.value) return;
     automaticDownload = automatic;
     const version = updateInfo.value!.latest_version;
@@ -405,8 +453,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
       // Windows installers and the portable helper own process replacement/relaunch.
       if (!cache?.portable_mode && !navigator.userAgent.includes("Windows")) {
         phase.value = "restart";
-        const { relaunch } = await import("@tauri-apps/plugin-process");
-        await relaunch();
+        await api.relaunchApp();
       }
     } catch (error) {
       failed = true;
@@ -434,14 +481,17 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
   }
   async function installDownloadedUpdate() {
+    if (updaterDisabled) return;
     await performInstall(false);
   }
   async function restartApp() {
+    if (updaterDisabled) return;
     if (updateReady.value) await performInstall(true);
   }
   async function initialize() {
     if (initialized || disposed) return;
     initialized = true;
+    if (updaterDisabled) return;
     if (isTauriRuntime()) {
       phase.value = "checking";
       try {
@@ -453,6 +503,12 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
           else {
             setDownloaded(cache);
             updateInfo.value!.current_version = await api.getAppVersion();
+            // An upgrade that happened outside this process leaves the previous
+            // package in the cache. Adopting it would pin the dialog to "already
+            // up to date" while still advertising a downloaded update (#13562).
+            if (isPreparedUpdateObsolete(cache.version, updateInfo.value!.current_version)) {
+              await discardSupersededUpdate(cache);
+            }
           }
         }
       } catch (error) {
@@ -484,11 +540,28 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
       })
       .catch(fail);
   });
+  // Hiding the toolbar entry mid-session must also stop background activity,
+  // and re-showing it resumes the silent checks.
+  const stopUpdateEntryWatch = watch(updateEntryVisible, (visible) => {
+    if (disposed) return;
+    if (!visible) {
+      clearRetry();
+      if (automaticDownload || (checkingUpdates.value && silentCheck)) void cancelDownload().catch(fail);
+      return;
+    }
+    if (!initialized) return;
+    void (cancelOperation ?? Promise.resolve())
+      .then(() => {
+        if (updateEntryVisible.value && !disposed) void checkUpdates({ silent: true });
+      })
+      .catch(fail);
+  });
   function dispose() {
     disposed = true;
     clearRetry();
     clearInterval(hourlyTimer);
     stopSettingsWatch();
+    stopUpdateEntryWatch();
     updatePreparationRelease?.();
     updatePreparationRelease = undefined;
     void cancelDownload().catch(() => {});
@@ -498,12 +571,14 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     phase,
     checkingUpdates,
     updateInfo,
+    visibleUpdateInfo,
     updateCheckMessage,
     updateCheckFailed,
     showUpdateDialog,
     isDownloadingUpdate,
     downloadProgress,
     updateDownloaded,
+    updateDownloadedVersion,
     isInstallingUpdate,
     isPreparingUpdate,
     updateReady,

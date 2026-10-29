@@ -1,10 +1,9 @@
 // @vitest-environment happy-dom
 
-import { readFileSync } from "node:fs";
-import { createApp, defineComponent, h, nextTick } from "vue";
+import { createApp, defineComponent, h, nextTick, shallowRef } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { dispatch, findAll, findOne, hostText, mountComponent } from "./vueHostHarness";
+import { dispatch, findAll, findOne, hostText, mountComponent, type HostNode } from "./vueHostHarness";
 import type { DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 
 const settingsMock = vi.hoisted(() => ({ store: null as any }));
@@ -85,7 +84,7 @@ vi.mock("@/stores/settingsStore", async () => {
   };
   return { ...actual, useSettingsStore: () => settingsMock.store };
 });
-vi.mock("@/lib/dataGrid/geometryPreview", () => ({ isHexGeometry: () => false, renderWktOnCanvas: mocks.renderWkt }));
+vi.mock("@/lib/dataGrid/geometryPreview", () => ({ isHexGeometry: () => false, looksLikeWkt: () => false, parseWktGeometry: () => null, renderWktOnCanvas: mocks.renderWkt }));
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: mocks.copyToClipboard }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
 vi.mock("@/composables/useDataGridCellDetail", async () => {
@@ -113,18 +112,7 @@ import DataGridSearchBar from "@/components/grid/DataGridSearchBar.vue";
 import DataGridSortBuilder from "@/components/grid/DataGridSortBuilder.vue";
 import DataGridSortWorkbench from "@/components/grid/DataGridSortWorkbench.vue";
 import DataGridTextSortWorkbench from "@/components/grid/DataGridTextSortWorkbench.vue";
-
-const cellDetailPanelSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailPanel.vue", "utf8");
-const cellDetailDialogSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailDialog.vue", "utf8");
-const binaryTextPreviewSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailTextPreview.vue", "utf8");
-const dataGridSource = readFileSync("apps/desktop/src/components/grid/DataGrid.vue", "utf8");
-
-describe("DataGrid opaque aggregate-state safety", () => {
-  it("blocks cell edits and keyless row deletion through the centralized gates", () => {
-    expect(dataGridSource).toMatch(/function canEditCellItem[\s\S]*isOpaqueAggregateStateColumnType\(allColumnTypes\.value\[columnIndex\]\)/);
-    expect(dataGridSource).toMatch(/function canDeleteRowItem[\s\S]*canUseKeylessRowPredicate[\s\S]*hasUnsafeOpaqueAggregateStatePredicate\(allColumnTypes\.value, item\.data\)/);
-  });
-});
+import EnumCellEditor from "@/components/grid/EnumCellEditor.vue";
 
 function detail(patch: Partial<DataGridCellDetail> = {}): DataGridCellDetail {
   return {
@@ -234,6 +222,34 @@ describe("DataGridPagination", () => {
     expect(summaryText).toContain("grid.selectionAverage");
     expect(summaryText).toContain("grid.selectionCells");
     expect(summaryText).toContain("grid.rows");
+  });
+
+  it("shows min, max, count and distinct beside sum and average when numbers are selected (#13286)", () => {
+    const mounted = mountComponent(DataGridPagination, {
+      selectionSummary: { cellCount: 4, rowCount: 2 },
+      selectionSummarySumText: "10",
+      selectionSummaryAverageText: "2.5",
+      selectionSummaryMinText: "1",
+      selectionSummaryMaxText: "4",
+      selectionSummaryCount: 4,
+      selectionSummaryDistinctCount: 3,
+      loading: false,
+      infiniteScrollEnabled: false,
+      infiniteScrollAllLoaded: false,
+      pageSize: 100,
+      customPageSizeInput: "",
+      pageSizeMenuItems: [],
+      exportMenuItems: [],
+      currentPage: 1,
+      canGoNextPage: false,
+      canJumpLastPage: false,
+    });
+
+    const summaryText = hostText(mounted.root);
+    expect(summaryText).toContain("grid.selectionMin");
+    expect(summaryText).toContain("grid.selectionMax");
+    expect(summaryText).toContain("grid.selectionCount");
+    expect(summaryText).toContain("grid.selectionDistinct");
   });
 
   it("keeps the loading icon mounted with a constant footprint and only animates while loading", async () => {
@@ -431,7 +447,7 @@ describe("DataGridPagination", () => {
       canExport: true,
     });
 
-    const findExportMenu = () => findAll(mounted.root, (node) => node.props["data-stub"] === "LightDropdown" && node.props["aria-label"] === "grid.export");
+    const findExportMenu = () => findAll(mounted.root, (node) => node.props["aria-label"] === "grid.export");
     expect(findExportMenu()).toHaveLength(1);
 
     await mounted.setProps({ canExport: false });
@@ -458,8 +474,119 @@ describe("DataGridPagination", () => {
       canJumpLastPage: false,
     });
 
-    const exportMenus = findAll(mounted.root, (node) => node.props["data-stub"] === "LightDropdown" && node.props["aria-label"] === "grid.export");
+    const exportMenus = findAll(mounted.root, (node) => node.props["aria-label"] === "grid.export");
     expect(exportMenus).toHaveLength(1);
+  });
+
+  it("copies each aggregate value on click, and only the values", () => {
+    const copySelectionSummary = vi.fn();
+    const mounted = mountComponent(DataGridPagination, {
+      selectionSummary: { cellCount: 4, rowCount: 2 },
+      selectionSummarySumText: "10",
+      selectionSummaryAverageText: "2.5",
+      loading: false,
+      infiniteScrollEnabled: false,
+      infiniteScrollAllLoaded: false,
+      pageSize: 100,
+      customPageSizeInput: "",
+      pageSizeMenuItems: [],
+      exportMenuItems: [],
+      currentPage: 1,
+      canGoNextPage: false,
+      canJumpLastPage: false,
+      onCopySelectionSummary: copySelectionSummary,
+    });
+
+    const sum = findOne(mounted.root, (node) => node.props["data-selection-summary-sum"] === "");
+    const average = findOne(mounted.root, (node) => node.props["data-selection-summary-average"] === "");
+    // Native buttons provide tab focus plus Enter/Space activation without recreating
+    // the complete button interaction model on a clickable text span.
+    expect(sum.type).toBe("button");
+    expect(average.type).toBe("button");
+    expect(sum.props.title).toBe("grid.copyValue: grid.selectionSum");
+    expect(hostText(sum)).toContain("grid.copyValue");
+
+    dispatch(sum, "click");
+    expect(copySelectionSummary).toHaveBeenCalledWith("10");
+
+    dispatch(average, "click");
+    expect(copySelectionSummary).toHaveBeenLastCalledWith("2.5");
+    expect(copySelectionSummary).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets long aggregates shrink so load-all and export stay in the footer (#13468)", () => {
+    const longValue = "2026102710000008194";
+    const mounted = mountComponent(DataGridPagination, {
+      selectionSummary: { cellCount: 1, rowCount: 1 },
+      selectionSummarySumText: longValue,
+      selectionSummaryAverageText: longValue,
+      selectionSummaryMinText: longValue,
+      selectionSummaryMaxText: longValue,
+      selectionSummaryCount: 1,
+      selectionSummaryDistinctCount: 1,
+      loading: false,
+      infiniteScrollEnabled: false,
+      infiniteScrollAllLoaded: false,
+      canLoadAllRows: true,
+      pageSize: 100,
+      customPageSizeInput: "",
+      pageSizeMenuItems: [],
+      exportMenuItems: [],
+      currentPage: 1,
+      canGoNextPage: true,
+      canJumpLastPage: true,
+    });
+
+    const classes = (node: HostNode) => String(node.props.class).split(/\s+/);
+    const sum = findOne(mounted.root, (node) => node.props["data-selection-summary-sum"] === "");
+    const summaryGroup = sum.parent!;
+    const bar = summaryGroup.parent!;
+    // The status bar caps this column at the space left over, so the bar itself must be
+    // allowed to be narrower than its content instead of forcing max-content width.
+    expect(classes(bar)).toContain("min-w-0");
+    expect(classes(bar)).not.toContain("min-w-max");
+
+    const aggregates = ["sum", "average", "min", "max"].map((key) => findOne(mounted.root, (node) => node.props[`data-selection-summary-${key}`] === ""));
+    for (const aggregate of aggregates) {
+      expect(classes(aggregate)).toEqual(expect.arrayContaining(["min-w-0", "truncate"]));
+      expect(classes(aggregate)).not.toContain("shrink-0");
+    }
+    expect(classes(summaryGroup)).toEqual(expect.arrayContaining(["min-w-0", "overflow-hidden"]));
+    expect(classes(summaryGroup)).not.toContain("shrink-0");
+    // Truncated text stays readable on hover.
+    expect(sum.props.title).toBe("grid.copyValue: grid.selectionSum");
+
+    const loadAll = findOne(mounted.root, (node) => node.props["aria-label"] === "grid.loadAllAndGoToLastRow");
+    expect(classes(loadAll)).toContain("shrink-0");
+  });
+
+  it("keeps the aggregate values non-copyable while the selection drag is pending", () => {
+    const copySelectionSummary = vi.fn();
+    const mounted = mountComponent(DataGridPagination, {
+      selectionSummary: { cellCount: 4, rowCount: 2 },
+      selectionSummarySumText: "…",
+      selectionSummaryAverageText: "…",
+      selectionSummaryPending: true,
+      loading: false,
+      infiniteScrollEnabled: false,
+      infiniteScrollAllLoaded: false,
+      pageSize: 100,
+      customPageSizeInput: "",
+      pageSizeMenuItems: [],
+      exportMenuItems: [],
+      currentPage: 1,
+      canGoNextPage: false,
+      canJumpLastPage: false,
+      onCopySelectionSummary: copySelectionSummary,
+    });
+
+    const sum = findOne(mounted.root, (node) => node.props["data-selection-summary-sum"] === "");
+    // Pending aggregate placeholders retain their layout but expose no copy action.
+    expect(sum.props.title).toBeUndefined();
+    expect(sum.props.disabled).toBe(true);
+
+    dispatch(sum, "click");
+    expect(copySelectionSummary).not.toHaveBeenCalled();
   });
 });
 
@@ -1619,6 +1746,51 @@ describe("DataGridDistinctValuePopover", () => {
     await mounted.setProps({ selectedKeys: new Set(options.map((option) => option.key)) });
     expect(findSelectAll().props["aria-checked"]).toBe(true);
   });
+
+  it("renders the current page value switch and emits update:source", async () => {
+    const updateSource = vi.fn();
+    const mounted = mountComponent(DataGridDistinctValuePopover, {
+      open: true,
+      search: "",
+      options: [{ key: "str:open", label: "open", count: 12, value: "open" }],
+      loading: false,
+      error: "",
+      limited: false,
+      limit: 1000,
+      source: "database",
+      "onUpdate:source": updateSource,
+    });
+
+    expect(hostText(mounted.root)).toContain("grid.filterFromCurrentPage");
+    const switchEl = findOne(mounted.root, (node) => node.props["data-distinct-value-page-switch"] === "");
+    expect(switchEl.props["model-value"] ?? switchEl.props.modelValue).toBe(false);
+
+    (switchEl.props["onUpdate:model-value"] ?? switchEl.props["onUpdate:modelValue"])(true);
+    expect(updateSource).toHaveBeenCalledWith("page");
+
+    await mounted.setProps({ source: "page" });
+    const switchElPage = findOne(mounted.root, (node) => node.props["data-distinct-value-page-switch"] === "");
+    expect(switchElPage.props["model-value"] ?? switchElPage.props.modelValue).toBe(true);
+
+    (switchElPage.props["onUpdate:model-value"] ?? switchElPage.props["onUpdate:modelValue"])(false);
+    expect(updateSource).toHaveBeenCalledWith("database");
+  });
+
+  it("disables source switch when server filter is not supported", () => {
+    const mounted = mountComponent(DataGridDistinctValuePopover, {
+      open: true,
+      search: "",
+      options: [{ key: "str:open", label: "open", count: 12, value: "open" }],
+      loading: false,
+      error: "",
+      limited: false,
+      limit: 1000,
+      canUseServerFilter: false,
+    });
+    const switchEl = findOne(mounted.root, (node) => node.props["data-distinct-value-page-switch"] === "");
+    expect(switchEl.props.disabled).toBe(true);
+    expect(switchEl.props["model-value"] ?? switchEl.props.modelValue).toBe(true);
+  });
 });
 
 describe("DataGridFilterWorkbench", () => {
@@ -1679,6 +1851,24 @@ describe("DataGridFilterWorkbench", () => {
     });
 
     expect(findAll(mounted.root, (node) => node.type === "button" && node.props.title === "grid.databaseValueFilter")).toHaveLength(1);
+  });
+
+  it("forwards distinct value source updates in the conditions workbench", () => {
+    const updateSource = vi.fn();
+    const mounted = mountComponent(DataGridFilterWorkbench, {
+      sqlPreview: "",
+      rules: [{ id: "r1", columnName: "status", mode: "equals", rawValue: "", rawEndValue: "", conjunction: "AND" }],
+      columns: ["status"],
+      filteredColumns: ["status"],
+      modeOptions: [{ value: "equals", labelKey: "equals" }],
+      columnSearch: "",
+      valueSuggestions: { ruleId: "r1", target: "value", source: "database", search: "", options: [], loading: false, error: "", limited: false, limit: 1000, selectedKeys: new Set<string>() },
+      onUpdateValueSuggestionSource: updateSource,
+    });
+
+    const switchEl = findOne(mounted.root, (node) => node.props["data-distinct-value-page-switch"] === "");
+    (switchEl.props["onUpdate:model-value"] ?? switchEl.props["onUpdate:modelValue"])(true);
+    expect(updateSource).toHaveBeenCalledWith("page");
   });
 
   it("scrolls to the newest rule when a condition is added", async () => {
@@ -1956,6 +2146,108 @@ describe("cell detail surfaces", () => {
     expect(copyText).toHaveBeenCalledWith("#2005805");
   });
 
+  it("presents printable Oracle BLOB bytes as text and copies the presented value", async () => {
+    const copyText = vi.fn();
+    const blobDetail = detail({
+      type: "BLOB",
+      value: "0x48656c6c6f",
+      rawValue: "0x48656c6c6f",
+      rawValuePreview: "0x48656c6c6f",
+      displayValue: "Hello",
+      displayValuePreview: "Hello",
+      formattedJson: "",
+    });
+    const dialog = mountComponent(DataGridCellDetailDialog, {
+      open: true,
+      detail: blobDetail,
+      typeColorClass: () => "",
+      openImagePreview: vi.fn(),
+      copyText,
+      canDownloadBinaryValue: () => true,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => false,
+      importBinaryValue: vi.fn(),
+      databaseType: "oracle",
+    });
+    const panel = mountComponent(DataGridCellDetailPanel, {
+      detail: blobDetail,
+      panelIsBottom: true,
+      metadataCollapsed: false,
+      valueFillsHeight: false,
+      editing: false,
+      sideJsonView: false,
+      showCompactJson: false,
+      canCompactJson: false,
+      typeColorClass: () => "",
+      canDownloadBinaryValue: () => true,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => false,
+      importBinaryValue: vi.fn(),
+      openImagePreview: vi.fn(),
+      canCopySqlCondition: () => true,
+      databaseType: "oracle",
+    });
+
+    expect(hostText(dialog.root)).toContain("Hello");
+    expect(hostText(panel.root)).toContain("Hello");
+    dispatch(
+      findOne(dialog.root, (node) => node.props.title === "grid.copyValue"),
+      "click",
+    );
+    expect(copyText).toHaveBeenCalledWith("Hello");
+  });
+
+  it("presents printable PostgreSQL BYTEA bytes as text and copies the presented value (#11987)", async () => {
+    const copyText = vi.fn();
+    const byteaDetail = detail({
+      type: "BYTEA",
+      value: "0x48656c6c6f",
+      rawValue: "0x48656c6c6f",
+      rawValuePreview: "0x48656c6c6f",
+      displayValue: "Hello",
+      displayValuePreview: "Hello",
+      formattedJson: "",
+    });
+    const dialog = mountComponent(DataGridCellDetailDialog, {
+      open: true,
+      detail: byteaDetail,
+      typeColorClass: () => "",
+      openImagePreview: vi.fn(),
+      copyText,
+      canDownloadBinaryValue: () => true,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => true,
+      importBinaryValue: vi.fn(),
+      databaseType: "postgres",
+    });
+    const panel = mountComponent(DataGridCellDetailPanel, {
+      detail: byteaDetail,
+      panelIsBottom: true,
+      metadataCollapsed: false,
+      valueFillsHeight: false,
+      editing: false,
+      sideJsonView: false,
+      showCompactJson: false,
+      canCompactJson: false,
+      typeColorClass: () => "",
+      canDownloadBinaryValue: () => true,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => true,
+      importBinaryValue: vi.fn(),
+      openImagePreview: vi.fn(),
+      canCopySqlCondition: () => true,
+      databaseType: "postgres",
+    });
+
+    expect(hostText(dialog.root)).toContain("Hello");
+    expect(hostText(panel.root)).toContain("Hello");
+    dispatch(
+      findOne(dialog.root, (node) => node.props.title === "grid.copyValue"),
+      "click",
+    );
+    expect(copyText).toHaveBeenCalledWith("Hello");
+  });
+
   it("keeps non-MySQL BLOB detail previews in hex", () => {
     const panel = mountComponent(DataGridCellDetailPanel, {
       detail: detail({ type: "BLOB", value: "0x2332303035383035", rawValue: "0x2332303035383035", rawValuePreview: "0x2332303035383035", displayValue: "BLOB [8 bytes]", displayValuePreview: "BLOB [8 bytes]", formattedJson: "" }),
@@ -2086,6 +2378,55 @@ describe("cell detail surfaces", () => {
     expect(findOne(panel.root, (node) => node.type === "textarea").value).toBe("中文");
   });
 
+  it("shows the grid boolean label in the panel and dialog without changing the raw value", () => {
+    const booleanDetail = detail({
+      type: "bit",
+      value: true,
+      rawValue: "true",
+      rawValuePreview: "true",
+      displayValue: "TRUE",
+      displayValuePreview: "TRUE",
+      formattedJson: "",
+    });
+    const panel = mountComponent(DataGridCellDetailPanel, {
+      detail: booleanDetail,
+      panelIsBottom: true,
+      metadataCollapsed: false,
+      valueFillsHeight: false,
+      editing: false,
+      sideJsonView: false,
+      showCompactJson: false,
+      canCompactJson: false,
+      typeColorClass: () => "",
+      canDownloadBinaryValue: () => false,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => false,
+      importBinaryValue: vi.fn(),
+      openImagePreview: vi.fn(),
+      canCopySqlCondition: () => true,
+      databaseType: "sqlserver",
+    });
+    const dialog = mountComponent(DataGridCellDetailDialog, {
+      open: true,
+      detail: booleanDetail,
+      typeColorClass: () => "",
+      openImagePreview: vi.fn(),
+      copyText: vi.fn(),
+      canDownloadBinaryValue: () => false,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => false,
+      importBinaryValue: vi.fn(),
+      databaseType: "sqlserver",
+    });
+
+    for (const mounted of [panel, dialog]) {
+      expect(hostText(mounted.root)).toContain("TRUE");
+      expect(hostText(mounted.root)).not.toContain(">true<");
+    }
+    // rawValue remains the edit/copy payload; only the preview is labeled.
+    expect(booleanDetail.rawValue).toBe("true");
+  });
+
   it("keeps the value transform entry for non-binary detail cells", () => {
     const panel = mountComponent(DataGridCellDetailPanel, {
       detail: detail({ type: "VARCHAR(32)", value: "hello", rawValue: "hello", rawValuePreview: "hello", displayValue: "hello", displayValuePreview: "hello", formattedJson: "" }),
@@ -2148,16 +2489,6 @@ describe("cell detail surfaces", () => {
     expect(startEdit).not.toHaveBeenCalled();
     expect(hostText(panel.root)).toContain("0x48656c6c6f");
     expect(findOne(panel.root, (node) => node.type === "textarea").value).toBe("Hello");
-  });
-
-  it("keeps the binary text preview component strictly read-only and shared by both surfaces", () => {
-    expect(binaryTextPreviewSource).toContain("binaryCellTextPreview(props.value");
-    // 不发出任何编辑/提交事件，也不给 detail.value / rawValue 赋值。
-    expect(binaryTextPreviewSource).not.toContain("defineEmits");
-    expect(binaryTextPreviewSource).not.toMatch(/(?:props|detail)\.(?:value|rawValue)\s*=/);
-    expect(cellDetailDialogSource).toMatch(/<DataGridCellDetailTextPreview\s+v-if="open && isBinaryCellColumnType\(detail\.type\)"/);
-    // Panel 与下载菜单同一道闸门：编辑中不对草稿做只读文本预览。
-    expect(cellDetailPanelSource).toMatch(/<DataGridCellDetailTextPreview\s+v-if="!editing && isBinaryCellColumnType\(detail\.type\)"/);
   });
 
   it("copies the presented value, emits edit, closes, and replaces the JSON result", async () => {
@@ -2425,5 +2756,136 @@ describe("DataGrid column header tooltips", () => {
     expect(grid.headerTooltipsDisabled()).toEqual([false, false]);
 
     grid.destroy();
+  });
+});
+
+describe("DataGrid busy execution elapsed time", () => {
+  it("rebases the displayed elapsed time when another execution starts while loading", async () => {
+    setActivePinia(createPinia());
+    const now = vi.spyOn(Date, "now").mockReturnValue(5_000);
+    const startedAt = shallowRef(1_000);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp(defineComponent({ setup: () => () => h(DataGrid, { result: { columns: ["id"], rows: [[1]] }, loading: true, busyStartedAt: startedAt.value }) }));
+    try {
+      app.mount(host);
+      await nextTick();
+      await nextTick();
+      expect(host.textContent).toContain("4.0s");
+
+      now.mockReturnValue(9_000);
+      startedAt.value = 8_000;
+      await nextTick();
+      await nextTick();
+      expect(host.textContent).toContain("1.0s");
+      expect(host.textContent).not.toContain("8.0s");
+    } finally {
+      app.unmount();
+      host.remove();
+      now.mockRestore();
+    }
+  });
+});
+
+describe("EnumCellEditor boolean labels", () => {
+  it("shows TRUE/FALSE but commits the raw boolean value", () => {
+    const commit = vi.fn();
+    const editor = mountComponent(EnumCellEditor, {
+      modelValue: "true",
+      values: ["true", "false"],
+      displayValues: ["TRUE", "FALSE"],
+      nullable: true,
+      onCommit: commit,
+    });
+
+    expect(hostText(editor.root)).toContain("TRUE");
+    dispatch(
+      findOne(editor.root, (node) => node.type === "button" && hostText(node).trim() === "FALSE"),
+      "click",
+    );
+    expect(commit).toHaveBeenCalledWith("false");
+  });
+
+  it("shows 1/0 for the zero-one style while keeping the raw values", () => {
+    const commit = vi.fn();
+    const editor = mountComponent(EnumCellEditor, {
+      modelValue: "false",
+      values: ["true", "false"],
+      displayValues: ["1", "0"],
+      nullable: true,
+      onCommit: commit,
+    });
+
+    expect(hostText(editor.root)).toContain("0");
+    dispatch(
+      findOne(editor.root, (node) => node.type === "button" && hostText(node).trim() === "1"),
+      "click",
+    );
+    expect(commit).toHaveBeenCalledWith("true");
+  });
+});
+
+describe("DataGrid large-table preview notice", () => {
+  const HIDDEN_KEY = "dbx-table-data-preview-notice-hidden";
+
+  function mountGrid() {
+    setActivePinia(createPinia());
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const result = {
+      columns: ["id", "content"],
+      column_types: ["int4", "text"],
+      rows: [[1, "preview"]],
+      affected_rows: 0,
+      execution_time_ms: 1,
+      large_value_cells: [{ row_index: 0, column_index: 1, original_bytes: 5000 }],
+    };
+    const tableMeta = { schema: "app", tableName: "t", columns: [], primaryKeys: [] };
+    const app = createApp(defineComponent({ setup: () => () => h(DataGrid, { result, tableMeta, context: "table-data" }) }));
+    app.mount(host);
+    return {
+      host,
+      notice: () => host.querySelector("[data-grid-preview-notice]"),
+      destroy() {
+        app.unmount();
+        host.remove();
+      },
+    };
+  }
+
+  beforeEach(() => {
+    localStorage.removeItem(HIDDEN_KEY);
+  });
+
+  function fullTextEntry(host: HTMLElement) {
+    return [...host.querySelectorAll("button")].find((button) => button.textContent?.trim() === "grid.tableDataPreviewLoadPageShort");
+  }
+
+  // #12906: the banner only stayed away for the current result, so every new
+  // table brought it back. "Don't show again" has to persist across tables and
+  // keep the full text one click away.
+  it("persists the don't-show-again choice without leaving an empty banner row", async () => {
+    const grid = mountGrid();
+    await nextTick();
+    expect(grid.notice()?.textContent).toContain("grid.tableDataPreviewNotice");
+    expect(fullTextEntry(grid.host)).toBeUndefined();
+
+    const dontShowAgain = [...grid.host.querySelectorAll("button")].find((button) => button.textContent?.trim() === "grid.tableDataPreviewDontShowAgain");
+    expect(dontShowAgain).toBeTruthy();
+    dontShowAgain!.click();
+    await nextTick();
+
+    expect(localStorage.getItem(HIDDEN_KEY)).toBe("1");
+    // The banner row is gone entirely; the full-text action moved into the
+    // existing toolbar action row so no empty strip is left behind.
+    expect(grid.notice()).toBeNull();
+    expect(fullTextEntry(grid.host)).toBeTruthy();
+    grid.destroy();
+
+    const reopened = mountGrid();
+    await nextTick();
+    expect(reopened.notice()).toBeNull();
+    expect(fullTextEntry(reopened.host)).toBeTruthy();
+    reopened.destroy();
   });
 });

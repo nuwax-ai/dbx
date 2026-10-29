@@ -7,6 +7,46 @@ import { columnHeaderDragAutoScrollDelta, columnHeaderDropTargetIndex } from "@/
 import { loadDataGridColumnLayout, saveDataGridColumnLayout } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 
 describe("useDataGridColumnLayout", () => {
+  it("combines independent NULL and empty-column toggles without losing manual visibility", async () => {
+    const scope = effectScope();
+    const hideNullColumns = ref(true);
+    const hideEmptyColumns = ref(false);
+    const allEmptyColumnIndexes = ref([1, 2]);
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(["value", "null", "mixed", "manual"]),
+        displayableColumnIndexes: ref([0, 1, 2, 3]),
+        allNullColumnIndexes: ref([1]),
+        allEmptyColumnIndexes,
+        columnOrderKeys: ref(["value", "null", "mixed", "manual"]),
+        layoutScopeKey: ref("empty-columns"),
+        tableScopeKey: ref(""),
+        hideNullColumns,
+        hideEmptyColumns,
+        onHideNullColumnsChange: (hidden) => {
+          hideNullColumns.value = hidden;
+        },
+      }),
+    )!;
+    try {
+      state.hideColumns([3]);
+      expect(state.visibleColumnIndexes.value).toEqual([0, 2]);
+      hideEmptyColumns.value = true;
+      await nextTick();
+      expect(state.visibleColumnIndexes.value).toEqual([0]);
+      state.toggleAllNullColumns();
+      await nextTick();
+      expect(state.visibleColumnIndexes.value).toEqual([0]);
+      allEmptyColumnIndexes.value = [];
+      await nextTick();
+      expect(state.visibleColumnIndexes.value).toEqual([0, 1, 2]);
+      hideEmptyColumns.value = false;
+      await nextTick();
+      expect(state.hiddenColumnIndexes.value).toEqual(new Set([3]));
+    } finally {
+      scope.stop();
+    }
+  });
   beforeEach(() => {
     const values = new Map<string, string>();
     vi.stubGlobal("localStorage", {
@@ -21,6 +61,41 @@ describe("useDataGridColumnLayout", () => {
     document.querySelectorAll("[data-column-header-drag-preview]").forEach((element) => element.remove());
     vi.unstubAllGlobals();
   });
+  it("shows only valid requested columns, persists the selection, and restores all columns", async () => {
+    vi.useFakeTimers();
+    const scope = effectScope();
+    const keys = ["id", "internal", "email", "created"];
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(keys),
+        displayableColumnIndexes: ref([0, 2, 3]),
+        allNullColumnIndexes: ref([]),
+        columnOrderKeys: ref(keys),
+        layoutScopeKey: ref("show-only-regression"),
+        tableScopeKey: ref(""),
+        hideNullColumns: ref(false),
+        onHideNullColumnsChange: vi.fn(),
+      }),
+    )!;
+    try {
+      state.hideColumns([2]);
+      state.showOnlyColumns([2, 2, 1, -1, 999, NaN]);
+      expect(state.visibleColumnIndexes.value).toEqual([2]);
+      state.showOnlyColumns([]);
+      state.showOnlyColumns([999]);
+      expect(state.visibleColumnIndexes.value).toEqual([2]);
+      await vi.advanceTimersByTimeAsync(101);
+      expect(loadDataGridColumnLayout("show-only-regression", keys)?.hiddenKeys).toEqual(["id", "created"]);
+      state.showAllColumns();
+      expect(state.visibleColumnIndexes.value).toEqual([0, 2, 3]);
+      await vi.advanceTimersByTimeAsync(101);
+      expect(loadDataGridColumnLayout("show-only-regression", keys)?.hiddenKeys).toEqual([]);
+    } finally {
+      scope.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("builds cumulative offsets", () => {
     expect(dataGridColumnOffsets([80, 120, 60])).toEqual([0, 80, 200, 260]);
   });

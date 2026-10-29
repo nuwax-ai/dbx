@@ -100,9 +100,10 @@ public final class DdlBuilder {
             if (!column.getIs_nullable()) {
                 line.append(" NOT NULL");
             }
-            if (notBlank(column.getColumn_default())) {
+            String columnDefault = sanitizeDefault(column.getColumn_default());
+            if (notBlank(columnDefault)) {
                 line.append(" DEFAULT ");
-                line.append(column.getColumn_default());
+                line.append(columnDefault);
             }
             columnLines.add(line.toString());
         }
@@ -112,8 +113,13 @@ public final class DdlBuilder {
             if (!index.getIs_primary() || index.getColumns().isEmpty()) {
                 continue;
             }
-            for (String column : index.getColumns()) {
-                primaryKeys.add(quoteIdent(column, useBacktick));
+            List<String> directions = index.getKey_directions();
+            for (int columnIndex = 0; columnIndex < index.getColumns().size(); columnIndex++) {
+                String renderedColumn = quoteIdent(index.getColumns().get(columnIndex), useBacktick);
+                if (isDescendingKey(directions, columnIndex)) {
+                    renderedColumn += " DESC";
+                }
+                primaryKeys.add(renderedColumn);
             }
             break;
         }
@@ -187,6 +193,7 @@ public final class DdlBuilder {
             String unique = index.getIs_unique() ? "UNIQUE " : "";
             String using = notBlank(index.getIndex_type()) ? " USING " + index.getIndex_type() : "";
             List<String> quotedColumns = new ArrayList<>();
+            List<String> directions = index.getKey_directions();
             for (int columnIndex = 0; columnIndex < index.getColumns().size(); columnIndex++) {
                 String column = index.getColumns().get(columnIndex);
                 String renderedColumn = quoteIdent(column, useBacktick);
@@ -198,6 +205,13 @@ public final class DdlBuilder {
                     int options = keyOptions.get(columnIndex);
                     renderedColumn += (options & 1) != 0 ? " DESC" : " ASC";
                     renderedColumn += (options & 2) != 0 ? " NULLS FIRST" : " NULLS LAST";
+                } else if (isDescendingKey(directions, columnIndex)) {
+                    // Explicit key directions (e.g. Spanner's ASC_OR_DESC) must
+                    // survive into the DDL: DESC key parts change query plans
+                    // and their absence misrepresents the schema (#13484).
+                    // ASC is the default and stays implicit, matching the
+                    // engine's own DDL output and the index panels.
+                    renderedColumn += " DESC";
                 }
                 quotedColumns.add(renderedColumn);
             }
@@ -387,9 +401,10 @@ public final class DdlBuilder {
     }
 
     private static String quoteIdent(String identifier, boolean useBacktick) {
+        String clean = sanitizeString(identifier);
         return useBacktick
-            ? JdbcIdentifiers.INSTANCE.backtick(identifier)
-            : JdbcIdentifiers.INSTANCE.doubleQuote(identifier);
+            ? JdbcIdentifiers.INSTANCE.backtick(clean)
+            : JdbcIdentifiers.INSTANCE.doubleQuote(clean);
     }
 
     private static String qualifiedName(String schema, String name, boolean useBacktick) {
@@ -438,11 +453,53 @@ public final class DdlBuilder {
         return matcher.matches() ? "IDENTITY(" + matcher.group(1) + "," + matcher.group(2) + ")" : null;
     }
 
+    private static String sanitizeString(String value) {
+        if (value == null) {
+            return "";
+        }
+        int nullIdx = value.indexOf('\0');
+        return nullIdx >= 0 ? value.substring(0, nullIdx) : value;
+    }
+
+    private static String sanitizeDefault(String defaultValue) {
+        if (defaultValue == null) {
+            return null;
+        }
+        int nullIdx = defaultValue.indexOf('\0');
+        if (nullIdx < 0) {
+            return defaultValue;
+        }
+        String truncated = defaultValue.substring(0, nullIdx).trim();
+        return truncated.isEmpty() ? null : truncated;
+    }
+
+    private static boolean isDescendingKey(List<String> directions, int columnIndex) {
+        if (directions == null || columnIndex >= directions.size()) {
+            return false;
+        }
+        String direction = directions.get(columnIndex);
+        return direction != null && "DESC".equalsIgnoreCase(direction.trim());
+    }
+
     private static boolean notBlank(String value) {
-        return value != null && !value.trim().isEmpty();
+        if (value == null) {
+            return false;
+        }
+        int nullIdx = value.indexOf('\0');
+        if (nullIdx >= 0) {
+            value = value.substring(0, nullIdx);
+        }
+        return !value.trim().isEmpty();
     }
 
     private static String sqlStringBody(String value) {
+        if (value == null) {
+            return "";
+        }
+        int nullIdx = value.indexOf('\0');
+        if (nullIdx >= 0) {
+            value = value.substring(0, nullIdx);
+        }
         return value.replace("'", "''");
     }
 

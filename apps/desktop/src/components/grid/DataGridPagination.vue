@@ -17,6 +17,12 @@ const props = withDefaults(
     selectionSummary: { cellCount: number; rowCount: number } | null;
     selectionSummarySumText: string;
     selectionSummaryAverageText: string;
+    selectionSummaryMinText: string;
+    selectionSummaryMaxText: string;
+    selectionSummaryCount?: number;
+    selectionSummaryDistinctCount?: number;
+    // 拖拽选区期间聚合值只是占位符，父组件把该状态传下来，值不可复制
+    selectionSummaryPending?: boolean;
     loading: boolean;
     infiniteScrollEnabled: boolean;
     infiniteScrollAllLoaded: boolean;
@@ -28,12 +34,13 @@ const props = withDefaults(
     defaultPageSize: number;
     pageSizeMenuItems: LightDropdownItem[];
     exportMenuItems: LightDropdownItem[];
+    exportWarning?: string;
     currentPage: number;
     maxPage?: number;
     canGoNextPage: boolean;
     canJumpLastPage: boolean;
   }>(),
-  { paginationEnabled: true, loadAllRowsActive: false, loadAllRowsEnabled: true, canLoadAllRows: false, canExport: true },
+  { paginationEnabled: true, loadAllRowsActive: false, loadAllRowsEnabled: true, canLoadAllRows: false, canExport: true, selectionSummaryPending: false },
 );
 
 const customPageSizeInput = defineModel<string>("customPageSizeInput", { default: "" });
@@ -56,7 +63,22 @@ const emit = defineEmits<{
   loadAllRows: [];
   selectExport: [value: string];
   applyCustomPageSizeAndSetDefault: [];
+  // 载荷是聚合值当前显示出来的文本，保证复制到的就是用户看到的那个数
+  copySelectionSummary: [text: string];
 }>();
+
+// 拖拽选区中聚合值显示为占位符 "…"，此时不给复制入口，避免复制出一个假值
+const selectionSummaryValueClass = computed(() => (props.selectionSummaryPending ? "" : "cursor-pointer transition-colors hover:text-foreground"));
+
+// Aggregates truncate when the footer runs out of room (long numbers, narrow windows), so the tooltip carries the full value.
+function selectionSummaryValueTitle(text: string) {
+  return props.selectionSummaryPending ? undefined : `${t("grid.copyValue")}: ${text}`;
+}
+
+function copySelectionSummaryValue(text: string) {
+  if (props.selectionSummaryPending) return;
+  emit("copySelectionSummary", text);
+}
 
 watch(
   () => props.currentPage,
@@ -91,17 +113,61 @@ function handlePageInputKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="flex min-w-max items-center justify-end gap-1">
-    <div v-if="selectionSummary" class="flex shrink-0 items-center gap-3 tabular-nums">
-      <span class="shrink-0">{{ t("grid.selectionSum", { value: selectionSummarySumText }) }}</span>
-      <span class="shrink-0">{{ t("grid.selectionAverage", { value: selectionSummaryAverageText }) }}</span>
+  <div class="flex min-w-0 items-center justify-end gap-1">
+    <div v-if="selectionSummary" class="flex min-w-0 items-center gap-3 overflow-hidden tabular-nums">
+      <button
+        type="button"
+        class="min-w-0 truncate text-left"
+        :class="selectionSummaryValueClass"
+        :title="selectionSummaryValueTitle(t('grid.selectionSum', { value: selectionSummarySumText }))"
+        :disabled="selectionSummaryPending"
+        data-selection-summary-sum
+        @click="copySelectionSummaryValue(selectionSummarySumText)"
+      >
+        <span v-if="!selectionSummaryPending" class="sr-only">{{ t("grid.copyValue") }}: </span>{{ t("grid.selectionSum", { value: selectionSummarySumText }) }}
+      </button>
+      <button
+        type="button"
+        class="min-w-0 truncate text-left"
+        :class="selectionSummaryValueClass"
+        :title="selectionSummaryValueTitle(t('grid.selectionAverage', { value: selectionSummaryAverageText }))"
+        :disabled="selectionSummaryPending"
+        data-selection-summary-average
+        @click="copySelectionSummaryValue(selectionSummaryAverageText)"
+      >
+        <span v-if="!selectionSummaryPending" class="sr-only">{{ t("grid.copyValue") }}: </span>{{ t("grid.selectionAverage", { value: selectionSummaryAverageText }) }}
+      </button>
+      <button
+        type="button"
+        class="min-w-0 truncate text-left"
+        :class="selectionSummaryValueClass"
+        :title="selectionSummaryValueTitle(t('grid.selectionMin', { value: selectionSummaryMinText }))"
+        :disabled="selectionSummaryPending"
+        data-selection-summary-min
+        @click="copySelectionSummaryValue(selectionSummaryMinText)"
+      >
+        <span v-if="!selectionSummaryPending" class="sr-only">{{ t("grid.copyValue") }}: </span>{{ t("grid.selectionMin", { value: selectionSummaryMinText }) }}
+      </button>
+      <button
+        type="button"
+        class="min-w-0 truncate text-left"
+        :class="selectionSummaryValueClass"
+        :title="selectionSummaryValueTitle(t('grid.selectionMax', { value: selectionSummaryMaxText }))"
+        :disabled="selectionSummaryPending"
+        data-selection-summary-max
+        @click="copySelectionSummaryValue(selectionSummaryMaxText)"
+      >
+        <span v-if="!selectionSummaryPending" class="sr-only">{{ t("grid.copyValue") }}: </span>{{ t("grid.selectionMax", { value: selectionSummaryMaxText }) }}
+      </button>
       <div class="flex shrink-0 items-center gap-1">
+        <span v-if="selectionSummaryCount" class="shrink-0">{{ t("grid.selectionCount", { count: selectionSummaryCount }) }}</span>
+        <span v-if="selectionSummaryDistinctCount" class="shrink-0">{{ t("grid.selectionDistinct", { count: selectionSummaryDistinctCount }) }}</span>
         <span class="shrink-0">{{ t("grid.selectionCells", { count: selectionSummary.cellCount }) }}</span>
         <span class="shrink-0">{{ t("grid.rows", { count: selectionSummary.rowCount }) }}</span>
       </div>
     </div>
-    <Loader2 class="w-3 h-3 text-muted-foreground" :class="loading ? 'animate-spin' : 'invisible'" aria-hidden="true" />
-    <template v-if="paginationEnabled && (infiniteScrollEnabled || loadAllRowsActive)">
+    <Loader2 class="w-3 h-3 shrink-0 text-muted-foreground" :class="loading ? 'animate-spin' : 'invisible'" aria-hidden="true" />
+    <template v-if="paginationEnabled && (infiniteScrollEnabled || loadAllRowsActive || infiniteScrollAllLoaded)">
       <span v-if="infiniteScrollAllLoaded" class="text-xs text-muted-foreground shrink-0">{{ t("grid.allLoaded") }}</span>
     </template>
     <template v-if="paginationEnabled && !infiniteScrollEnabled && !loadAllRowsActive">
@@ -165,6 +231,6 @@ function handlePageInputKeydown(event: KeyboardEvent) {
       </TooltipTrigger>
       <TooltipContent side="bottom">{{ t("grid.loadAllAndGoToLastRow") }}</TooltipContent>
     </Tooltip>
-    <DataGridExportMenu v-if="canExport" :items="exportMenuItems" :label="t('grid.export')" :on-select="(value) => emit('selectExport', value)" />
+    <DataGridExportMenu v-if="canExport" :items="exportMenuItems" :warning="exportWarning" :label="t('grid.export')" :on-select="(value) => emit('selectExport', value)" />
   </div>
 </template>

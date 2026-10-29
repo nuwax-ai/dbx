@@ -19,21 +19,25 @@ const mocks = vi.hoisted(() => ({
   previewTableImportFile: vi.fn(),
   importTableFile: vi.fn<(request: TableImportRequest, onProgress: (progress: TableImportProgress) => void) => Promise<TableImportSummary>>(),
   releaseTableImportSource: vi.fn().mockResolvedValue(undefined),
+  previewSqlFile: vi.fn(),
+  store: { sqlFileSource: null as unknown },
 }));
 
 vi.mock("@/stores/connectionStore", () => ({
-  useConnectionStore: () => ({
-    getConfig: (id: string) => {
-      if (id === "connection-1") return { id, name: "SQLite", db_type: "sqlite" };
-      if (id === "postgres-1") return { id, name: "PostgreSQL", db_type: "postgres" };
-      if (id === "sqlserver-1") return { id, name: "SQL Server", db_type: "sqlserver" };
-      if (id === "duckdb-1") return { id, name: "DuckDB", db_type: "duckdb" };
-      return undefined;
-    },
-    ensureConnected: mocks.ensureConnected,
-    invalidateMetadataCache: vi.fn(),
-    refreshObjectListTreeNode: vi.fn().mockResolvedValue(undefined),
-  }),
+  useConnectionStore: () =>
+    Object.assign(mocks.store, {
+      getConfig: (id: string) => {
+        if (id === "mysql-1") return { id, name: "MySQL", db_type: "mysql" };
+        if (id === "connection-1") return { id, name: "SQLite", db_type: "sqlite" };
+        if (id === "postgres-1") return { id, name: "PostgreSQL", db_type: "postgres" };
+        if (id === "sqlserver-1") return { id, name: "SQL Server", db_type: "sqlserver" };
+        if (id === "duckdb-1") return { id, name: "DuckDB", db_type: "duckdb" };
+        return undefined;
+      },
+      ensureConnected: mocks.ensureConnected,
+      invalidateMetadataCache: vi.fn(),
+      refreshObjectListTreeNode: vi.fn().mockResolvedValue(undefined),
+    }),
 }));
 
 vi.mock("@/stores/settingsStore", () => ({
@@ -50,6 +54,7 @@ vi.mock("@/lib/backend/api", () => ({
   cancelTableImport: vi.fn(),
 }));
 
+vi.mock("@/lib/backend/http", () => ({ previewSqlFile: mocks.previewSqlFile }));
 vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: vi.fn() }) }));
 
@@ -212,10 +217,10 @@ async function flushAsyncUpdates() {
   }
 }
 
-async function mountSourceDialog(connectionId = "connection-1") {
+async function mountSourceDialog(connectionId = "connection-1", props: Record<string, unknown> = {}) {
   const container = document.createElement("div");
   document.body.append(container);
-  const app = createApp(defineComponent({ setup: () => () => h(TableImportDialog, { open: true, prefillConnectionId: connectionId, prefillDatabase: "main" }) }));
+  const app = createApp(defineComponent({ setup: () => () => h(TableImportDialog, { open: true, prefillConnectionId: connectionId, prefillDatabase: "main", ...props }) }));
   mountedApps.push(app);
   app.use(i18n);
   app.mount(container);
@@ -283,6 +288,8 @@ beforeEach(() => {
     return { importId: request.importId, rowsImported, totalRows: rowsImported, elapsedMs: 1 };
   });
   mocks.releaseTableImportSource.mockReset().mockResolvedValue(undefined);
+  mocks.previewSqlFile.mockReset();
+  mocks.store.sqlFileSource = null;
 });
 
 afterEach(() => {
@@ -292,6 +299,29 @@ afterEach(() => {
 });
 
 describe("TableImportDialog batch selection", () => {
+  it.each([false, true])("blocks import when every sheet is empty (single sheet: %s)", async (singleSheet) => {
+    mocks.previewTableImportFile.mockResolvedValue({ ...workbookPreview("First"), sheets: singleSheet ? ["First"] : sheets, columns: ["id"], rows: [], totalRows: 0 });
+    await mountDialog();
+    expect(button("Next").disabled).toBe(true);
+    expect(mocks.importTableFile).not.toHaveBeenCalled();
+  });
+
+  it.each(["First", "Second"])("keeps data sheets importable when %s is empty", async (emptySheet) => {
+    mocks.previewTableImportFile.mockImplementation((_source, options) => {
+      const name = options.parseOptions.sheetName || "First";
+      const preview = workbookPreview(name);
+      if (name === emptySheet) Object.assign(preview, { columns: [], rows: [], totalRows: 0, totalRowsExact: true });
+      return Promise.resolve(preview);
+    });
+    await mountDialog();
+
+    expect(taskCheckbox(`rows_${emptySheet}`).checked).toBe(false);
+    expect(taskCheckbox(`rows_${emptySheet}`).disabled).toBe(true);
+    await startImport();
+    expect(mocks.importTableFile).toHaveBeenCalledTimes(2);
+    expect(mocks.importTableFile.mock.calls.every(([request]) => request.preparedSource!.totalRows > 0)).toBe(true);
+  });
+
   it("reloads a single CSV preview and passes the selected decimal separator to import", async () => {
     mocks.previewTableImportFile.mockImplementation(() => Promise.resolve(delimitedPreview()));
     await mountDialog([new File(['amount,note\n"12,50",plain'], "rows.csv")]);
@@ -322,6 +352,60 @@ describe("TableImportDialog batch selection", () => {
     const formats = document.body.querySelector<HTMLElement>('[data-testid="table-import-format-options"]');
     expect(formats?.classList.contains("lg:grid-cols-6")).toBe(true);
     expect(formats?.classList.contains("lg:grid-cols-7")).toBe(false);
+  });
+
+  it.each([
+    ["mysql-1", {}, true],
+    ["postgres-1", {}, true],
+    ["mysql-1", { prefillTable: "orders" }, false],
+    ["connection-1", {}, false],
+  ])("offers the Navicat backup format only at database level of MySQL/PostgreSQL (%s, %o)", async (connectionId, props, offered) => {
+    await mountSourceDialog(connectionId, props);
+
+    expect(!!document.body.querySelector('[data-format="nb3"]')).toBe(offered);
+    expect(document.body.querySelector<HTMLInputElement>('input[type="file"]')?.accept.includes(".nb3")).toBe(offered);
+  });
+
+  it("hands a selected Navicat backup to the SQL file executor targeting this database", async () => {
+    const preview = { fileName: "shop.nb3", filePath: "/server/tmp/shop.nb3", preview: "-- Navicat backup restored by DBX" };
+    mocks.previewSqlFile.mockResolvedValue(preview);
+    const onUpdateOpen = vi.fn();
+    await mountSourceDialog("mysql-1", { prefillSchema: "", "onUpdate:open": onUpdateOpen });
+
+    const archive = new File(["nb3"], "shop.nb3");
+    const input = document.body.querySelector<HTMLInputElement>('[data-testid="table-import-nb3-input"]')!;
+    Object.defineProperty(input, "files", { configurable: true, value: [archive] });
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await flushAsyncUpdates();
+
+    expect(mocks.previewSqlFile).toHaveBeenCalledWith(archive);
+    expect(mocks.previewTableImportFile).not.toHaveBeenCalled();
+    expect(mocks.store.sqlFileSource).toEqual({ connectionId: "mysql-1", database: "main", preview });
+    expect(onUpdateOpen).toHaveBeenCalledWith(false);
+  });
+
+  it("routes a Navicat backup picked from the generic file selector to the restore flow", async () => {
+    mocks.previewSqlFile.mockRejectedValue(new Error("Encrypted Navicat backups are not supported"));
+    const onUpdateOpen = vi.fn();
+    await mountSourceDialog("postgres-1", { "onUpdate:open": onUpdateOpen });
+
+    await selectFiles([new File(["nb3"], "app.NB3")]);
+
+    expect(mocks.previewTableImportFile).not.toHaveBeenCalled();
+    expect(mocks.store.sqlFileSource).toBeNull();
+    expect(onUpdateOpen).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Encrypted Navicat backups are not supported");
+  });
+
+  it("keeps a mixed selection in the table import flow instead of restoring the archive", async () => {
+    mocks.previewTableImportFile.mockImplementation(() => Promise.resolve(delimitedPreview()));
+
+    await mountSourceDialog("mysql-1");
+    await selectFiles([new File(["id,name"], "first.csv"), new File(["nb3"], "shop.nb3")]);
+
+    expect(mocks.previewSqlFile).not.toHaveBeenCalled();
+    expect(mocks.previewTableImportFile).toHaveBeenCalledTimes(2);
+    expect(mocks.store.sqlFileSource).toBeNull();
   });
 
   it("offers Parquet for DuckDB and forwards the connection context to preview", async () => {
@@ -594,5 +678,95 @@ describe("TableImportDialog batch selection", () => {
     expect(mocks.importTableFile).toHaveBeenCalledTimes(1);
     expect(mocks.importTableFile.mock.calls[0]![0]).toMatchObject({ table: "second", sourceFormat: "csv", parseOptions: { encoding: "utf8", sheetName: null } });
     expect(mocks.releaseTableImportSource.mock.calls.map(([source]) => source).sort()).toEqual(["first.csv-source", "second.csv-source"]);
+  });
+
+  it("recovers preview and enables next step when data start row is adjusted after an invalid title row (#11689)", async () => {
+    mocks.previewTableImportFile.mockImplementation((_source, options) => {
+      const { titleRow, dataStartRow } = options.parseOptions;
+      if (titleRow !== null && titleRow !== undefined && titleRow >= dataStartRow) {
+        return Promise.reject(new Error("Title row must be before the data start row"));
+      }
+      return Promise.resolve(delimitedPreview());
+    });
+    await mountDialog([new File(["id,name\n1,alice\n2,bob"], "rows.csv")]);
+    expect(button("Next").disabled).toBe(false);
+
+    await editInputWithValue("1", "3");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushAsyncUpdates();
+
+    expect(document.body.textContent).toContain("Title row must be before the data start row");
+    expect(button("Next").disabled).toBe(true);
+
+    await editInputWithValue("2", "4");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushAsyncUpdates();
+
+    expect(document.body.textContent).not.toContain("Title row must be before the data start row");
+    expect(button("Next").disabled).toBe(false);
+  });
+
+  it("reloads preview when returning to options step after preview was cleared by error (#11689)", async () => {
+    let failPreview = false;
+    mocks.previewTableImportFile.mockImplementation((_source, _options) => {
+      if (failPreview) {
+        return Promise.reject(new Error("Title row must be before the data start row"));
+      }
+      return Promise.resolve(delimitedPreview());
+    });
+    await mountDialog([new File(["id,name\n1,alice"], "rows.csv")]);
+    expect(button("Next").disabled).toBe(false);
+
+    failPreview = true;
+    await editInputWithValue("1", "3");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushAsyncUpdates();
+
+    expect(document.body.textContent).toContain("Title row must be before the data start row");
+    expect(button("Next").disabled).toBe(true);
+
+    failPreview = false;
+    await click("Back");
+    expect(button("Next").disabled).toBe(false);
+    await click("Next");
+    await flushAsyncUpdates();
+
+    expect(document.body.textContent).not.toContain("Title row must be before the data start row");
+    expect(button("Next").disabled).toBe(false);
+  });
+
+  it("renders empty string as null option for Excel source and passes it to parse options (#11608)", async () => {
+    let capturedOptions: any = null;
+    mocks.previewTableImportFile.mockImplementation((_source, options) => {
+      capturedOptions = options;
+      return Promise.resolve({
+        fileName: "rows.xlsx",
+        filePath: "/tmp/rows.xlsx",
+        sourceRef: "workbook-source",
+        fileType: "excel",
+        sizeBytes: 10,
+        columns: ["id", "name"],
+        rows: [[1, "test"]],
+        totalRows: 1,
+        totalRowsExact: true,
+        sourceFingerprint: "rows-Sheet1",
+        sheets: ["Sheet1"],
+      });
+    });
+    await mountDialog([new File(["workbook"], "rows.xlsx")]);
+    expect(button("Next").disabled).toBe(false);
+
+    const emptyStringCheckbox = [...document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((el) => el.parentElement?.textContent?.includes("Empty string as NULL"));
+    expect(emptyStringCheckbox).toBeTruthy();
+    expect(emptyStringCheckbox!.checked).toBe(false);
+
+    emptyStringCheckbox!.click();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushAsyncUpdates();
+
+    expect(capturedOptions?.parseOptions?.emptyStringAsNull).toBe(true);
+
+    await startImport();
+    expect(mocks.importTableFile.mock.calls.at(-1)?.[0].parseOptions.emptyStringAsNull).toBe(true);
   });
 });

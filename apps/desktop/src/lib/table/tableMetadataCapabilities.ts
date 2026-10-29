@@ -15,7 +15,7 @@ const defaultCapabilities: TableMetadataCapabilities = {
   indexes: true,
   foreignKeys: true,
   // Structured constraint metadata (list_constraints) is only enabled for
-  // drivers that implement it (PostgreSQL natively; Oracle/Xugu via agents);
+  // drivers that implement it (PostgreSQL natively; Oracle/OceanBase/Xugu via agents);
   // leave it off by default so every other dialect doesn't grow a permanently
   // empty tab.
   constraints: false,
@@ -28,6 +28,9 @@ const defaultCapabilities: TableMetadataCapabilities = {
 
 const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabilities>>> = {
   oracle: {
+    constraints: true,
+  },
+  "oceanbase-oracle": {
     constraints: true,
   },
   // KingbaseES V9 shares PostgreSQL's declarative partition catalog and DDL.
@@ -160,8 +163,14 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
   },
 };
 
-export function getTableMetadataCapabilities(dbType?: DatabaseType): TableMetadataCapabilities {
-  return { ...defaultCapabilities, ...(dbType ? capabilityByType[dbType] : undefined) };
+export function getTableMetadataCapabilities(dbType?: DatabaseType, context?: { connectionType?: DatabaseType; exactIdentity?: boolean }): TableMetadataCapabilities {
+  const capabilities = { ...defaultCapabilities, ...(dbType ? capabilityByType[dbType] : undefined) };
+  // Exact JDBC currently implements columns, indexes and DDL only. Do not offer
+  // metadata tabs whose requests cannot preserve the selected raw identity.
+  if (context?.exactIdentity && context.connectionType === "jdbc") {
+    return { ...capabilities, foreignKeys: false, constraints: false, triggers: false, partitions: false };
+  }
+  return capabilities;
 }
 
 export function firstStructureMetadataTab(capabilities: TableMetadataCapabilities, isCreateMode: boolean): TableInfoTab {
