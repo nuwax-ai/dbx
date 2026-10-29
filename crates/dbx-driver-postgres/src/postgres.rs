@@ -11168,6 +11168,31 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_postgres::types::FromSql;
 
+    /// nuwax fork 回归:fork 侧生成/归一化的 PG URL(socket 形态、混合大小写 sslmode、
+    /// 参数内 #)必须能被 tokio_postgres::Config::from_str 接受——解析失败即连接必挂。
+    #[test]
+    fn generated_pg_urls_parse_with_tokio_postgres() {
+        fn test_config(json: &str) -> dbx_types::models::connection::ConnectionConfig {
+            serde_json::from_str(json).expect("test pg config json")
+        }
+
+        let socket_cfg = test_config(
+            r#"{"id":"t","name":"t","db_type":"postgres","host":"/var/run/postgresql","port":5433,"username":"app","password":"","database":"appdb","url_params":"SSLMode=REQUIRE&application_name=my#app"}"#,
+        );
+        let socket_url = socket_cfg.connection_url_with_host("/var/run/postgresql", 5433);
+        let parsed = tokio_postgres::Config::from_str(&socket_url).expect("socket url must parse");
+        assert!(matches!(parsed.get_hosts(), [tokio_postgres::config::Host::Unix(_)]), "socket host must dial unix: {socket_url}");
+        assert_eq!(parsed.get_ports(), &[5433], "non-default port must survive: {socket_url}");
+        assert_eq!(parsed.get_application_name(), Some("my#app"), "post-# param must survive (decoded): {socket_url}");
+
+        let tcp_cfg = test_config(
+            r#"{"id":"t","name":"t","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"app","password":"pw","database":"appdb","url_params":"SSLMode=REQUIRE"}"#,
+        );
+        let tcp_url = tcp_cfg.connection_url_with_host("127.0.0.1", 5432);
+        let parsed = tokio_postgres::Config::from_str(&tcp_url).expect("tcp url must parse");
+        assert!(matches!(parsed.get_hosts(), [tokio_postgres::config::Host::Tcp(_)]), "tcp host expected: {tcp_url}");
+    }
+
     fn postgres_numeric_binary(weight: i16, sign: u16, scale: u16, digits: &[u16]) -> Vec<u8> {
         let mut raw = Vec::with_capacity(8 + digits.len() * 2);
         raw.extend_from_slice(&u16::try_from(digits.len()).unwrap().to_be_bytes());

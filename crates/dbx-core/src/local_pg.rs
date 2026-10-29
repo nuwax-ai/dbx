@@ -24,12 +24,19 @@ const LOCAL_PG_SOCKET_DIR: &str = "/var/run/postgresql";
 ///
 /// 带 info 日志（`ensure-local-pg` 特征串供镜像产物构建校验）。
 pub async fn ensure_local_pg_connection(storage: &Storage) -> Result<(), String> {
-    let Some(user) = std::env::var("POSTGRES_USER").ok().filter(|u| !u.trim().is_empty()) else {
+    let Some((user, database)) = local_pg_env() else {
         return Ok(());
     };
-    let database = std::env::var("POSTGRES_DB").ok().filter(|d| !d.trim().is_empty());
-    // env_file/清单里的尾随空白不应进入用户名(校验按 trim 判空,播种也用 trim 后的值)
-    ensure_local_pg_with(storage, user.trim(), database.as_deref().map(str::trim)).await
+    ensure_local_pg_with(storage, &user, database.as_deref()).await
+}
+
+/// env 解析(独立函数便于直测 trim 语义;依赖 nextest 每用例独立进程的隔离,
+/// 勿在 cargo test 线程模型下与其它 env 用例并行)。
+fn local_pg_env() -> Option<(String, Option<String>)> {
+    // env_file/清单里的尾随空白不应进入用户名/库名(校验按 trim 判空,播种同口径)
+    let user = std::env::var("POSTGRES_USER").ok().filter(|u| !u.trim().is_empty()).map(|u| u.trim().to_string())?;
+    let database = std::env::var("POSTGRES_DB").ok().filter(|d| !d.trim().is_empty()).map(|d| d.trim().to_string());
+    Some((user, database))
 }
 
 /// 核心逻辑（env 已解析；测试直调，避开进程级 env 与并行测试竞态）。
@@ -81,6 +88,21 @@ fn is_factory_shape(current: &ConnectionConfig, desired: &ConnectionConfig) -> b
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn env_values_are_trimmed_before_seeding() {
+        // env_file 尾随空白不应进入用户名/库名(判空与播种同口径 trim)。
+        // 依赖 nextest 每用例独立进程;cargo test 线程模型下勿与其它 env 用例并行。
+        std::env::remove_var("POSTGRES_DB");
+        std::env::set_var("POSTGRES_USER", "  app  ");
+        assert_eq!(local_pg_env(), Some(("app".to_string(), None)));
+        std::env::set_var("POSTGRES_DB", " appdb ");
+        assert_eq!(local_pg_env(), Some(("app".to_string(), Some("appdb".to_string()))));
+        std::env::set_var("POSTGRES_USER", "   ");
+        assert_eq!(local_pg_env(), None);
+        std::env::remove_var("POSTGRES_USER");
+        std::env::remove_var("POSTGRES_DB");
+    }
 
     fn temp_data_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

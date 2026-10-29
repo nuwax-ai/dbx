@@ -2472,6 +2472,21 @@ fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
                 "verify-full" | "verify-identity" => parts.push("sslmode=verify-full".to_string()),
                 _ => {}
             }
+        } else if key.eq_ignore_ascii_case("sslmode") {
+            // nuwax fork: tokio-postgres 对 URL 参数 key/value 的匹配均大小写敏感
+            // (vendored config.rs 的 param()/SslMode 解析),用户存的 SSLMode=REQUIRE
+            // 等混合大小写会直接 invalid connection string——TCP 与 socket 共用
+            // 本归一化,统一重写为小写规范形(值映射沿用 ssl-mode 分支的同义词表;
+            // 未知值丢弃,由末尾的默认注入兜底)。
+            let decoded_value = percent_decode_str(raw_value).decode_utf8_lossy().trim().to_ascii_lowercase().replace('_', "-");
+            match decoded_value.as_str() {
+                "require" | "required" => parts.push("sslmode=require".to_string()),
+                "prefer" | "preferred" => parts.push("sslmode=prefer".to_string()),
+                "disable" | "disabled" => parts.push("sslmode=disable".to_string()),
+                "verify-ca" => parts.push("sslmode=verify-ca".to_string()),
+                "verify-full" | "verify-identity" => parts.push("sslmode=verify-full".to_string()),
+                _ => {}
+            }
         } else if key.eq_ignore_ascii_case("host")
             || key.eq_ignore_ascii_case("hostaddr")
             || key.eq_ignore_ascii_case("port")
@@ -2485,7 +2500,9 @@ fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
             // Driver-specific parameters may be present in older/imported
             // saved connections. tokio-postgres rejects unknown URL keys.
         } else {
-            parts.push(part.to_string());
+            // nuwax fork: `#` 会被 dbx-driver-postgres 的 postgres_connection_url
+            // 当 fragment 切分截断(后续参数全部丢失/解析错乱),编码为 %23 保全。
+            parts.push(part.replace('#', "%23"));
         }
     }
 
@@ -3749,6 +3766,37 @@ mod tests {
         let cfg = pg_config("/var/run/postgresql", "app", "pw", "appdb");
         let url = cfg.redacted_connection_url_with_host("/var/run/postgresql", 5432);
         assert_eq!(url, "postgres:///appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5432");
+    }
+
+    #[test]
+    fn postgres_url_params_normalize_sslmode_case() {
+        // nuwax fork: tokio-postgres 对参数 key/value 均大小写敏感(vendored
+        // config.rs),SSLMode=REQUIRE 之类会 invalid connection string——
+        // TCP 与 socket 共用归一化,统一重写为小写规范形(值映射沿用 ssl-mode 分支同义词表)
+        assert_eq!(super::normalize_postgres_url_params("SSLMode=REQUIRE", false), "sslmode=require");
+        assert_eq!(super::normalize_postgres_url_params("sslMode=Verify-Full", false), "sslmode=verify-full");
+        assert_eq!(super::normalize_postgres_url_params("SSLMODE=PREFERRED", false), "sslmode=prefer");
+        // 未知值丢弃,由末尾默认注入兜底
+        assert_eq!(super::normalize_postgres_url_params("sslmode=Bogus", false), "sslmode=prefer");
+    }
+
+    #[test]
+    fn postgres_url_params_encode_fragment() {
+        // `#` 会被 dbx-driver-postgres 的 postgres_connection_url 当 fragment 切分,
+        // 其后的参数全部丢失——统一编码为 %23(TCP 与 socket 共用)
+        assert_eq!(
+            super::normalize_postgres_url_params("application_name=my#app&options=-c geqo=on#main", false),
+            "sslmode=prefer&application_name=my%23app&options=-c geqo=on%23main"
+        );
+    }
+
+    #[test]
+    fn postgres_tcp_url_canonicalizes_mixed_case_sslmode() {
+        // TCP 形态同样受益于归一化(此前仅 socket 侧剔除,SSLMode= 生成的 TCP URL 会被 tokio 拒绝)
+        let mut cfg = pg_config("127.0.0.1", "app", "pw", "appdb");
+        cfg.url_params = Some("SSLMode=REQUIRE".into());
+        let url = cfg.connection_url_with_host("127.0.0.1", 5432);
+        assert_eq!(url, "postgres://app:pw@127.0.0.1:5432/appdb?sslmode=require");
     }
 
     #[test]

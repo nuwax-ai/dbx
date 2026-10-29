@@ -50,6 +50,13 @@ describe("settings search", () => {
     expect(searchSettings(entries, query, "en")).toEqual(expect.arrayContaining([expect.objectContaining({ id: "backups", category: "backups", targetId: "backups" })]));
   });
 
+  it("maps retired settings tabs to their surviving homes", () => {
+    expect(resolveSettingsCategory("sqlFile")).toBe("editor");
+    // nuwax fork: 更新管理 tab 已删除,深链引导到版本信息页
+    expect(resolveSettingsCategory("updates")).toBe("about");
+    expect(resolveSettingsCategory(undefined)).toBe("appearance");
+  });
+
   it("finds connection tab colors by their Chinese label", () => {
     const entries = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { isWeb: false, visibleCategories: allCategories }, (key) => (key === "settings.colorizeConnectionTabs" ? "按连接颜色区分标签页" : key), categoryLabels);
     expect(searchSettings(entries, "连接颜色", "zh-CN")).toEqual(expect.arrayContaining([expect.objectContaining({ id: "appearance-connection-tab-colors", category: "appearance", targetId: "appearance" })]));

@@ -56,7 +56,8 @@ const UPDATER_ENABLED = false;
 - `settingsSearch.ts`：`ToolbarVisibilityItemKey` 类型和 `TOOLBAR_VISIBILITY_ITEMS` 列表中的两项
 
 **保留**：App.vue 中 Welcome 页的 `@open-github` 绑定属于另一组件，不动。官方新增的 `alwaysOnTop` 工具栏项**保留**。
-`useToast` 导入已随主题按钮一并删除（官方当时唯一 `toast(` 用法即主题按钮；官方若新增别的 toast 用法则恢复，见第 8 条附带注意）。
+`useToast` 导入已随主题按钮一并删除——指 `AppToolbar.vue` 的导入（官方当时唯一 `toast(` 用法即主题按钮；
+App.vue 自身的 `useToast` 保留且大量在用）；官方若新增别的 toast 用法则恢复，见第 8 条附带注意。
 「外观 → 工具栏」可见性开关列表（`TOOLBAR_VISIBILITY_ITEMS` / `ToolbarVisibilityItemKey`）中官方的
 `checkUpdates`、`theme`、`github`、`pluginCenter` 四项一并删除——入口已被删除/门控，开关是死控件；
 `settingsStore` 的 `checkUpdates` 字段保留（`AlwaysOnTopVisibilitySync.spec` 哨兵在用）。
@@ -110,6 +111,19 @@ autoUpdateApp: false,
 **注意**：官方 2026-09-24 起 `main.rs` 重构为 `fn main() + serve()` 并引入数据迁移门禁
 （migration gate + StartupGate 向导）；旧的 `storage.migrate_from_json()` 调用**不要加回**，
 JSON 迁移已归迁移门禁管。
+
+**钩子失败语义（2026-10-29）**：启动钩子失败仅 `log::warn` 后继续（原 `.expect()` 会在密钥
+不匹配的存量数据上 crash-loop，官方迁移门禁本就容忍该状态交给恢复向导）。代价：钩子失败后
+迁移恢复完成时**不会自动重跑**，local-pg 播种要等下一次容器重启——容器编排常重启，接受。
+
+**PG URL 归一化（2026-10-29，TCP 与 socket 共享）**：`normalize_postgres_url_params` 统一将
+`sslmode` key/value 重写为小写规范形（tokio-postgres 对两者均大小写敏感，`SSLMode=REQUIRE`
+会 invalid connection string），参数内 `#` 编码为 `%23`（dbx-driver-postgres 的
+`postgres_connection_url` 按 `#` 切 query，后续参数全部丢失）；`postgres_socket_url` 另显式
+传递 `port`（tokio-postgres 按 `{dir}/.s.PGSQL.{port}` 定位 socket 文件，丢弃会静默回落 5432）。
+官方上游同样存在这些 bug，适合上游化。回归测试：dbx-types `postgres_url_params_*` /
+`postgres_socket_host_*` / `postgres_tcp_url_canonicalizes_*`，dbx-driver-postgres
+`generated_pg_urls_parse_with_tokio_postgres`（真实 Config::from_str 解析断言）。
 
 ## 7. Docker 构建加固（国内网络）
 
@@ -186,7 +200,8 @@ web 模式不可见；官方若放开该条件，此入口会复活插件市场�
 已删除的 tab（仅使用共享隧道档案的连接可见，自部署场景碰不到，故意不动 locale）。
 该提示所在按钮 `@open-tunnel-profile-settings`（App.vue `openSettings('tunnels')`）点击后会经
 `resolveSettingsCategory` 回落到「外观」tab——同样是已知死路，同样只在共享隧道档案场景可达。
-官方若往 tunnels tab 加新设置，冲突时保持整块删除；`TunnelProfileManager` 组件
+
+**合并注意**：官方若往 tunnels tab 加新设置，冲突时保持整块删除；`TunnelProfileManager` 组件
 本身保留（连接对话框的隧道选择仍在用共享档案数据）。
 
 ## 11. 删除「更新管理」设置 tab（2026-09-28）
