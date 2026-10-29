@@ -30,12 +30,16 @@ pub async fn ensure_local_pg_connection(storage: &Storage) -> Result<(), String>
     ensure_local_pg_with(storage, &user, database.as_deref()).await
 }
 
-/// env 解析(独立函数便于直测 trim 语义;依赖 nextest 每用例独立进程的隔离,
-/// 勿在 cargo test 线程模型下与其它 env 用例并行)。
+/// env 解析(读 env 的壳;语义在 local_pg_env_from,可无 env 直测)。
 fn local_pg_env() -> Option<(String, Option<String>)> {
-    // env_file/清单里的尾随空白不应进入用户名/库名(校验按 trim 判空,播种同口径)
-    let user = std::env::var("POSTGRES_USER").ok().filter(|u| !u.trim().is_empty()).map(|u| u.trim().to_string())?;
-    let database = std::env::var("POSTGRES_DB").ok().filter(|d| !d.trim().is_empty()).map(|d| d.trim().to_string());
+    local_pg_env_from(|key| std::env::var(key).ok())
+}
+
+/// env_file/清单里的尾随空白不应进入用户名/库名(判空与播种同口径 trim)。
+/// getenv 以闭包注入,测试无需读写进程 env(避免 cargo test 线程模型下的 setenv 竞态)。
+fn local_pg_env_from(getenv: impl Fn(&str) -> Option<String>) -> Option<(String, Option<String>)> {
+    let user = getenv("POSTGRES_USER").filter(|u| !u.trim().is_empty()).map(|u| u.trim().to_string())?;
+    let database = getenv("POSTGRES_DB").filter(|d| !d.trim().is_empty()).map(|d| d.trim().to_string());
     Some((user, database))
 }
 
@@ -92,16 +96,17 @@ mod tests {
     #[test]
     fn env_values_are_trimmed_before_seeding() {
         // env_file 尾随空白不应进入用户名/库名(判空与播种同口径 trim)。
-        // 依赖 nextest 每用例独立进程;cargo test 线程模型下勿与其它 env 用例并行。
-        std::env::remove_var("POSTGRES_DB");
-        std::env::set_var("POSTGRES_USER", "  app  ");
-        assert_eq!(local_pg_env(), Some(("app".to_string(), None)));
-        std::env::set_var("POSTGRES_DB", " appdb ");
-        assert_eq!(local_pg_env(), Some(("app".to_string(), Some("appdb".to_string()))));
-        std::env::set_var("POSTGRES_USER", "   ");
-        assert_eq!(local_pg_env(), None);
-        std::env::remove_var("POSTGRES_USER");
-        std::env::remove_var("POSTGRES_DB");
+        // 闭包注入,不读写进程 env——cargo test 线程模型下同样安全。
+        fn fake_env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |key: &str| vars.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+        }
+        assert_eq!(local_pg_env_from(fake_env(&[("POSTGRES_USER", "  app  ")])), Some(("app".to_string(), None)));
+        assert_eq!(
+            local_pg_env_from(fake_env(&[("POSTGRES_USER", "app"), ("POSTGRES_DB", " appdb ")])),
+            Some(("app".to_string(), Some("appdb".to_string())))
+        );
+        assert_eq!(local_pg_env_from(fake_env(&[("POSTGRES_USER", "   ")])), None);
+        assert_eq!(local_pg_env_from(fake_env(&[])), None);
     }
 
     fn temp_data_dir(tag: &str) -> PathBuf {

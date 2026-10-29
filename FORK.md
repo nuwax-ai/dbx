@@ -121,9 +121,16 @@ JSON 迁移已归迁移门禁管。
 会 invalid connection string），参数内 `#` 编码为 `%23`（dbx-driver-postgres 的
 `postgres_connection_url` 按 `#` 切 query，后续参数全部丢失）；`postgres_socket_url` 另显式
 传递 `port`（tokio-postgres 按 `{dir}/.s.PGSQL.{port}` 定位 socket 文件，丢弃会静默回落 5432）。
-官方上游同样存在这些 bug，适合上游化。回归测试：dbx-types `postgres_url_params_*` /
-`postgres_socket_host_*` / `postgres_tcp_url_canonicalizes_*`，dbx-driver-postgres
-`generated_pg_urls_parse_with_tokio_postgres`（真实 Config::from_str 解析断言）。
+**sslmode 未知值策略（fail-closed）**：空值/裸键=无意图，丢弃走默认注入；未知非空值
+（如拼错的 `verify-ful`）**原样透传**，由下游以 invalid sslmode 明确报错——绝不静默降级
+prefer（否则会以不校验证书甚至明文连上）；`allow`（libpq 合法、tokio 不支持）映射到最近的
+prefer（加密倾向收紧方向）。
+**上游归责**：sslmode 大小写与 `#` 截断上游同样存在，适合上游化；socket 形态整体
+（`postgres_socket_url` 及其 port 传递）为 fork 专属，官方没有该函数。
+回归测试：dbx-types `postgres_url_params_*` / `postgres_socket_host_*` /
+`postgres_tcp_url_canonicalizes_*`，dbx-driver-postgres
+`generated_pg_urls_parse_with_tokio_postgres`（经 `postgres_connection_url` 消毒后的真实
+Config::from_str 解析断言，含 TCP `#` 与 verify-full→require+主机名校验映射）。
 
 ## 7. Docker 构建加固（国内网络）
 

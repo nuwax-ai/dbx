@@ -2476,16 +2476,20 @@ fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
             // nuwax fork: tokio-postgres 对 URL 参数 key/value 的匹配均大小写敏感
             // (vendored config.rs 的 param()/SslMode 解析),用户存的 SSLMode=REQUIRE
             // 等混合大小写会直接 invalid connection string——TCP 与 socket 共用
-            // 本归一化,统一重写为小写规范形(值映射沿用 ssl-mode 分支的同义词表;
-            // 未知值丢弃,由末尾的默认注入兜底)。
-            let decoded_value = percent_decode_str(raw_value).decode_utf8_lossy().trim().to_ascii_lowercase().replace('_', "-");
-            match decoded_value.as_str() {
+            // 本归一化,统一重写为小写规范形(值映射沿用 ssl-mode 分支的同义词表)。
+            // fail-closed:空值=无意图,丢弃走默认注入;未知非空值原样透传,
+            // 由下游 tokio 以 invalid sslmode 明确报错——绝不静默降级 prefer
+            // (否则 verify-ful 之类拼写错误会以不校验证书甚至明文连上)。
+            // allow 为 libpq 合法值而 tokio 不支持,映射到最近的 prefer(加密倾向收紧)。
+            let canonical = percent_decode_str(raw_value).decode_utf8_lossy().trim().to_ascii_lowercase().replace('_', "-");
+            match canonical.as_str() {
                 "require" | "required" => parts.push("sslmode=require".to_string()),
-                "prefer" | "preferred" => parts.push("sslmode=prefer".to_string()),
+                "prefer" | "preferred" | "allow" => parts.push("sslmode=prefer".to_string()),
                 "disable" | "disabled" => parts.push("sslmode=disable".to_string()),
                 "verify-ca" => parts.push("sslmode=verify-ca".to_string()),
                 "verify-full" | "verify-identity" => parts.push("sslmode=verify-full".to_string()),
-                _ => {}
+                "" => {}
+                _ => parts.push(format!("sslmode={canonical}")),
             }
         } else if key.eq_ignore_ascii_case("host")
             || key.eq_ignore_ascii_case("hostaddr")
@@ -3776,9 +3780,11 @@ mod tests {
         assert_eq!(super::normalize_postgres_url_params("SSLMode=REQUIRE", false), "sslmode=require");
         assert_eq!(super::normalize_postgres_url_params("sslMode=Verify-Full", false), "sslmode=verify-full");
         assert_eq!(super::normalize_postgres_url_params("SSLMODE=PREFERRED", false), "sslmode=prefer");
-        // 未知值丢弃,由末尾默认注入兜底
-        assert_eq!(super::normalize_postgres_url_params("sslmode=Bogus", false), "sslmode=prefer");
-        // 边界:空值、只有键无值同样走丢弃+兜底;百分号编码的键解码后同样命中
+        // fail-closed:未知非空值原样透传(下游 tokio 报 invalid sslmode),不静默降级;
+        // allow(libpq 合法、tokio 不支持)映射到最近的 prefer
+        assert_eq!(super::normalize_postgres_url_params("sslmode=Bogus", false), "sslmode=bogus");
+        assert_eq!(super::normalize_postgres_url_params("sslmode=allow", false), "sslmode=prefer");
+        // 边界:空值、只有键无值=无意图,丢弃走默认注入;百分号编码的键解码后同样命中
         assert_eq!(super::normalize_postgres_url_params("sslmode=", false), "sslmode=prefer");
         assert_eq!(super::normalize_postgres_url_params("sslmode", false), "sslmode=prefer");
         assert_eq!(super::normalize_postgres_url_params("ssl%6Dode=DISABLE", false), "sslmode=disable");

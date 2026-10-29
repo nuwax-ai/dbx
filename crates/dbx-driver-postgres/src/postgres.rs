@@ -11169,28 +11169,52 @@ mod tests {
     use tokio_postgres::types::FromSql;
 
     /// nuwax fork 回归:fork 侧生成/归一化的 PG URL(socket 形态、混合大小写 sslmode、
-    /// 参数内 #)必须能被 tokio_postgres::Config::from_str 接受——解析失败即连接必挂。
+    /// 参数内 #)经 postgres_connection_url 消毒后必须能被 tokio_postgres::Config::from_str
+    /// 接受——`#` 的截断正发生在 postgres_connection_url 的 query/fragment 切分,
+    /// 必须走该层而非只测生成端字符串。
     #[test]
     fn generated_pg_urls_parse_with_tokio_postgres() {
         fn test_config(json: &str) -> dbx_types::models::connection::ConnectionConfig {
             serde_json::from_str(json).expect("test pg config json")
+        }
+        fn sanitize_and_parse(raw: &str) -> (tokio_postgres::Config, PostgresConnectionUrl) {
+            let sanitized = postgres_connection_url(raw).expect("driver sanitize must accept");
+            let parsed = tokio_postgres::Config::from_str(&sanitized.url).expect("sanitized url must parse: {}");
+            (parsed, sanitized)
         }
 
         let socket_cfg = test_config(
             r#"{"id":"t","name":"t","db_type":"postgres","host":"/var/run/postgresql","port":5433,"username":"app","password":"","database":"appdb","url_params":"SSLMode=REQUIRE&application_name=my#app"}"#,
         );
         let socket_url = socket_cfg.connection_url_with_host("/var/run/postgresql", 5433);
-        let parsed = tokio_postgres::Config::from_str(&socket_url).expect("socket url must parse");
+        let (parsed, _) = sanitize_and_parse(&socket_url);
         assert!(matches!(parsed.get_hosts(), [tokio_postgres::config::Host::Unix(_)]), "socket host must dial unix: {socket_url}");
         assert_eq!(parsed.get_ports(), &[5433], "non-default port must survive: {socket_url}");
-        assert_eq!(parsed.get_application_name(), Some("my#app"), "post-# param must survive (decoded): {socket_url}");
+        assert_eq!(parsed.get_application_name(), Some("my#app"), "post-# param must survive driver sanitize (decoded): {socket_url}");
 
-        let tcp_cfg = test_config(
+        let tcp_hash_cfg = test_config(
+            r#"{"id":"t","name":"t","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"app","password":"pw","database":"appdb","url_params":"application_name=my#app"}"#,
+        );
+        let tcp_hash_url = tcp_hash_cfg.connection_url_with_host("127.0.0.1", 5432);
+        let (parsed, _) = sanitize_and_parse(&tcp_hash_url);
+        assert!(matches!(parsed.get_hosts(), [tokio_postgres::config::Host::Tcp(_)]), "tcp host expected: {tcp_hash_url}");
+        assert_eq!(parsed.get_application_name(), Some("my#app"), "tcp post-# param must survive driver sanitize: {tcp_hash_url}");
+
+        let tcp_ssl_cfg = test_config(
             r#"{"id":"t","name":"t","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"app","password":"pw","database":"appdb","url_params":"SSLMode=REQUIRE"}"#,
         );
-        let tcp_url = tcp_cfg.connection_url_with_host("127.0.0.1", 5432);
-        let parsed = tokio_postgres::Config::from_str(&tcp_url).expect("tcp url must parse");
-        assert!(matches!(parsed.get_hosts(), [tokio_postgres::config::Host::Tcp(_)]), "tcp host expected: {tcp_url}");
+        let tcp_ssl_url = tcp_ssl_cfg.connection_url_with_host("127.0.0.1", 5432);
+        let (parsed, _) = sanitize_and_parse(&tcp_ssl_url);
+        assert!(matches!(parsed.get_ssl_mode(), tokio_postgres::config::SslMode::Require), "mixed-case sslmode must canonicalize: {tcp_ssl_url}");
+
+        // verify-full 在 driver 层映射为 require + 主机名校验;tokio 本身不认识 verify-*
+        let verify_cfg = test_config(
+            r#"{"id":"t","name":"t","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"app","password":"pw","database":"appdb","url_params":"sslMode=Verify-Full"}"#,
+        );
+        let verify_url = verify_cfg.connection_url_with_host("127.0.0.1", 5432);
+        let (parsed, sanitized) = sanitize_and_parse(&verify_url);
+        assert!(matches!(parsed.get_ssl_mode(), tokio_postgres::config::SslMode::Require), "verify-full maps to require: {verify_url}");
+        assert!(!sanitized.accepts_invalid_certs && sanitized.verifies_hostname, "verify-full must verify certs and hostname: {verify_url}");
     }
 
     fn postgres_numeric_binary(weight: i16, sign: u16, scale: u16, digits: &[u16]) -> Vec<u8> {
