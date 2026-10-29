@@ -8838,7 +8838,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "Sterowniki JDBC",
     securityTab: "Bezpieczeństwo",
-    aboutTab: "O programie",
+    aboutTab: "Informacje o wersji",
     fontFamily: "Krój czcionki",
     dataGridFontFamily: "Czcionka siatki wyników",
     dataGridFontFamilyDescription: "Dotyczy wyników zapytań, danych tabel, nagłówków kolumn i wbudowanych edytorów komórek.",

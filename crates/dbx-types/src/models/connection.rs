@@ -1327,7 +1327,7 @@ impl ConnectionConfig {
             }
             DatabaseType::Postgres | DatabaseType::Redshift => {
                 if raw_host.starts_with('/') {
-                    postgres_socket_url("", &db_part, &params, raw_host)
+                    postgres_socket_url("", &db_part, &params, port, raw_host)
                 } else {
                     let suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
                     if is_multi_host(raw_host) {
@@ -1511,7 +1511,7 @@ impl ConnectionConfig {
             DatabaseType::Postgres | DatabaseType::Redshift => {
                 if raw_host.starts_with('/') {
                     let auth = if password.is_empty() { username.clone() } else { format!("{username}:{password}") };
-                    postgres_socket_url(&auth, &db_part, &params, raw_host)
+                    postgres_socket_url(&auth, &db_part, &params, port, raw_host)
                 } else if is_multi_host(raw_host) {
                     // Multi-host: host1:port1,host2:port2 — each host already has its port embedded
                     let suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
@@ -3080,18 +3080,25 @@ fn replace_oracle_descriptor_value(input: &str, key: &str, value: &str) -> Strin
 /// nuwax fork: unix socket host 的 PG 连接串——URI authority 放不下以 `/` 开头的
 /// host(tokio-postgres 会解析成空 host 回落 TCP localhost + 脏 dbname,静默错连),
 /// 经 query 参数 `host=<percent-encoded 路径>` 表达(libpq 语义,tokio-postgres
-/// `?host=/path` 原生走 unix socket)。`params` 非空时与 host 参数合并;
-/// port 于 socket 无意义,忽略。
-fn postgres_socket_url(auth: &str, db_part: &str, params: &str, raw_host: &str) -> String {
+/// `?host=/path` 原生走 unix socket)。`params` 非空时与 host/port 参数合并;
+/// port 参与 socket 文件定位(`{dir}/.s.PGSQL.{port}`),显式传递。
+fn postgres_socket_url(auth: &str, db_part: &str, params: &str, port: u16, raw_host: &str) -> String {
     // socket 下强制 sslmode=disable:unix 通道无 TLS 语义,而 dbx 的 TLS connector
     // 会对 socket 路径做 SNI 校验直接报 "invalid dns name"(normalize 默认的
     // sslmode=prefer 即触发)——剔除调用方传入的 sslmode 键后强制 disable,
-    // 其余参数保留。
-    let kept: Vec<&str> = params.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("sslmode=")).collect();
+    // 其余参数保留。键名按 url_param_key_is 大小写不敏感匹配:用户可存
+    // `SSLMode=` 等混合大小写,tokio-postgres 对未知参数直接报 UnknownOption;
+    // 参数内 `#` 百分号编码,防止把后续追加的 sslmode/host/port 截断成 fragment。
+    let kept: Vec<String> = params
+        .split('&')
+        .filter(|kv| !kv.is_empty() && !url_param_key_is(kv, "sslmode"))
+        .map(|kv| kv.replace('#', "%23"))
+        .collect();
     let mut query_parts = kept;
-    query_parts.push("sslmode=disable");
+    query_parts.push("sslmode=disable".to_string());
     let host_param = format!("host={}", encode_url_part(raw_host));
-    query_parts.push(&host_param);
+    query_parts.push(host_param);
+    query_parts.push(format!("port={port}"));
     let authority = if auth.is_empty() { String::new() } else { format!("{auth}@") };
     format!("postgres://{authority}{db_part}?{}", query_parts.join("&"))
 }
@@ -3688,13 +3695,43 @@ mod tests {
         let cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
         let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
         assert_eq!(
-            url, "postgres://app@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql",
+            url, "postgres://app@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5432",
             "socket host 必须走 query 形态(空密码省 :pass;sslmode 强制 disable——TLS 对 socket 路径 SNI 报错)"
         );
         // 带密码:auth 段含 password
         let cfg = pg_config("/var/run/postgresql", "app", "pw", "appdb");
         let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
-        assert_eq!(url, "postgres://app:pw@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql");
+        assert_eq!(url, "postgres://app:pw@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5432");
+    }
+
+    #[test]
+    fn postgres_socket_host_keeps_non_default_port() {
+        // tokio-postgres 以 {dir}/.s.PGSQL.{port} 定位 socket 文件,端口默认回落 5432——
+        // 非默认端口必须显式传递,否则静默拨错实例
+        let cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
+        let url = cfg.connection_url_with_host("/var/run/postgresql", 5433);
+        assert_eq!(url, "postgres://app@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5433");
+        let redacted = cfg.redacted_connection_url_with_host("/var/run/postgresql", 5433);
+        assert_eq!(redacted, "postgres:///appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5433");
+    }
+
+    #[test]
+    fn postgres_socket_host_strips_case_insensitive_sslmode() {
+        // 混合大小写 sslmode 也要剔除:tokio-postgres 对未知参数(SSLMode)报 UnknownOption
+        let mut cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
+        cfg.url_params = Some("SSLMode=require&connect_timeout=5".into());
+        let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
+        assert_eq!(url, "postgres://app@/appdb?connect_timeout=5&sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5432");
+    }
+
+    #[test]
+    fn postgres_socket_host_encodes_fragment_in_params() {
+        // 参数内 `#` 若不编码,后续追加的 sslmode/host/port 会被截成 URL fragment,socket 永远拨不通
+        // (normalize 对 options 值不做整体编码,空格等按原文透传——此处只确保 `#` 被编码)
+        let mut cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
+        cfg.url_params = Some("options=-c geqo=on#main".into());
+        let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
+        assert_eq!(url, "postgres://app@/appdb?options=-c geqo=on%23main&sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5432");
     }
 
     #[test]
@@ -3704,14 +3741,14 @@ mod tests {
         let mut cfg = pg_config("/var/run/postgresql", "app", "", "appdb");
         cfg.url_params = Some("sslmode=disable".into());
         let url = cfg.connection_url_with_host("/var/run/postgresql", 5432);
-        assert_eq!(url, "postgres://app@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql", "params 与 host 合并");
+        assert_eq!(url, "postgres://app@/appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5432", "params 与 host 合并");
     }
 
     #[test]
     fn postgres_socket_host_redacted_form_has_no_credentials() {
         let cfg = pg_config("/var/run/postgresql", "app", "pw", "appdb");
         let url = cfg.redacted_connection_url_with_host("/var/run/postgresql", 5432);
-        assert_eq!(url, "postgres:///appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql");
+        assert_eq!(url, "postgres:///appdb?sslmode=disable&host=%2Fvar%2Frun%2Fpostgresql&port=5432");
     }
 
     #[test]

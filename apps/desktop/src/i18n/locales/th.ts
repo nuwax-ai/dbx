@@ -10669,7 +10669,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "Driver JDBC",
     securityTab: "ความปลอดภัย",
-    aboutTab: "เกี่ยวกับ",
+    aboutTab: "ข้อมูลเวอร์ชัน",
     fontFamily: "ตระกูลฟอนต์",
     dataGridFontFamily: "ฟอนต์กริดผลลัพธ์",
     dataGridFontFamilyDescription: "ใช้กับผลลัพธ์ Query ข้อมูลตาราง ส่วนหัวคอลัมน์ และ Editor เซลล์แบบฝัง",

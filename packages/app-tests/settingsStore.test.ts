@@ -431,7 +431,7 @@ test("defaults auto-close brackets to on and preserves saved booleans", () => {
   assert.equal(normalizeEditorSettings({ autoCloseBrackets: "nope" as any }).autoCloseBrackets, true);
 });
 
-test("defaults update notifications to enabled", () => {
+test("defaults update notifications to disabled", () => {
   // nuwax fork: app update notifications default to off (dbx-web cannot self-update); component auto-updates stay on.
   assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, false);
   assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateApp, false);

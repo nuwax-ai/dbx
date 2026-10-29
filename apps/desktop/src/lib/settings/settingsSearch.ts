@@ -14,6 +14,8 @@ const SETTINGS_CATEGORIES: readonly SettingsCategory[] = ["editor", "formatter",
  */
 export function resolveSettingsCategory(initialTab?: string): SettingsCategory {
   if (initialTab === "sqlFile") return "editor";
+  // nuwax fork: 更新管理 tab 已删除,历史深链/外部导航引导到版本信息页(最接近的存活归宿)
+  if (initialTab === "updates") return "about";
   return SETTINGS_CATEGORIES.includes(initialTab as SettingsCategory) ? (initialTab as SettingsCategory) : "appearance";
 }
 

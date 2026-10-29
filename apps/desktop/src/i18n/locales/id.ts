@@ -8412,7 +8412,7 @@ export default withEnglishFallback({
     mcpTab: "MCP",
     jdbcTab: "Driver JDBC",
     securityTab: "Keamanan",
-    aboutTab: "Tentang",
+    aboutTab: "Informasi Versi",
     fontFamily: "Jenis Font",
     dataGridFontFamily: "Font Grid Hasil",
     dataGridFontFamilyDescription: "Berlaku untuk hasil kueri, data tabel, header kolom, dan editor sel inline.",

@@ -55,8 +55,11 @@ const UPDATER_ENABLED = false;
 - `settingsStore.ts`：`ToolbarItems` 的 `theme`/`github` 字段（类型、默认值、normalize 三处）
 - `settingsSearch.ts`：`ToolbarVisibilityItemKey` 类型和 `TOOLBAR_VISIBILITY_ITEMS` 列表中的两项
 
-**保留**：`useToast` 导入（官方插件命令功能在用）；App.vue 中 Welcome 页的 `@open-github`
-绑定属于另一组件，不动。官方新增的 `alwaysOnTop` 工具栏项**保留**。
+**保留**：App.vue 中 Welcome 页的 `@open-github` 绑定属于另一组件，不动。官方新增的 `alwaysOnTop` 工具栏项**保留**。
+`useToast` 导入已随主题按钮一并删除（官方当时唯一 `toast(` 用法即主题按钮；官方若新增别的 toast 用法则恢复，见第 8 条附带注意）。
+「外观 → 工具栏」可见性开关列表（`TOOLBAR_VISIBILITY_ITEMS` / `ToolbarVisibilityItemKey`）中官方的
+`checkUpdates`、`theme`、`github`、`pluginCenter` 四项一并删除——入口已被删除/门控，开关是死控件；
+`settingsStore` 的 `checkUpdates` 字段保留（`AlwaysOnTopVisibilitySync.spec` 哨兵在用）。
 
 ## 4. 「设置 → 关于我们」裁剪 + 改名「版本信息」
 
@@ -67,9 +70,9 @@ const UPDATER_ENABLED = false;
 桌面端 `!isWeb` 的调试日志块（web 模式不可见）。
 **删除**：上述六张社区链接卡片（`grid gap-3 sm:grid-cols-3` 整块）及 `AppLogo` 导入。
 
-**改名**（2026-09-28）：`aboutTab` 的 locale 值在全部 11 种语言改为"版本信息"语义
-（zh-CN「版本信息」、zh-TW「版本資訊」、en "Version Info" 等；ja 本来就是
-「バージョン情報」未动）。设置搜索分类标签复用同一 key 自动跟随。
+**改名**（2026-09-28）：`aboutTab` 的 locale 值改为"版本信息"语义（zh-CN「版本信息」、zh-TW「版本資訊」、en "Version Info" 等；ja 本来就是
+「バージョン情報」未动）。2026-10-29 官方新增 id/pl/th 三语言，已同步改名（Informasi Versi / Informacje o wersji / ข้อมูลเวอร์ชัน）——
+此后 locale 总数 14，官方再添新语言时需同步补改名。设置搜索分类标签复用同一 key 自动跟随。
 官方若调整各语言 aboutTab 文案，合并时取 main 后需重套。
 
 ## 5. 应用更新提醒默认关闭
@@ -86,7 +89,10 @@ autoUpdateApp: false,
 ```
 
 **组件自动更新不受影响**：`autoUpdateDrivers`/`autoUpdateJdbc`/`autoUpdateMcp`/`autoUpdatePlugins` 保持 `true`。
-**注意**：已持久化过显式 `true` 的实例不会被被动关闭，需在 UI 手动关一次。
+**注意**（2026-10-29 更新）：官方已把 `updateNotificationsEnabled` 改为 `autoUpdateApp` 的别名（集中更新控制），
+仅存过旧字段 `true`、未单独持久化 `autoUpdateApp`/`autoDownloadUpdates` 的实例会回落到默认值——fork 默认 `false`，
+此类实例升级后应用更新提醒被动关闭（更新 tab 已删，无 UI 可再开）。这是官方别名语义与 fork 默认值的叠加结果，
+自部署场景本就应关，接受该行为。
 
 ## 6. PG 本地免密登录（unix socket）
 
@@ -158,6 +164,9 @@ loading/error 组件 + 预载失败恢复。**合并时 StartupGate.vue 和 App.
 **保留的打开路径**：`dbx://` 插件安装深链（`openPluginInstallDeepLink`）仍可打开页面——页面本身
 未删，只是没有常规入口；标签栏的插件中心 tab 本就只在页面已打开时渲染（非常驻按钮），无需处理；
 更新中心内的入口被 UPDATER_ENABLED 门控挡住，不可达。
+**潜在漏网（2026-10-29 评审发现，暂不动）**：设置 → AI 面板的 cc-switch 插件安装提示仍会 emit
+`open-cc-switch-plugin-center`（EditorSettingsDialog），当前被官方自身的 `!isWeb` 条件挡住，
+web 模式不可见；官方若放开该条件，此入口会复活插件市场页。合并后留意官方对该条件的改动。
 
 **合并注意**：官方对 AppToolbar 菜单/按钮组的重构会与此冲突，按"入口全删、系统保留"重套。
 
@@ -175,8 +184,9 @@ loading/error 组件 + 预载失败恢复。**合并时 StartupGate.vue 和 App.
 
 **已知瑕疵**：连接对话框中"由共享隧道档案管理，请在 设置 > 隧道维护 中编辑"提示文案仍指向
 已删除的 tab（仅使用共享隧道档案的连接可见，自部署场景碰不到，故意不动 locale）。
-
-**合并注意**：官方若往 tunnels tab 加新设置，冲突时保持整块删除；`TunnelProfileManager` 组件
+该提示所在按钮 `@open-tunnel-profile-settings`（App.vue `openSettings('tunnels')`）点击后会经
+`resolveSettingsCategory` 回落到「外观」tab——同样是已知死路，同样只在共享隧道档案场景可达。
+官方若往 tunnels tab 加新设置，冲突时保持整块删除；`TunnelProfileManager` 组件
 本身保留（连接对话框的隧道选择仍在用共享档案数据）。
 
 ## 11. 删除「更新管理」设置 tab（2026-09-28）

@@ -28,7 +28,8 @@ pub async fn ensure_local_pg_connection(storage: &Storage) -> Result<(), String>
         return Ok(());
     };
     let database = std::env::var("POSTGRES_DB").ok().filter(|d| !d.trim().is_empty());
-    ensure_local_pg_with(storage, &user, database.as_deref()).await
+    // env_file/清单里的尾随空白不应进入用户名(校验按 trim 判空,播种也用 trim 后的值)
+    ensure_local_pg_with(storage, user.trim(), database.as_deref().map(str::trim)).await
 }
 
 /// 核心逻辑（env 已解析；测试直调，避开进程级 env 与并行测试竞态）。

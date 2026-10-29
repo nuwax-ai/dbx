@@ -539,8 +539,12 @@ async fn serve() -> Result<(), String> {
             .await
             .expect("Failed to open storage")
             .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
-        // nuwax fork: 容器语义(POSTGRES_USER 在)时确保 local-pg socket 免密连接
-        dbx_core::local_pg::ensure_local_pg_connection(&storage).await.expect("Failed to ensure local-pg connection");
+        // nuwax fork: 容器语义(POSTGRES_USER 在)时确保 local-pg socket 免密连接。
+        // 失败仅告警不中断启动:load_connections 会对密钥不匹配的存量凭据硬失败,
+        // 而官方迁移门禁容忍该状态并交给恢复向导——此处 panic 会让容器 crash-loop。
+        if let Err(error) = dbx_core::local_pg::ensure_local_pg_connection(&storage).await {
+            log::warn!("ensure local-pg connection failed, continuing startup: {error}");
+        }
 
         // Initialize core dialect registry and load external plugin dialects
         register_core_dialects();
